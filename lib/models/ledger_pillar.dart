@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// Sidebar / thread context — pyramid layers.
+/// Sidebar / main-pane context (data keys stay stable; labels live in [LedgerPillarX]).
 enum LedgerPillar {
   stakeholders,
   goals,
@@ -8,23 +8,34 @@ enum LedgerPillar {
   people,
 }
 
+/// Rail section **Expectations**: towards me, then towards others.
+const List<LedgerPillar> kLedgerPillarExpectationsSection = [
+  LedgerPillar.stakeholders,
+  LedgerPillar.expectations,
+];
+
+/// Rail section **Team**: ideation and roster.
+const List<LedgerPillar> kLedgerPillarTeamSection = [
+  LedgerPillar.goals,
+  LedgerPillar.people,
+];
+
 extension LedgerPillarX on LedgerPillar {
   String get title => switch (this) {
-        LedgerPillar.stakeholders => 'Stakeholders',
-        LedgerPillar.goals => 'Goals',
-        LedgerPillar.expectations => 'Expectations',
+        LedgerPillar.stakeholders => 'Towards me',
+        LedgerPillar.goals => 'Ideation',
+        LedgerPillar.expectations => 'Towards others',
         LedgerPillar.people => 'People',
       };
 
   String get description => switch (this) {
         LedgerPillar.stakeholders =>
-          'What the Board or Conseil expects from you — the why.',
+          'Expectations from my upper hierarchy or stakeholders.',
         LedgerPillar.goals =>
-          'Strategic objectives that answer those asks — the what.',
+          'Launch ideation campaign to solve problem, and create objectives for others.',
         LedgerPillar.expectations =>
-          'Handshakes with your team — the how. Pending, Contracted, or Breached only.',
-        LedgerPillar.people =>
-          'Individuals responsible for those handshakes — the who.',
+          'Expectations or tasks delegated to your team or others.',
+        LedgerPillar.people => 'Your team and collaborators.',
       };
 
   /// Accent for focus glow and sidebar selection (not full theme tint).
@@ -35,10 +46,11 @@ extension LedgerPillarX on LedgerPillar {
         LedgerPillar.people => const Color(0xFFC4A7FF),
       };
 
+  /// Top-to-bottom rail order: **Expectations** section then **Team** (matches Tab cycle).
   LedgerPillar get next => switch (this) {
-        LedgerPillar.stakeholders => LedgerPillar.goals,
-        LedgerPillar.goals => LedgerPillar.expectations,
-        LedgerPillar.expectations => LedgerPillar.people,
+        LedgerPillar.stakeholders => LedgerPillar.expectations,
+        LedgerPillar.expectations => LedgerPillar.goals,
+        LedgerPillar.goals => LedgerPillar.people,
         LedgerPillar.people => LedgerPillar.stakeholders,
       };
 }

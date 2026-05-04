@@ -14,7 +14,7 @@ import 'package:inled/widgets/expectation_status_badge.dart';
 import 'package:inled/widgets/responsive_centered_body.dart';
 import 'package:inled/widgets/visibility_glyph.dart';
 
-/// Single-column command thread with pillar sidebar and pinned composer.
+/// Single-column command thread with persistent pillar rail and pinned composer.
 class LedgerConsoleScreen extends StatefulWidget {
   const LedgerConsoleScreen({
     super.key,
@@ -30,10 +30,12 @@ class LedgerConsoleScreen extends StatefulWidget {
 class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   static const _data = LocalLedgerDataSource();
 
-  final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _captureController = TextEditingController();
   final _captureFocus = FocusNode();
   final _scrollController = ScrollController();
+
+  /// Persistent left rail (not a modal drawer — stays put when the canvas is used).
+  bool _railExpanded = true;
 
   LedgerPillar _pillar = LedgerPillar.expectations;
   final Map<LedgerPillar, List<FeedEntry>> _userCaptures = {
@@ -90,6 +92,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (event.logicalKey == LogicalKeyboardKey.tab &&
         _captureController.text.isEmpty) {
       setState(() => _pillar = _pillar.next);
+      _focusComposer();
       return true;
     }
     return false;
@@ -131,21 +134,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final goalsById = {for (final g in goals) g.id: g};
 
     return Scaffold(
-      key: _scaffoldKey,
       backgroundColor: theme.scaffoldBackgroundColor,
-      drawer: _PillarDrawer(
-        selected: _pillar,
-        onSelect: (p) {
-          setState(() => _pillar = p);
-          Navigator.of(context).pop();
-          _focusComposer();
-        },
-      ),
       appBar: AppBar(
         leading: IconButton(
-          icon: const Icon(Icons.menu),
-          tooltip: 'Pillars',
-          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+          icon: Icon(_railExpanded ? Icons.menu_open : Icons.menu),
+          tooltip: _railExpanded ? 'Collapse sidebar' : 'Expand sidebar',
+          onPressed: () => setState(() => _railExpanded = !_railExpanded),
         ),
         title: const Text('inled'),
         actions: [
@@ -172,46 +166,71 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         ],
       ),
       body: SafeArea(
-        child: ResponsiveCenteredBody(
-          maxWidth: 800,
-          alwaysApplyMaxWidth: true,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _PillarHeader(pillar: _pillar, theme: theme),
-              const SizedBox(height: 12),
-              CommandCaptureBar(
-                controller: _captureController,
-                focusNode: _captureFocus,
-                accentColor: _pillar.accent,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ExcludeFocus(
+              excluding: true,
+              child: _PillarRail(
+                expanded: _railExpanded,
+                selected: _pillar,
+                onSelect: (p) {
+                  setState(() => _pillar = p);
+                  _focusComposer();
+                },
               ),
-              const SizedBox(height: 20),
-              Text(
-                'Recent',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: scheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                child: ListView(
-                  controller: _scrollController,
-                  padding: const EdgeInsets.only(bottom: 16),
-                  children: _threadChildren(
-                    theme: theme,
-                    scheme: scheme,
-                    stakeholders: stakeholders,
-                    goals: goals,
-                    people: people,
-                    expectations: expectations,
-                    peopleById: peopleById,
-                    goalsById: goalsById,
+            ),
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: _focusComposer,
+                child: ResponsiveCenteredBody(
+                  maxWidth: 800,
+                  alwaysApplyMaxWidth: true,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _PillarHeader(pillar: _pillar, theme: theme),
+                      const SizedBox(height: 28),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: CommandCaptureBar(
+                          controller: _captureController,
+                          focusNode: _captureFocus,
+                          accentColor: _pillar.accent,
+                        ),
+                      ),
+                      const SizedBox(height: 32),
+                      Text(
+                        'Recent',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          color: scheme.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Expanded(
+                        child: ListView(
+                          controller: _scrollController,
+                          padding: const EdgeInsets.only(bottom: 16),
+                          children: _threadChildren(
+                            theme: theme,
+                            scheme: scheme,
+                            stakeholders: stakeholders,
+                            goals: goals,
+                            people: people,
+                            expectations: expectations,
+                            peopleById: peopleById,
+                            goalsById: goalsById,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
@@ -291,12 +310,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       };
 }
 
-class _PillarDrawer extends StatelessWidget {
-  const _PillarDrawer({
+class _PillarRail extends StatelessWidget {
+  const _PillarRail({
+    required this.expanded,
     required this.selected,
     required this.onSelect,
   });
 
+  static const double _widthExpanded = 280;
+  static const double _widthCollapsed = 72;
+
+  final bool expanded;
   final LedgerPillar selected;
   final ValueChanged<LedgerPillar> onSelect;
 
@@ -304,36 +328,130 @@ class _PillarDrawer extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    return Drawer(
-      child: SafeArea(
+    final railColor = theme.drawerTheme.backgroundColor ??
+        scheme.surfaceContainerLow;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      width: expanded ? _widthExpanded : _widthCollapsed,
+      child: Material(
+        color: railColor,
         child: ListView(
           padding: const EdgeInsets.symmetric(vertical: 8),
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-              child: Text(
-                'Pyramid',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w600,
+            if (expanded) ...[
+              _railSectionHeading(context, 'Expectations', primary: true),
+              for (final p in kLedgerPillarExpectationsSection)
+                _expandedPillarTile(
+                  context,
+                  p: p,
+                  selected: selected,
+                  onSelect: onSelect,
                 ),
+              const SizedBox(height: 12),
+              _railSectionHeading(context, 'Team'),
+              for (final p in kLedgerPillarTeamSection)
+                _expandedPillarTile(
+                  context,
+                  p: p,
+                  selected: selected,
+                  onSelect: onSelect,
+                ),
+            ] else ...[
+              const SizedBox(height: 12),
+              for (final p in kLedgerPillarExpectationsSection)
+                _collapsedPillarDot(
+                  context,
+                  p: p,
+                  selected: selected,
+                  onSelect: onSelect,
+                ),
+              const SizedBox(height: 14),
+              for (final p in kLedgerPillarTeamSection)
+                _collapsedPillarDot(
+                  context,
+                  p: p,
+                  selected: selected,
+                  onSelect: onSelect,
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _railSectionHeading(
+    BuildContext context,
+    String label, {
+    bool primary = false,
+  }) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, primary ? 16 : 10, 20, 6),
+      child: Text(
+        label,
+        style: theme.textTheme.titleSmall?.copyWith(
+          color: scheme.onSurfaceVariant,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _expandedPillarTile(
+    BuildContext context, {
+    required LedgerPillar p,
+    required LedgerPillar selected,
+    required ValueChanged<LedgerPillar> onSelect,
+  }) {
+    final theme = Theme.of(context);
+    return ListTile(
+      leading: Icon(Icons.circle, size: 10, color: p.accent),
+      title: Text(p.title),
+      subtitle: Text(
+        p.description,
+        maxLines: 3,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodySmall,
+      ),
+      selected: p == selected,
+      selectedTileColor: p.accent.withValues(alpha: 0.12),
+      onTap: () => onSelect(p),
+    );
+  }
+
+  Widget _collapsedPillarDot(
+    BuildContext context, {
+    required LedgerPillar p,
+    required LedgerPillar selected,
+    required ValueChanged<LedgerPillar> onSelect,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '${p.title}\n${p.description}',
+      waitDuration: const Duration(milliseconds: 400),
+      child: InkWell(
+        onTap: () => onSelect(p),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          child: Center(
+            child: Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: p.accent.withValues(alpha: p == selected ? 1 : 0.45),
+                border: p == selected
+                    ? Border.all(
+                        color: scheme.onSurface.withValues(alpha: 0.35),
+                        width: 2,
+                      )
+                    : null,
               ),
             ),
-            for (final p in LedgerPillar.values)
-              ListTile(
-                leading: Icon(Icons.circle, size: 10, color: p.accent),
-                title: Text(p.title),
-                subtitle: Text(
-                  p.description,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall,
-                ),
-                selected: p == selected,
-                selectedTileColor: p.accent.withValues(alpha: 0.12),
-                onTap: () => onSelect(p),
-              ),
-          ],
+          ),
         ),
       ),
     );
