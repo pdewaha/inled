@@ -96,7 +96,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
                 decoration: InputDecoration(
                   isDense: true,
                   hintText:
-                      'Draft a commitment… Enter to send · Shift+Enter newline · Tab on empty cycles views',
+                      'Draft a commitment… Enter to send · Shift+Enter newline',
                   hintStyle: _mono.copyWith(
                     color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
                     height: 1.35,

@@ -10,24 +10,17 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS companies (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL,
+  domain text,
+  created_by uuid,
+  title text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz
 );
 
--- Company membership (a user can belong to multiple companies)
-CREATE TABLE IF NOT EXISTS company_members (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  user_id uuid NOT NULL,
-  role integer NOT NULL,
-  status integer NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  joined_at timestamptz,
-  UNIQUE (company_id, user_id)
-);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_domain
+  ON companies (lower(domain))
+  WHERE domain IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_company_members_user_id
-  ON company_members (user_id);
 
 -- Invitation flow for joining companies
 CREATE TABLE IF NOT EXISTS invites (
@@ -50,13 +43,18 @@ CREATE INDEX IF NOT EXISTS idx_invites_company_id
 CREATE INDEX IF NOT EXISTS idx_invites_email
   ON invites (email);
 
--- Collaborators / targets (linked_user_id optional)
+-- People are the core identity model:
+-- every member or collaborator is a person; auth link is optional.
 CREATE TABLE IF NOT EXISTS people (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  email text,
   display_name text NOT NULL,
   handle text NOT NULL,
-  linked_user_id uuid,
+  title text,
+  auth_user_id uuid,
+  role integer NOT NULL DEFAULT 0,
+  status integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz
 );
@@ -67,27 +65,21 @@ CREATE INDEX IF NOT EXISTS idx_people_company_id
 CREATE INDEX IF NOT EXISTS idx_people_handle
   ON people (handle);
 
--- Strategic ideation goals
-CREATE TABLE IF NOT EXISTS ideation_goals (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  title text NOT NULL,
-  tag text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz
-);
+CREATE INDEX IF NOT EXISTS idx_people_auth_user_id
+  ON people (auth_user_id);
 
--- Optional uniqueness proposed in discussion
-CREATE UNIQUE INDEX IF NOT EXISTS uq_ideation_goals_company_tag
-  ON ideation_goals (company_id, lower(tag));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_people_company_email
+  ON people (company_id, lower(email))
+  WHERE email IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_people_company_handle
+  ON people (company_id, lower(handle));
 
 -- Unified ledger line:
--- one directed commitment, viewed as an "objective" by the target
--- and as an "expectation" by the writer.
+-- one directed commitment tracked in the accountability ledger.
 CREATE TABLE IF NOT EXISTS expectations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  ideation_goal_id uuid REFERENCES ideation_goals(id) ON DELETE RESTRICT,
   writer_user_id uuid NOT NULL,
   target_person_id uuid NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
   title text NOT NULL,
@@ -109,9 +101,6 @@ CREATE INDEX IF NOT EXISTS idx_expectations_company_target
 
 CREATE INDEX IF NOT EXISTS idx_expectations_company_status
   ON expectations (company_id, expectation_status);
-
-CREATE INDEX IF NOT EXISTS idx_expectations_company_goal
-  ON expectations (company_id, ideation_goal_id);
 
 -- Reusable tag dictionary per company
 CREATE TABLE IF NOT EXISTS expectation_tags (

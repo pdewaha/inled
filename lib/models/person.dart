@@ -5,10 +5,14 @@ class Person {
     required this.createdAt,
     required this.displayName,
     required this.handle,
+    this.email,
+    this.title,
   });
 
   final String id;
   final DateTime createdAt;
   final String displayName;
   final String handle;
+  final String? email;
+  final String? title;
 }

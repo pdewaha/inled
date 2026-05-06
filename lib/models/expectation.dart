@@ -7,7 +7,6 @@ class Expectation {
     required this.id,
     required this.createdAt,
     required this.personId,
-    required this.goalId,
     required this.summary,
     required this.deadlineLabel,
     required this.status,
@@ -17,7 +16,6 @@ class Expectation {
   final String id;
   final DateTime createdAt;
   final String personId;
-  final String goalId;
   final String summary;
   final String deadlineLabel;
   final ExpectationStatus status;
