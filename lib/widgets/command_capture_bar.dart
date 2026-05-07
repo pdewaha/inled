@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 /// Multiline drafting composer; glow uses [accentColor] when [focusNode] has focus.
 class CommandCaptureBar extends StatefulWidget {
@@ -7,11 +8,13 @@ class CommandCaptureBar extends StatefulWidget {
     required this.controller,
     required this.focusNode,
     required this.accentColor,
+    this.onTabPressed,
   });
 
   final TextEditingController controller;
   final FocusNode focusNode;
   final Color accentColor;
+  final VoidCallback? onTabPressed;
 
   @override
   State<CommandCaptureBar> createState() => _CommandCaptureBarState();
@@ -47,15 +50,16 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final focused = widget.focusNode.hasFocus;
+    final focusGlowColor = Color.lerp(scheme.onSurface, Colors.white, 0.55)!;
     final glow = focused
         ? [
             BoxShadow(
-              color: widget.accentColor.withValues(alpha: 0.35),
+              color: focusGlowColor.withValues(alpha: 0.22),
               blurRadius: 20,
               spreadRadius: 0,
             ),
             BoxShadow(
-              color: widget.accentColor.withValues(alpha: 0.12),
+              color: focusGlowColor.withValues(alpha: 0.1),
               blurRadius: 40,
               spreadRadius: 2,
             ),
@@ -70,7 +74,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: focused
-              ? widget.accentColor.withValues(alpha: 0.55)
+              ? focusGlowColor.withValues(alpha: 0.5)
               : scheme.outline.withValues(alpha: 0.35),
           width: focused ? 1.5 : 1,
         ),
@@ -86,23 +90,39 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
               child: Icon(Icons.chevron_right, color: widget.accentColor, size: 22),
             ),
             Expanded(
-              child: TextField(
-                controller: widget.controller,
-                focusNode: widget.focusNode,
-                style: _mono.copyWith(color: scheme.onSurface),
-                minLines: 5,
-                maxLines: 10,
-                textInputAction: TextInputAction.newline,
-                decoration: InputDecoration(
-                  isDense: true,
-                  hintText:
-                      'Draft a commitment… Enter to send · Shift+Enter newline',
-                  hintStyle: _mono.copyWith(
-                    color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
-                    height: 1.35,
+              child: Shortcuts(
+                shortcuts: const <ShortcutActivator, Intent>{
+                  SingleActivator(LogicalKeyboardKey.tab): DoNothingAndStopPropagationIntent(),
+                },
+                child: Actions(
+                  actions: <Type, Action<Intent>>{
+                    DoNothingAndStopPropagationIntent: CallbackAction<DoNothingAndStopPropagationIntent>(
+                      onInvoke: (_) {
+                        widget.onTabPressed?.call();
+                        return null;
+                      },
+                    ),
+                  },
+                  child: TextField(
+                    controller: widget.controller,
+                    focusNode: widget.focusNode,
+                    style: _mono.copyWith(color: scheme.onSurface),
+                    minLines: 5,
+                    maxLines: 10,
+                    textInputAction: TextInputAction.newline,
+                    decoration: InputDecoration(
+                      isDense: true,
+                      hintText:
+                          'Take note of your expectation. Use @<name> to target someone specific, '
+                          'or @me for yourself. #<hashtags> are allowed too to link expectations to a topic.',
+                      hintStyle: _mono.copyWith(
+                        color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
+                        height: 1.35,
+                      ),
+                      border: InputBorder.none,
+                      contentPadding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                    ),
                   ),
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
                 ),
               ),
             ),

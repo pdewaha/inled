@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:inled/data_sources/local_ledger_data_source.dart';
 import 'package:inled/models/expectation.dart';
+import 'package:inled/models/expectation_health.dart';
 import 'package:inled/models/feed_entry.dart';
 import 'package:inled/models/ledger_pillar.dart';
 import 'package:inled/models/person.dart';
@@ -12,10 +14,10 @@ import 'package:inled/models/expectation_visibility.dart';
 import 'package:inled/theme.dart';
 import 'package:inled/utils/capture_parser.dart';
 import 'package:inled/widgets/command_capture_bar.dart';
-import 'package:inled/widgets/expectation_status_badge.dart';
+import 'package:inled/widgets/ledger_tag_chip.dart';
 import 'package:inled/widgets/responsive_centered_body.dart';
-import 'package:inled/widgets/visibility_glyph.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// Single-column command thread with persistent pillar rail and pinned composer.
 class LedgerConsoleScreen extends StatefulWidget {
@@ -31,9 +33,6 @@ class LedgerConsoleScreen extends StatefulWidget {
 }
 
 class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
-  static const _data = LocalLedgerDataSource();
-  static const _probeTable = 'connection_probe';
-
   final _captureController = TextEditingController();
   final _captureFocus = FocusNode();
   final _scrollController = ScrollController();
@@ -46,17 +45,87 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   LedgerPillar _pillar = LedgerPillar.home;
   final List<FeedEntry> _homeRecent = [];
   final List<Person> _people = [];
-  late final List<Expectation> _expectations;
+  final List<Expectation> _expectations = [];
   bool _peopleLoading = true;
   String? _peopleLoadError;
+  bool _expectationsLoading = true;
+  String? _expectationsLoadError;
   bool _tagsLoading = true;
   String? _tagsLoadError;
   final List<String> _recentTags = [];
-  _SupabaseProbeStatus _supabaseProbeStatus = _SupabaseProbeStatus.checking;
-  String? _supabaseProbeMessage;
+  String _profileName = 'You';
+  String? _profileTitle;
+  String? _myPersonId;
 
   bool _keyboardHookRegistered = false;
   bool _submitInFlight = false;
+  bool _refreshInFlight = false;
+  String? _activeMentionQuery;
+  int? _activeMentionStart;
+  int? _activeMentionEnd;
+  Person? _uniqueMentionSuggestion;
+  String? _activeTagQuery;
+  int? _activeTagStart;
+  int? _activeTagEnd;
+  String? _uniqueTagSuggestion;
+  bool _othersDraftsCollapsed = false;
+  bool _othersPublishedCollapsed = false;
+  bool _othersFinishedCollapsed = false;
+  bool _othersArchiveCollapsed = true;
+  bool _meInboxCollapsed = false;
+  bool _meCommitmentsCollapsed = false;
+  bool _tagsArchiveCollapsed = true;
+  String? _tagsSelectedTag;
+  ExpectationStatus? _othersStatusFilter;
+  String? _othersTagFilter;
+  String? _othersPersonFilter;
+
+  bool _hasUnreadChat(Expectation e) {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null) return false;
+    final senderAt = e.lastChattedSenderAt;
+    final receiverAt = e.lastChattedReceiverAt;
+    if (e.writerUserId == null) return false;
+    final isWriterView = currentUserId == e.writerUserId;
+    if (isWriterView) {
+      return receiverAt != null && (senderAt == null || receiverAt.isAfter(senderAt));
+    }
+    return senderAt != null && (receiverAt == null || senderAt.isAfter(receiverAt));
+  }
+
+  void _openTagPillar(String tag) {
+    setState(() {
+      _pillar = LedgerPillar.tags;
+      _tagsSelectedTag = tag;
+    });
+  }
+
+  Future<void> _deleteExpectationFromList(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null || expectation.writerUserId != currentUserId) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only the author can delete this expectation.')),
+      );
+      return;
+    }
+    try {
+      await Supabase.instance.client.from('expectations').delete().eq('id', expectation.id);
+      if (!mounted) return;
+      setState(() {
+        _expectations.removeWhere((e) => e.id == expectation.id);
+        _homeRecent.removeWhere((e) => e.linkedExpectationId == expectation.id);
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Item has been deleted.')));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Failed to delete expectation.')));
+    }
+  }
 
   void _focusComposer() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -69,9 +138,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   @override
   void initState() {
     super.initState();
-    _expectations = _data.getExpectations();
-    _probeSupabase();
+    _captureController.addListener(_onCaptureChanged);
     _loadPeopleFromSupabase();
+    _loadExpectationsFromSupabase();
     _loadRecentTagsFromSupabase();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -83,64 +152,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     });
   }
 
-  Future<void> _probeSupabase() async {
-    final client = Supabase.instance.client;
-    try {
-      try {
-        await client.from(_probeTable).select('id').limit(1);
-      } on PostgrestException catch (e) {
-        final msg = e.message.toLowerCase();
-        final unauthorized =
-            msg.contains('jwt') ||
-            msg.contains('api key') ||
-            msg.contains('apikey') ||
-            msg.contains('unauthorized');
-        if (unauthorized) {
-          if (mounted) {
-            setState(() {
-              _supabaseProbeStatus = _SupabaseProbeStatus.unauthorized;
-              _supabaseProbeMessage = e.message;
-            });
-          }
-          return;
-        }
-        if (e.code == 'PGRST205' || e.code == '42P01') {
-          if (mounted) {
-            setState(() {
-              _supabaseProbeStatus = _SupabaseProbeStatus.tableMissing;
-              _supabaseProbeMessage =
-                  'Reachable, but table "public.$_probeTable" does not exist.';
-            });
-          }
-          return;
-        }
-        if (e.code == '42501') {
-          if (mounted) {
-            setState(() {
-              _supabaseProbeStatus = _SupabaseProbeStatus.unauthorized;
-              _supabaseProbeMessage = e.message;
-            });
-          }
-          return;
-        }
-        rethrow;
-      }
-      if (mounted) {
-        setState(() {
-          _supabaseProbeStatus = _SupabaseProbeStatus.connected;
-          _supabaseProbeMessage = 'Connected';
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _supabaseProbeStatus = _SupabaseProbeStatus.failed;
-          _supabaseProbeMessage = e.toString();
-        });
-      }
-    }
-  }
-
   Future<void> _loadPeopleFromSupabase() async {
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
@@ -149,13 +160,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       setState(() {
         _peopleLoading = false;
         _peopleLoadError = 'No authenticated user.';
+        _profileName = 'You';
+        _profileTitle = null;
+        _myPersonId = null;
       });
       return;
     }
     try {
       final meRows = await client
           .from('people')
-          .select('company_id')
+          .select('id,company_id,display_name,handle,email,title')
           .eq('auth_user_id', user.id)
           .limit(1);
       if ((meRows as List).isEmpty) {
@@ -164,14 +178,25 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           _peopleLoading = false;
           _peopleLoadError = 'No linked person/company found for this user.';
           _people.clear();
+          _myPersonId = null;
+          _profileName = (user.email?.trim().isNotEmpty ?? false)
+              ? user.email!.trim()
+              : 'You';
+          _profileTitle = null;
         });
         return;
       }
 
-      final companyId = meRows.first['company_id'] as String;
+      final me = meRows.first as Map;
+      final meId = me['id'] as String?;
+      final meDisplay = ((me['display_name'] as String?) ?? '').trim();
+      final meHandle = ((me['handle'] as String?) ?? '').trim();
+      final meEmail = ((me['email'] as String?) ?? '').trim();
+      final meTitle = ((me['title'] as String?) ?? '').trim();
+      final companyId = me['company_id'] as String;
       final rows = await client
           .from('people')
-          .select('id,created_at,display_name,handle,email,title')
+          .select('id,created_at,display_name,handle,auth_user_id,email,title')
           .eq('company_id', companyId)
           .order('display_name', ascending: true);
 
@@ -186,6 +211,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   ? (r['display_name'] as String).trim()
                   : (r['handle'] as String? ?? 'Unknown'),
               handle: ((r['handle'] as String?) ?? 'unknown').trim(),
+              authUserId: (r['auth_user_id'] as String?)?.trim(),
               email: (r['email'] as String?)?.trim(),
               title: (r['title'] as String?)?.trim(),
             ),
@@ -197,20 +223,41 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _people
           ..clear()
           ..addAll(mapped);
+        _myPersonId = meId;
         _peopleLoading = false;
         _peopleLoadError = null;
+        _profileName = meDisplay.isNotEmpty
+            ? meDisplay
+            : (meHandle.isNotEmpty
+                ? meHandle
+                : (meEmail.isNotEmpty
+                    ? meEmail
+                    : ((user.email?.trim().isNotEmpty ?? false)
+                        ? user.email!.trim()
+                        : 'You')));
+        _profileTitle = meTitle.isEmpty ? null : meTitle;
       });
     } on PostgrestException catch (e) {
       if (!mounted) return;
       setState(() {
         _peopleLoading = false;
         _peopleLoadError = 'Failed to load people: ${e.message}';
+        _myPersonId = null;
+        _profileName = (user.email?.trim().isNotEmpty ?? false)
+            ? user.email!.trim()
+            : 'You';
+        _profileTitle = null;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _peopleLoading = false;
         _peopleLoadError = 'Failed to load people: $e';
+        _myPersonId = null;
+        _profileName = (user.email?.trim().isNotEmpty ?? false)
+            ? user.email!.trim()
+            : 'You';
+        _profileTitle = null;
       });
     }
   }
@@ -244,22 +291,23 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
       final companyId = meRows.first['company_id'] as String;
       final rows = await client
-          .from('expectation_tag_links')
-          .select('created_at, expectation_tags!inner(name,company_id)')
-          .eq('expectation_tags.company_id', companyId)
+          .from('expectations')
+          .select('summary,created_at')
+          .eq('company_id', companyId)
           .order('created_at', ascending: false)
-          .limit(80);
+          .limit(200);
 
       final seen = <String>{};
       final tags = <String>[];
       for (final row in (rows as List)) {
-        final tagObj = row['expectation_tags'];
-        if (tagObj is! Map) continue;
-        final name = (tagObj['name'] as String?)?.trim();
-        if (name == null || name.isEmpty) continue;
-        final key = name.toLowerCase();
-        if (seen.add(key)) {
-          tags.add(name);
+        final summary = ((row['summary'] as String?) ?? '').trim();
+        if (summary.isEmpty) continue;
+        for (final tag in _extractInlineTags(summary)) {
+          final key = tag.toLowerCase();
+          if (seen.add(key)) {
+            tags.add(tag);
+          }
+          if (tags.length >= 20) break;
         }
         if (tags.length >= 20) break;
       }
@@ -287,11 +335,111 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
   }
 
+  Future<void> _loadExpectationsFromSupabase() async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      if (!mounted) return;
+      setState(() {
+        _expectationsLoading = false;
+        _expectationsLoadError = 'No authenticated user.';
+      });
+      return;
+    }
+    try {
+      final meRows = await client
+          .from('people')
+          .select('company_id')
+          .eq('auth_user_id', user.id)
+          .limit(1);
+      if ((meRows as List).isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _expectationsLoading = false;
+          _expectationsLoadError = 'No linked person/company found for this user.';
+          _expectations.clear();
+        });
+        return;
+      }
+      final companyId = meRows.first['company_id'] as String;
+      final rows = await client
+          .from('expectations')
+          .select(
+            'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,progress,expectation_status,expectation_health,expectation_visibility',
+          )
+          .eq('company_id', companyId)
+          .order('created_at', ascending: false);
+
+      final mapped = (rows as List).map((r) {
+        final statusIdx = (r['expectation_status'] as num?)?.toInt() ?? 0;
+        final healthIdx = (r['expectation_health'] as num?)?.toInt() ?? 0;
+        final visIdx = (r['expectation_visibility'] as num?)?.toInt() ?? 0;
+        final status = _statusFromDb(statusIdx);
+        final health = _healthFromDb(healthIdx);
+        final visibility =
+            (visIdx >= 0 && visIdx < ExpectationVisibility.values.length)
+            ? ExpectationVisibility.values[visIdx]
+            : ExpectationVisibility.shadow;
+        return Expectation(
+          id: r['id'] as String,
+          createdAt: DateTime.tryParse(r['created_at'] as String? ?? '') ??
+              DateTime.now().toUtc(),
+          writerUserId: r['writer_user_id'] as String?,
+          personId: r['target_person_id'] as String,
+          summary: ((r['summary'] as String?) ?? '').trim(),
+          deadlineLabel: ((r['deadline_label'] as String?) ?? 'TBD').trim(),
+          deadlineAt: DateTime.tryParse((r['deadline_at'] as String?) ?? ''),
+          finishedAt: DateTime.tryParse((r['finished_at'] as String?) ?? ''),
+          responsibleUpdatedAt: DateTime.tryParse(
+            (r['responsible_updated_at'] as String?) ?? '',
+          ),
+          publishedAt: DateTime.tryParse((r['published_at'] as String?) ?? '') ??
+              (visIdx == ExpectationVisibility.echo.index
+                  ? DateTime.tryParse(r['created_at'] as String? ?? '')
+                  : null),
+          seenAt: DateTime.tryParse((r['seen_at'] as String?) ?? ''),
+          lastChattedSenderAt: DateTime.tryParse(
+            (r['last_chatted_sender_at'] as String?) ?? '',
+          ),
+          lastChattedReceiverAt: DateTime.tryParse(
+            (r['last_chatted_receiver_at'] as String?) ?? '',
+          ),
+          progress: (r['progress'] as num?)?.toInt(),
+          health: health,
+          status: status,
+          visibility: visibility,
+        );
+      }).toList();
+
+      if (!mounted) return;
+      setState(() {
+        _expectations
+          ..clear()
+          ..addAll(mapped);
+        _expectationsLoading = false;
+        _expectationsLoadError = null;
+      });
+    } on PostgrestException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _expectationsLoading = false;
+        _expectationsLoadError = 'Failed to load expectations: ${e.message}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _expectationsLoading = false;
+        _expectationsLoadError = 'Failed to load expectations: $e';
+      });
+    }
+  }
+
   @override
   void dispose() {
     if (_keyboardHookRegistered) {
       HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     }
+    _captureController.removeListener(_onCaptureChanged);
     _captureController.dispose();
     _captureFocus.dispose();
     _scrollController.dispose();
@@ -320,6 +468,137 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return false;
   }
 
+  void _onComposerTabPressed() {
+    if (!_captureFocus.hasFocus) return;
+    final mention = _uniqueMentionSuggestion;
+    final tag = _uniqueTagSuggestion;
+    if (mention != null) {
+      _insertMention(mention);
+    } else if (tag != null) {
+      _insertTag(tag);
+    }
+    _captureFocus.requestFocus();
+  }
+
+  void _onCaptureChanged() {
+    final value = _captureController.value;
+    final selection = value.selection;
+    if (!selection.isValid || !selection.isCollapsed) {
+      _clearTokenAutocomplete();
+      return;
+    }
+    final caret = selection.baseOffset;
+    if (caret < 0 || caret > value.text.length) {
+      _clearTokenAutocomplete();
+      return;
+    }
+    final beforeCaret = value.text.substring(0, caret);
+    final match = RegExp(r'@([a-zA-Z0-9._-]*)$').firstMatch(beforeCaret);
+    final tagMatch = RegExp(r'#([a-zA-Z0-9._-]*)$').firstMatch(beforeCaret);
+    if (match == null && tagMatch == null) {
+      _clearTokenAutocomplete();
+      return;
+    }
+    if (match != null) {
+      final query = (match.group(1) ?? '').toLowerCase();
+      final start = match.start;
+      final end = caret;
+      final suggestions = _people.where((p) {
+        final handle = p.handle.toLowerCase();
+        final display = p.displayName.toLowerCase();
+        return query.isEmpty || handle.startsWith(query) || display.startsWith(query);
+      }).toList();
+      final unique = suggestions.length == 1 ? suggestions.first : null;
+      final alreadyComplete = unique != null && unique.handle.toLowerCase() == query;
+      setState(() {
+        _activeMentionQuery = query;
+        _activeMentionStart = start;
+        _activeMentionEnd = end;
+        _uniqueMentionSuggestion = alreadyComplete ? null : unique;
+        _activeTagQuery = null;
+        _activeTagStart = null;
+        _activeTagEnd = null;
+        _uniqueTagSuggestion = null;
+      });
+      return;
+    }
+    final query = (tagMatch?.group(1) ?? '').toLowerCase();
+    final start = tagMatch!.start;
+    final end = caret;
+    final suggestions = _recentTags
+        .where((tag) => query.isEmpty || tag.toLowerCase().startsWith(query))
+        .toList();
+    final unique = suggestions.length == 1 ? suggestions.first : null;
+    final alreadyComplete = unique != null && unique.toLowerCase() == query;
+    setState(() {
+      _activeTagQuery = query;
+      _activeTagStart = start;
+      _activeTagEnd = end;
+      _uniqueTagSuggestion = alreadyComplete ? null : unique;
+      _activeMentionQuery = null;
+      _activeMentionStart = null;
+      _activeMentionEnd = null;
+      _uniqueMentionSuggestion = null;
+    });
+  }
+
+  void _clearTokenAutocomplete() {
+    if (_activeMentionQuery == null &&
+        _uniqueMentionSuggestion == null &&
+        _activeTagQuery == null &&
+        _uniqueTagSuggestion == null) {
+      return;
+    }
+    setState(() {
+      _activeMentionQuery = null;
+      _activeMentionStart = null;
+      _activeMentionEnd = null;
+      _uniqueMentionSuggestion = null;
+      _activeTagQuery = null;
+      _activeTagStart = null;
+      _activeTagEnd = null;
+      _uniqueTagSuggestion = null;
+    });
+  }
+
+  void _insertMention(Person person) {
+    final start = _activeMentionStart;
+    final end = _activeMentionEnd;
+    if (start == null || end == null) return;
+    final value = _captureController.value;
+    if (start < 0 || end < start || end > value.text.length) return;
+    final prefix = value.text.substring(0, start);
+    final suffix = value.text.substring(end);
+    final replacement = '@${person.handle}';
+    final spacer = suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' ';
+    final nextText = '$prefix$replacement$spacer$suffix';
+    final nextCaret = (prefix + replacement + spacer).length;
+    _captureController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextCaret),
+    );
+    _clearTokenAutocomplete();
+  }
+
+  void _insertTag(String tag) {
+    final start = _activeTagStart;
+    final end = _activeTagEnd;
+    if (start == null || end == null) return;
+    final value = _captureController.value;
+    if (start < 0 || end < start || end > value.text.length) return;
+    final prefix = value.text.substring(0, start);
+    final suffix = value.text.substring(end);
+    final replacement = '#$tag';
+    final spacer = suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' ';
+    final nextText = '$prefix$replacement$spacer$suffix';
+    final nextCaret = (prefix + replacement + spacer).length;
+    _captureController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextCaret),
+    );
+    _clearTokenAutocomplete();
+  }
+
   Future<void> _submitCapture() async {
     if (_submitInFlight) return;
     final text = _captureController.text.trim();
@@ -331,26 +610,55 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       );
       return;
     }
-    _submitInFlight = true;
-    final parse = parseCaptureLine(text);
-    final mode = await _askSubmitMode();
-    if (mode == null) {
-      _submitInFlight = false;
+    if (!_hasContentWord(text)) {
+      _showComposerToast(
+        'Please include at least one word besides @mentions and #tags.',
+      );
       return;
     }
-
+    _submitInFlight = true;
     final handle = _extractMentionHandle(text);
     Person? person;
+    var shouldAskSubmitMode = true;
     if (handle != null) {
-      person = _findPersonByHandle(handle);
+      if (handle.toLowerCase() == 'me') {
+        shouldAskSubmitMode = false;
+        person = await _resolveCurrentPerson();
+        if (person == null) {
+          _showComposerToast('Could not resolve @me for the current user.');
+          _submitInFlight = false;
+          return;
+        }
+      } else {
+        person = _findPersonByHandle(handle);
+      }
       if (person == null) {
+        shouldAskSubmitMode = false;
         final email = await _askOptionalEmailForHandle(handle);
         if (email == _cancelToken) {
           _submitInFlight = false;
           return;
         }
-        person = _createPersonFromHandle(handle, email: email);
+        try {
+          person = await _createPersonFromHandleInSupabase(
+            handle,
+            email: email,
+          );
+        } catch (e) {
+          _showComposerToast('Could not create @$handle yet: $e');
+          _submitInFlight = false;
+          return;
+        }
       }
+    }
+    final storedText = _normalizeExpectationTextForStorage(text);
+    final parse = parseCaptureLine(text);
+    final mode = shouldAskSubmitMode
+        ? await _askSubmitMode()
+        : _ExpectationSubmitMode.inform;
+    if (mode == null) {
+      _submitInFlight = false;
+      return;
     }
 
     final visibility = mode == _ExpectationSubmitMode.draft
@@ -358,26 +666,37 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         : ExpectationVisibility.echo;
 
     setState(() {
-      _homeRecent.insert(
-        0,
-        FeedEntry(
-          id: 'cap_${DateTime.now().millisecondsSinceEpoch}',
-          createdAt: DateTime.now().toUtc(),
-          body: text,
-          parse: parse,
-          isUserCapture: true,
-        ),
-      );
+      final tempExpectationId = 'exp_${DateTime.now().millisecondsSinceEpoch}';
+      _homeRecent.insert(0, FeedEntry(
+        id: 'cap_${DateTime.now().millisecondsSinceEpoch}',
+        createdAt: DateTime.now().toUtc(),
+        body: text,
+        parse: parse,
+        linkedExpectationId: person != null ? tempExpectationId : null,
+        isUserCapture: true,
+      ));
       final target = person ?? (_people.isNotEmpty ? _people.first : null);
       if (target != null) {
         _expectations.insert(
           0,
           Expectation(
-            id: 'exp_${DateTime.now().millisecondsSinceEpoch}',
+            id: tempExpectationId,
             createdAt: DateTime.now().toUtc(),
+            writerUserId: Supabase.instance.client.auth.currentUser?.id,
             personId: target.id,
-            summary: text,
+            summary: storedText,
             deadlineLabel: 'TBD',
+            deadlineAt: null,
+            finishedAt: null,
+            responsibleUpdatedAt: DateTime.now().toUtc(),
+            publishedAt: visibility == ExpectationVisibility.echo
+                ? DateTime.now().toUtc()
+                : null,
+            seenAt: null,
+            lastChattedSenderAt: null,
+            lastChattedReceiverAt: null,
+            progress: 0,
+            health: ExpectationHealth.unknown,
             status: ExpectationStatus.pending,
             visibility: visibility,
           ),
@@ -386,11 +705,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _captureController.clear();
     });
     try {
-      await _persistExpectationToSupabase(
-        text: text,
+      final persistedExpectationId = await _persistExpectationToSupabase(
+        text: storedText,
         visibility: visibility,
         target: person ?? (_people.isNotEmpty ? _people.first : null),
       );
+      if (mounted) {
+        setState(() {
+          if (_homeRecent.isNotEmpty) {
+            final first = _homeRecent.first;
+            _homeRecent[0] = FeedEntry(
+              id: first.id,
+              createdAt: first.createdAt,
+              body: first.body,
+              parse: first.parse,
+              linkedExpectationId: persistedExpectationId,
+              isUserCapture: first.isUserCapture,
+            );
+          }
+        });
+      }
+      await _loadExpectationsFromSupabase();
     } catch (e) {
       if (mounted) {
         _showComposerToast('Expectation saved locally, but DB write failed: $e');
@@ -404,17 +739,230 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     _submitInFlight = false;
   }
 
+  Future<Person?> _resolveCurrentPerson() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) return null;
+    try {
+      final existing = await Supabase.instance.client
+          .from('people')
+          .select('id,created_at,display_name,handle,auth_user_id,email,title')
+          .eq('auth_user_id', user.id)
+          .limit(1);
+      if ((existing as List).isEmpty) return null;
+      final row = existing.first as Map;
+      final createdAt = DateTime.tryParse((row['created_at'] as String?) ?? '') ??
+          DateTime.now().toUtc();
+      final resolved = Person(
+        id: row['id'] as String,
+        createdAt: createdAt,
+        displayName: ((row['display_name'] as String?) ?? '').trim(),
+        handle: ((row['handle'] as String?) ?? '').trim(),
+        authUserId: (row['auth_user_id'] as String?)?.trim(),
+        email: ((row['email'] as String?) ?? '').trim().isEmpty
+            ? null
+            : ((row['email'] as String?) ?? '').trim(),
+        title: ((row['title'] as String?) ?? '').trim().isEmpty
+            ? null
+            : ((row['title'] as String?) ?? '').trim(),
+      );
+      final idx = _people.indexWhere((p) => p.id == resolved.id);
+      if (idx >= 0) {
+        _people[idx] = resolved;
+      } else {
+        _people.add(resolved);
+      }
+      return resolved;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static const _cancelToken = '__cancel__';
   static final RegExp _mentionRegex = RegExp(r'@([a-zA-Z0-9._-]+)');
+  static final RegExp _leadingMentionRegex = RegExp(r'^\s*@([a-zA-Z0-9._-]+)\b\s*');
   static final RegExp _atTagRegex = RegExp(r'@([a-zA-Z0-9._-]+)');
   static final RegExp _hashTagRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
   static final RegExp _allHashTagsRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
+  static final RegExp _wordCharRegex = RegExp(r'[a-zA-Z0-9]');
   static final RegExp _uuidRegex = RegExp(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$',
   );
   static final RegExp _emailRegex = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
 
-  Future<void> _persistExpectationToSupabase({
+  Future<String?> _askInviteEmailDialog({Person? person}) async {
+    final handle = person?.handle.trim();
+    final initialEmail = (person?.email ?? '').trim();
+    final controller = TextEditingController(text: initialEmail);
+    String? error;
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            return AlertDialog(
+              title: Text(
+                (handle != null && handle.isNotEmpty)
+                    ? 'Invite @$handle'
+                    : 'Invite person',
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    (handle != null && handle.isNotEmpty)
+                        ? 'Send a personalized invite email for @$handle.'
+                        : 'Invite people from your organisation directly to there personal email or distribution lists.',
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: controller,
+                    autofocus: true,
+                    decoration: InputDecoration(
+                      hintText: 'name@company.com',
+                      errorText: error,
+                    ),
+                    onSubmitted: (_) {
+                      final value = controller.text.trim();
+                      if (_emailRegex.hasMatch(value)) {
+                        Navigator.of(context).pop(value);
+                      } else {
+                        setLocalState(() {
+                          error = 'Please enter a valid email address.';
+                        });
+                      }
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(_cancelToken),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final value = controller.text.trim();
+                    if (_emailRegex.hasMatch(value)) {
+                      Navigator.of(context).pop(value);
+                    } else {
+                      setLocalState(() {
+                        error = 'Please enter a valid email address.';
+                      });
+                    }
+                  },
+                  child: const Text('Send invite'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    controller.dispose();
+    if (result == _cancelToken) return null;
+    return result?.trim();
+  }
+
+  Future<void> _openInviteFlow({String? personId}) async {
+    Person? person;
+    if (personId != null) {
+      for (final p in _people) {
+        if (p.id == personId) {
+          person = p;
+          break;
+        }
+      }
+    }
+    if (person != null && (person.authUserId ?? '').trim().isNotEmpty) {
+      _showComposerToast('This person already has an account.');
+      return;
+    }
+    final email = await _askInviteEmailDialog(person: person);
+    if (email == null || !_emailRegex.hasMatch(email)) return;
+    try {
+      final client = Supabase.instance.client;
+      final user = client.auth.currentUser;
+      if (user == null) {
+        throw Exception('No authenticated user.');
+      }
+      final meRows = await client
+          .from('people')
+          .select('company_id')
+          .eq('auth_user_id', user.id)
+          .limit(1);
+      if ((meRows as List).isEmpty) {
+        throw Exception('No linked person/company for this user.');
+      }
+      final companyId = meRows.first['company_id'] as String;
+      if (person != null) {
+        await client.from('people').update({'email': email}).eq('id', person.id);
+      }
+      final expiresAt = DateTime.now()
+          .toUtc()
+          .add(const Duration(days: 14))
+          .toIso8601String();
+      final inviteKind = person == null ? 'generic' : 'personalized:${person.id}';
+      final tokenHash =
+          '$inviteKind:${DateTime.now().microsecondsSinceEpoch}-${user.id}-${email.toLowerCase()}';
+      await client.from('invites').insert({
+        'company_id': companyId,
+        'email': email,
+        'role': 0,
+        'status': 0,
+        'token_hash': tokenHash,
+        'invited_by_user_id': user.id,
+        'expires_at': expiresAt,
+      });
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            person == null
+                ? 'Generic invite created for $email.'
+                : 'Personalized invite created for @${
+                    person.handle
+                  } ($email).',
+          ),
+        ),
+      );
+      await _loadPeopleFromSupabase();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to create invite: $e')),
+      );
+    }
+  }
+
+  bool _hasContentWord(String input) {
+    final tokens = input.trim().split(RegExp(r'\s+'));
+    for (final raw in tokens) {
+      final t = raw.trim();
+      if (t.isEmpty) continue;
+      if (t.startsWith('@') || t.startsWith('#')) continue;
+      if (_wordCharRegex.hasMatch(t)) return true;
+    }
+    return false;
+  }
+
+  String _normalizeExpectationTextForStorage(String input) {
+    final trimmed = input.trim();
+    if (trimmed.isEmpty) return trimmed;
+    var normalized = trimmed.replaceFirst(_leadingMentionRegex, '').trim();
+    if (normalized.isEmpty) {
+      return trimmed;
+    }
+    final first = normalized[0];
+    final upperFirst = first.toUpperCase();
+    if (first != upperFirst) {
+      normalized = '$upperFirst${normalized.substring(1)}';
+    }
+    return normalized;
+  }
+
+  Future<String> _persistExpectationToSupabase({
     required String text,
     required ExpectationVisibility visibility,
     required Person? target,
@@ -448,7 +996,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       'title': title,
       'summary': text,
       'deadline_label': 'TBD',
-      'expectation_status': ExpectationStatus.pending.index,
+      'responsible_updated_at': DateTime.now().toUtc().toIso8601String(),
+      'progress': 0,
+      'expectation_status': _statusToDb(ExpectationStatus.pending),
+      'expectation_health': _healthToDb(ExpectationHealth.unknown),
       'expectation_visibility': visibility.index,
     }).select('id').single();
 
@@ -496,6 +1047,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (mounted) {
       await _loadRecentTagsFromSupabase();
     }
+    return expectationId;
   }
 
   void _showComposerToast(String message) {
@@ -506,6 +1058,42 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       if (!mounted) return;
       setState(() => _composerToastMessage = null);
     });
+  }
+
+  Future<void> _refreshCurrentPillar() async {
+    if (_refreshInFlight) return;
+    setState(() => _refreshInFlight = true);
+    try {
+      switch (_pillar) {
+        case LedgerPillar.people:
+          await _loadPeopleFromSupabase();
+          break;
+        case LedgerPillar.tags:
+          await _loadRecentTagsFromSupabase();
+          break;
+        case LedgerPillar.home:
+        case LedgerPillar.expectationsMe:
+        case LedgerPillar.expectationsOthers:
+          // Expectations views depend on both people + expectations + recent tags.
+          await _loadPeopleFromSupabase();
+          await _loadExpectationsFromSupabase();
+          await _loadRecentTagsFromSupabase();
+          break;
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Refreshed')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Refresh failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _refreshInFlight = false);
+    }
   }
 
   String? _extractMentionHandle(String input) {
@@ -521,19 +1109,110 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return null;
   }
 
-  Person _createPersonFromHandle(String handle, {String? email}) {
+  Future<Person> _createPersonFromHandleInSupabase(
+    String handle, {
+    String? email,
+  }) async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      throw Exception('No authenticated user.');
+    }
     final normalized = handle.trim();
-    final display = normalized.isEmpty
-        ? 'Unknown'
-        : '${normalized[0].toUpperCase()}${normalized.substring(1)}';
+    if (normalized.isEmpty) {
+      throw Exception('Invalid empty handle.');
+    }
+    final emailTrimmed = (email ?? '').trim();
+    final normalizedEmail = emailTrimmed.isEmpty ? null : emailTrimmed;
+
+    final meRows = await client
+        .from('people')
+        .select('id,company_id')
+        .eq('auth_user_id', user.id)
+        .limit(1);
+    if ((meRows as List).isEmpty) {
+      throw Exception('No linked person/company for this user.');
+    }
+    final companyId = meRows.first['company_id'] as String;
+
+    Map<String, dynamic>? personRow;
+    try {
+      personRow = await client
+          .from('people')
+          .insert({
+            'company_id': companyId,
+            'display_name': normalized,
+            'handle': normalized,
+            'email': normalizedEmail,
+          })
+          .select('id,created_at,display_name,handle,auth_user_id,email,title')
+          .single();
+    } on PostgrestException {
+      final existing = await client
+          .from('people')
+          .select('id,created_at,display_name,handle,auth_user_id,email,title')
+          .eq('company_id', companyId)
+          .ilike('handle', normalized)
+          .limit(1);
+      if ((existing as List).isEmpty) rethrow;
+      personRow = Map<String, dynamic>.from(existing.first as Map);
+      if (normalizedEmail != null &&
+          ((personRow['email'] as String?)?.trim().isNotEmpty != true)) {
+        final updated = await client
+            .from('people')
+            .update({'email': normalizedEmail})
+            .eq('id', personRow['id'] as String)
+            .select('id,created_at,display_name,handle,auth_user_id,email,title')
+            .single();
+        personRow = Map<String, dynamic>.from(updated);
+      }
+    }
+
+    if (normalizedEmail != null) {
+      final expiresAt = DateTime.now()
+          .toUtc()
+          .add(const Duration(days: 14))
+          .toIso8601String();
+      final tokenHash =
+          '${DateTime.now().microsecondsSinceEpoch}-${user.id}-${normalized.toLowerCase()}';
+      await client.from('invites').insert({
+        'company_id': companyId,
+        'email': normalizedEmail,
+        'role': 0,
+        'status': 0,
+        'token_hash': tokenHash,
+        'invited_by_user_id': user.id,
+        'expires_at': expiresAt,
+      });
+    }
+
     final person = Person(
-      id: 'person_${DateTime.now().millisecondsSinceEpoch}',
-      createdAt: DateTime.now().toUtc(),
-      displayName: display,
-      handle: normalized,
-      email: email,
+      id: personRow['id'] as String,
+      createdAt: DateTime.tryParse(personRow['created_at'] as String? ?? '') ??
+          DateTime.now().toUtc(),
+      displayName: (personRow['display_name'] as String?)?.trim().isNotEmpty ==
+              true
+          ? (personRow['display_name'] as String).trim()
+          : normalized,
+      handle: ((personRow['handle'] as String?) ?? normalized).trim(),
+      authUserId: (personRow['auth_user_id'] as String?)?.trim(),
+      email: (personRow['email'] as String?)?.trim(),
+      title: (personRow['title'] as String?)?.trim(),
     );
-    setState(() => _people.add(person));
+
+    final existingIdx = _people.indexWhere(
+      (p) => p.handle.toLowerCase() == person.handle.toLowerCase(),
+    );
+    setState(() {
+      if (existingIdx >= 0) {
+        _people[existingIdx] = person;
+      } else {
+        _people.add(person);
+      }
+      _people.sort(
+        (a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+      );
+    });
     return person;
   }
 
@@ -544,7 +1223,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return AlertDialog(
           title: const Text('Save expectation'),
           content: const Text(
-            'Do you want to save this as draft, or directly publish it?',
+            'Do you want to keep this shadowed, or directly publish it?',
           ),
           actions: [
             TextButton(
@@ -554,7 +1233,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             TextButton(
               onPressed: () =>
                   Navigator.of(context).pop(_ExpectationSubmitMode.draft),
-              child: const Text('Save as draft'),
+              child: const Text('Keep shadowed'),
             ),
             FilledButton(
               onPressed: () =>
@@ -622,7 +1301,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       });
                     }
                   },
-                  child: const Text('Save'),
+                  child: const Text('Continue anyway'),
                 ),
               ],
             );
@@ -632,6 +1311,32 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
     controller.dispose();
     return result;
+  }
+
+  Future<void> _openExpectationDetails({
+    required Expectation e,
+    required Person? person,
+  }) async {
+    await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 760, maxHeight: 900),
+            child: _ExpectationDetailsPanel(
+              expectation: e,
+              person: person,
+              canEdit: true,
+              onInvitePerson: (personId) => _openInviteFlow(personId: personId),
+            ),
+          ),
+        );
+      },
+    );
+    if (mounted) {
+      await _loadExpectationsFromSupabase();
+    }
   }
 
   @override
@@ -650,11 +1355,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         ),
         title: const Text('ExLed'),
         actions: [
-          _SupabaseProbeBadge(
-            status: _supabaseProbeStatus,
-            message: _supabaseProbeMessage,
-          ),
-          const SizedBox(width: 4),
           MenuAnchor(
             menuChildren: [
               for (final v in AppThemeVariant.values)
@@ -675,11 +1375,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             },
           ),
           IconButton(
-            tooltip: 'Logout',
-            onPressed: () async {
-              await Supabase.instance.client.auth.signOut();
-            },
-            icon: const Icon(Icons.logout),
+            tooltip: 'Refresh',
+            onPressed: _refreshInFlight ? null : _refreshCurrentPillar,
+            icon: _refreshInFlight
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh),
           ),
           const SizedBox(width: 4),
         ],
@@ -694,6 +1398,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 expanded: _railExpanded,
                 selected: _pillar,
                 recentTags: _recentTags,
+                profileName: _profileName,
+                profileTitle: _profileTitle,
+                onLogout: () async {
+                  await Supabase.instance.client.auth.signOut();
+                },
                 onSelect: (p) {
                   setState(() => _pillar = p);
                   if (p == LedgerPillar.home) {
@@ -702,6 +1411,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _captureFocus.unfocus();
                   }
                 },
+                onTagSelect: _openTagPillar,
+                onInviteTap: () => _openInviteFlow(),
               ),
             ),
             Expanded(
@@ -724,8 +1435,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             controller: _captureController,
                             focusNode: _captureFocus,
                             accentColor: _pillar.accent,
+                            onTabPressed: _onComposerTabPressed,
                           ),
                         ),
+                        if ((_activeMentionQuery != null &&
+                                _uniqueMentionSuggestion != null) ||
+                            (_activeTagQuery != null &&
+                                _uniqueTagSuggestion != null))
+                          Container(
+                            width: double.infinity,
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.symmetric(horizontal: 2),
+                            child: Text(
+                              _uniqueMentionSuggestion != null
+                                  ? 'Tab to complete: @${_uniqueMentionSuggestion!.handle}'
+                                  : 'Tab to complete: #${_uniqueTagSuggestion!}',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ),
                         if (_composerToastMessage != null)
                           Container(
                             width: double.infinity,
@@ -750,7 +1480,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           ),
                         const SizedBox(height: 20),
                       ],
-                      if (_pillar != LedgerPillar.people) ...[
+                      if (_pillar == LedgerPillar.home) ...[
                         Text(
                           'Recent',
                           style: theme.textTheme.titleSmall?.copyWith(
@@ -763,13 +1493,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       Expanded(
                         child: ListView(
                           controller: _scrollController,
-                          padding: const EdgeInsets.only(bottom: 16),
+                          padding: const EdgeInsets.only(right: 12, bottom: 16),
                           children: _threadChildren(
                             theme: theme,
                             scheme: scheme,
                             people: _people,
                             expectations: _expectations,
                             peopleById: peopleById,
+                            onOpenExpectationDetails: (e, p) =>
+                                _openExpectationDetails(e: e, person: p),
                           ),
                         ),
                       ),
@@ -790,33 +1522,53 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     required List<Person> people,
     required List<Expectation> expectations,
     required Map<String, Person> peopleById,
+    required void Function(Expectation e, Person? person) onOpenExpectationDetails,
   }) {
     final out = <Widget>[];
-    final mePerson = (() {
-      for (final p in people) {
-        if (p.handle.toLowerCase() == 'john') return p;
-      }
-      return null;
-    })();
-    final otherPerson = (() {
-      for (final p in people) {
-        if (p.handle.toLowerCase() == 'ava') return p;
-      }
-      return null;
-    })();
-
+    final mePerson = _myPersonId == null
+        ? null
+        : (() {
+            for (final p in people) {
+              if (p.id == _myPersonId) return p;
+            }
+            return null;
+          })();
     switch (_pillar) {
       case LedgerPillar.home:
+        final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+        final expectationsById = {for (final x in expectations) x.id: x};
         for (final e in _homeRecent) {
-          out.add(_UserCaptureGlassCard(entry: e, scheme: scheme, theme: theme));
+          final linkedExpectation = e.linkedExpectationId == null
+              ? null
+              : expectationsById[e.linkedExpectationId!];
+          final linkedPerson = linkedExpectation == null
+              ? null
+              : peopleById[linkedExpectation.personId];
+          out.add(
+            _RecentCaptureTile(
+              entry: e,
+              scheme: scheme,
+              theme: theme,
+              people: people,
+              onOpenDetails: linkedExpectation == null
+                  ? null
+                  : () =>
+                      onOpenExpectationDetails(linkedExpectation, linkedPerson),
+            ),
+          );
         }
         for (final x in expectations) {
+          if (currentUserId != null && x.writerUserId != currentUserId) continue;
           out.add(
-            _ExpectationGlassCard(
-              e: x,
+            _ExpectationOthersTile(
+              expectation: x,
+              person: peopleById[x.personId],
               theme: theme,
               scheme: scheme,
-              peopleById: peopleById,
+              hasUnreadChat: _hasUnreadChat(x),
+              onTagPressed: _openTagPillar,
+              onDelete: () => _deleteExpectationFromList(x),
+              onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
             ),
           );
         }
@@ -828,11 +1580,36 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         } else if (_peopleLoadError != null) {
           out.add(_PeopleErrorCard(message: _peopleLoadError!, onRetry: _loadPeopleFromSupabase));
         } else {
-          out.add(_PeopleTileGrid(people: people, theme: theme, scheme: scheme));
+          out.add(
+            _PeopleTileGrid(
+              people: people,
+              theme: theme,
+              scheme: scheme,
+              onPersonTap: (person) {
+                setState(() {
+                  _pillar = LedgerPillar.expectationsOthers;
+                  _othersPersonFilter = person.id;
+                });
+              },
+            ),
+          );
         }
         break;
 
       case LedgerPillar.tags:
+        if (_expectationsLoading) {
+          out.add(const _ExpectationsLoadingCard());
+          break;
+        }
+        if (_expectationsLoadError != null) {
+          out.add(
+            _ExpectationsErrorCard(
+              message: _expectationsLoadError!,
+              onRetry: _loadExpectationsFromSupabase,
+            ),
+          );
+          break;
+        }
         if (_tagsLoading) {
           out.add(const _TagsLoadingCard());
         } else if (_tagsLoadError != null) {
@@ -843,54 +1620,343 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             ),
           );
         } else {
-          out.add(_RecentTagsCloud(tags: _recentTags, theme: theme, scheme: scheme));
+          final publicTagged = expectations.where((x) {
+            // Tagged expectations with explicit @mentions are private.
+            if (_atTagRegex.hasMatch(x.summary)) return false;
+            return _extractInlineTags(x.summary).isNotEmpty;
+          }).toList();
+          final availableTags = publicTagged
+              .expand((e) => _extractInlineTags(e.summary))
+              .map((t) => t.toLowerCase())
+              .toSet()
+              .toList()
+            ..sort();
+          final effectiveTag =
+              availableTags.contains(_tagsSelectedTag) ? _tagsSelectedTag : null;
+          final activeTag = effectiveTag ?? (availableTags.isNotEmpty ? availableTags.first : null);
+          final filtered = activeTag == null
+              ? publicTagged
+              : publicTagged.where((x) {
+                  return _extractInlineTags(x.summary)
+                      .map((t) => t.toLowerCase())
+                      .contains(activeTag);
+                }).toList();
+          final inflow = filtered
+              .where((x) =>
+                  x.status != ExpectationStatus.finished &&
+                  x.status != ExpectationStatus.abandoned)
+              .toList();
+          final archive = filtered
+              .where((x) =>
+                  x.status == ExpectationStatus.finished ||
+                  x.status == ExpectationStatus.abandoned)
+              .toList();
+          out.add(
+            _RecentTagsCloud(
+              tags: availableTags,
+              selectedTag: activeTag,
+              theme: theme,
+              scheme: scheme,
+              onTagPressed: (tag) {
+                setState(() => _tagsSelectedTag = tag);
+              },
+            ),
+          );
+          out.add(const SizedBox(height: 8));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Inflow',
+              emptyText: activeTag == null
+                  ? 'No public tagged expectations yet.'
+                  : 'No inflow expectations for #$activeTag.',
+              items: inflow,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: false,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {},
+            ),
+          );
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: activeTag == null
+                  ? 'No archived tagged expectations.'
+                  : 'No archive expectations for #$activeTag.',
+              items: archive,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _tagsArchiveCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(() => _tagsArchiveCollapsed = !_tagsArchiveCollapsed);
+              },
+            ),
+          );
         }
         break;
 
       case LedgerPillar.expectationsMe:
+        if (_expectationsLoading) {
+          out.add(const _ExpectationsLoadingCard());
+          break;
+        }
+        if (_expectationsLoadError != null) {
+          out.add(
+            _ExpectationsErrorCard(
+              message: _expectationsLoadError!,
+              onRetry: _loadExpectationsFromSupabase,
+            ),
+          );
+          break;
+        }
         if (mePerson != null) {
-          for (final e in _homeRecent) {
-            final ph = e.parse?.personHandle;
-            if (ph != null && ph.toLowerCase() == mePerson.handle.toLowerCase()) {
-              out.add(_UserCaptureGlassCard(entry: e, scheme: scheme, theme: theme));
-            }
-          }
-          for (final x in expectations) {
-            if (x.personId == mePerson.id) {
-              out.add(
-                _ExpectationGlassCard(
-                  e: x,
-                  theme: theme,
-                  scheme: scheme,
-                  peopleById: peopleById,
-                ),
-              );
-            }
-          }
+          final towardsMe = expectations.where((x) => x.personId == mePerson.id).toList();
+          final inbox = towardsMe
+              .where(
+                (x) =>
+                    x.visibility == ExpectationVisibility.shadow ||
+                    x.status != ExpectationStatus.accepted,
+              )
+              .toList();
+          final commitments = towardsMe
+              .where(
+                (x) =>
+                    x.visibility != ExpectationVisibility.shadow &&
+                    x.status == ExpectationStatus.accepted,
+              )
+              .toList();
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Inbox',
+              emptyText: 'No inbox expectations.',
+              items: inbox,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _meInboxCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(() => _meInboxCollapsed = !_meInboxCollapsed);
+              },
+            ),
+          );
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Commitments',
+              emptyText: 'No commitments yet.',
+              items: commitments,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _meCommitmentsCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(() => _meCommitmentsCollapsed = !_meCommitmentsCollapsed);
+              },
+            ),
+          );
         }
         break;
 
       case LedgerPillar.expectationsOthers:
-        if (otherPerson != null) {
-          for (final e in _homeRecent) {
-            final ph = e.parse?.personHandle;
-            if (ph != null && ph.toLowerCase() == otherPerson.handle.toLowerCase()) {
-              out.add(_UserCaptureGlassCard(entry: e, scheme: scheme, theme: theme));
-            }
-          }
-          for (final x in expectations) {
-            if (x.personId == otherPerson.id) {
-              out.add(
-                _ExpectationGlassCard(
-                  e: x,
-                  theme: theme,
-                  scheme: scheme,
-                  peopleById: peopleById,
-                ),
-              );
-            }
-          }
+        final meId = mePerson?.id;
+        final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+        if (_expectationsLoading) {
+          out.add(const _ExpectationsLoadingCard());
+          break;
         }
+        if (_expectationsLoadError != null) {
+          out.add(
+            _ExpectationsErrorCard(
+              message: _expectationsLoadError!,
+              onRetry: _loadExpectationsFromSupabase,
+            ),
+          );
+          break;
+        }
+        final towardsOthers = expectations.where((x) {
+          if (currentUserId != null && x.writerUserId != currentUserId) return false;
+          if (meId == null) return true;
+          return x.personId != meId;
+        }).toList();
+        final availableTags = towardsOthers
+            .expand((e) => _extractInlineTags(e.summary))
+            .toSet()
+            .toList()
+          ..sort();
+        final peopleInvolved = towardsOthers
+            .map((e) => peopleById[e.personId])
+            .whereType<Person>()
+            .toList();
+        final personOptions = {
+          for (final p in peopleInvolved) p.id: p,
+        }.values.toList()
+          ..sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
+        final effectiveTagFilter = availableTags.contains(_othersTagFilter)
+            ? _othersTagFilter
+            : null;
+        final effectivePersonFilter = personOptions.any((p) => p.id == _othersPersonFilter)
+            ? _othersPersonFilter
+            : null;
+        final filteredTowardsOthers = towardsOthers.where((x) {
+          final statusMatch =
+              _othersStatusFilter == null || x.status == _othersStatusFilter;
+          final tagMatch = effectiveTagFilter == null
+              ? true
+              : _extractInlineTags(x.summary)
+                    .map((t) => t.toLowerCase())
+                    .contains(effectiveTagFilter.toLowerCase());
+          final personMatch =
+              effectivePersonFilter == null || x.personId == effectivePersonFilter;
+          return statusMatch && tagMatch && personMatch;
+        }).toList();
+        out.add(
+          Align(
+            alignment: Alignment.centerRight,
+            child: _ExpectationsOthersFiltersBar(
+              selectedStatus: _othersStatusFilter,
+              selectedTag: effectiveTagFilter,
+              selectedPersonId: effectivePersonFilter,
+              tags: availableTags,
+              people: personOptions,
+              onStatusChanged: (v) {
+                setState(() => _othersStatusFilter = v);
+              },
+              onTagChanged: (v) {
+                setState(() => _othersTagFilter = v);
+              },
+              onPersonChanged: (v) {
+                setState(() => _othersPersonFilter = v);
+              },
+            ),
+          ),
+        );
+        out.add(const SizedBox(height: 8));
+        final now = DateTime.now().toUtc();
+        final twoWeeksAgo = now.subtract(const Duration(days: 14));
+        final isTerminal = (Expectation x) =>
+            x.status == ExpectationStatus.finished ||
+            x.status == ExpectationStatus.abandoned;
+        final drafts = filteredTowardsOthers
+            .where((x) =>
+                x.visibility == ExpectationVisibility.shadow &&
+                !isTerminal(x))
+            .toList();
+        final published = filteredTowardsOthers
+            .where((x) =>
+                x.visibility == ExpectationVisibility.echo &&
+                !isTerminal(x))
+            .toList();
+        final recentlyFinished = filteredTowardsOthers
+            .where(
+              (x) =>
+                  x.status == ExpectationStatus.finished &&
+                  _finishedReferenceAt(x).isAfter(twoWeeksAgo),
+            )
+            .toList();
+        final archive = filteredTowardsOthers.where(isTerminal).toList();
+        out.add(
+          _ExpectationsOthersSection(
+            title: 'Shadowed',
+            emptyText: 'No shadowed expectations towards others yet.',
+            infoTooltip:
+                'Shadowed items, are only visible to you, you can use them to prepare a more definite version and then publish it, so it becomes visible to the chosen receiver',
+            items: drafts,
+            peopleById: peopleById,
+            theme: theme,
+            scheme: scheme,
+            collapsed: _othersDraftsCollapsed,
+            hasUnreadChat: _hasUnreadChat,
+            onTagPressed: _openTagPillar,
+            onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+            onDeleteExpectation: _deleteExpectationFromList,
+            onToggleCollapsed: () {
+              setState(() => _othersDraftsCollapsed = !_othersDraftsCollapsed);
+            },
+          ),
+        );
+        out.add(const SizedBox(height: 12));
+        out.add(
+          _ExpectationsOthersSection(
+            title: 'Published',
+            emptyText: 'No published expectations towards others yet.',
+            infoTooltip:
+                'Published items can be seen by you and your receiver, but nobody else',
+            items: published,
+            peopleById: peopleById,
+            theme: theme,
+            scheme: scheme,
+            collapsed: _othersPublishedCollapsed,
+            hasUnreadChat: _hasUnreadChat,
+            onTagPressed: _openTagPillar,
+            onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+            onDeleteExpectation: _deleteExpectationFromList,
+            onToggleCollapsed: () {
+              setState(
+                () => _othersPublishedCollapsed = !_othersPublishedCollapsed,
+              );
+            },
+          ),
+        );
+        out.add(const SizedBox(height: 12));
+        out.add(
+          _ExpectationsOthersSection(
+            title: 'Finished',
+            emptyText: 'No recently finished expectations (last 2 weeks).',
+            items: recentlyFinished,
+            peopleById: peopleById,
+            theme: theme,
+            scheme: scheme,
+            collapsed: _othersFinishedCollapsed,
+            hasUnreadChat: _hasUnreadChat,
+            onTagPressed: _openTagPillar,
+            onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+            onDeleteExpectation: _deleteExpectationFromList,
+            onToggleCollapsed: () {
+              setState(
+                () => _othersFinishedCollapsed = !_othersFinishedCollapsed,
+              );
+            },
+          ),
+        );
+        out.add(const SizedBox(height: 12));
+        out.add(
+          _ExpectationsOthersSection(
+            title: 'Archive',
+            emptyText: 'No archived expectations.',
+            items: archive,
+            peopleById: peopleById,
+            theme: theme,
+            scheme: scheme,
+            collapsed: _othersArchiveCollapsed,
+            hasUnreadChat: _hasUnreadChat,
+            onTagPressed: _openTagPillar,
+            onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+            onDeleteExpectation: _deleteExpectationFromList,
+            onToggleCollapsed: () {
+              setState(
+                () => _othersArchiveCollapsed = !_othersArchiveCollapsed,
+              );
+            },
+          ),
+        );
         break;
     }
 
@@ -914,13 +1980,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   static IconData _iconFor(AppThemeVariant v) => switch (v) {
         AppThemeVariant.light => Icons.light_mode_outlined,
         AppThemeVariant.dark => Icons.dark_mode_outlined,
-        AppThemeVariant.modern => Icons.auto_awesome_outlined,
       };
 
   static String _labelFor(AppThemeVariant v) => switch (v) {
         AppThemeVariant.light => 'Light',
         AppThemeVariant.dark => 'Dark',
-        AppThemeVariant.modern => 'Modern',
       };
 }
 
@@ -934,7 +1998,12 @@ class _PillarRail extends StatelessWidget {
     required this.expanded,
     required this.selected,
     required this.recentTags,
+    required this.profileName,
+    required this.profileTitle,
+    required this.onLogout,
     required this.onSelect,
+    required this.onTagSelect,
+    required this.onInviteTap,
   });
 
   static const double _widthExpanded = 280;
@@ -948,7 +2017,12 @@ class _PillarRail extends StatelessWidget {
   final bool expanded;
   final LedgerPillar selected;
   final List<String> recentTags;
+  final String profileName;
+  final String? profileTitle;
+  final Future<void> Function() onLogout;
   final ValueChanged<LedgerPillar> onSelect;
+  final ValueChanged<String> onTagSelect;
+  final Future<void> Function() onInviteTap;
 
   @override
   Widget build(BuildContext context) {
@@ -962,93 +2036,192 @@ class _PillarRail extends StatelessWidget {
       width: expanded ? _widthExpanded : _widthCollapsed,
       child: Material(
         color: railColor,
-        child: ListView(
-          padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Column(
           children: [
-            if (expanded) ...[
-              ListTile(
-                leading: const Icon(Icons.home_outlined),
-                title: const Text('Home'),
-                selected: selected == LedgerPillar.home,
-                selectedTileColor:
-                    LedgerPillar.home.accent.withValues(alpha: 0.12),
-                onTap: () => onSelect(LedgerPillar.home),
-              ),
-              _railSectionHeading(context, 'Expectations', primary: true),
-              for (final p in _sidebarOrder)
-                _expandedPillarTile(
-                  context,
-                  p: p,
-                  selected: selected,
-                  onSelect: onSelect,
-                ),
-              const SizedBox(height: 10),
-              _railSectionHeading(context, 'Organisation'),
-              _expandedPillarTile(
-                context,
-                p: LedgerPillar.people,
-                selected: selected,
-                onSelect: onSelect,
-              ),
-              _expandedPillarTile(
-                context,
-                p: LedgerPillar.tags,
-                selected: selected,
-                onSelect: onSelect,
-              ),
-              if (recentTags.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      for (final tag in recentTags.take(8))
-                        ActionChip(
-                          label: Text(
-                            '#$tag',
-                            style: theme.textTheme.labelSmall,
-                          ),
-                          onPressed: () => onSelect(LedgerPillar.tags),
-                          materialTapTargetSize:
-                              MaterialTapTargetSize.shrinkWrap,
-                          visualDensity: VisualDensity.compact,
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                children: [
+                  if (expanded) ...[
+                    ListTile(
+                      leading: const Icon(Icons.home_outlined),
+                      title: const Text('Home'),
+                      selected: selected == LedgerPillar.home,
+                      selectedTileColor:
+                          LedgerPillar.home.accent.withValues(alpha: 0.12),
+                      onTap: () => onSelect(LedgerPillar.home),
+                    ),
+                    _railSectionHeading(context, 'Expectations', primary: true),
+                    for (final p in _sidebarOrder)
+                      _expandedPillarTile(
+                        context,
+                        p: p,
+                        selected: selected,
+                        onSelect: onSelect,
+                      ),
+                    const SizedBox(height: 10),
+                    _railSectionHeading(context, 'Organisation'),
+                    _expandedPillarTile(
+                      context,
+                      p: LedgerPillar.people,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    _expandedPillarTile(
+                      context,
+                      p: LedgerPillar.tags,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    if (recentTags.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            for (final tag in recentTags.take(8))
+                              LedgerTagChip(
+                                tag: tag,
+                                onPressed: () => onTagSelect(tag),
+                              ),
+                          ],
                         ),
+                      ),
                     ],
+                  ] else ...[
+                    const SizedBox(height: 12),
+                    _collapsedPillarDot(
+                      context,
+                      p: LedgerPillar.home,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    const SizedBox(height: 14),
+                    for (final p in _sidebarOrder)
+                      _collapsedPillarDot(
+                        context,
+                        p: p,
+                        selected: selected,
+                        onSelect: onSelect,
+                      ),
+                    const SizedBox(height: 14),
+                    _collapsedPillarDot(
+                      context,
+                      p: LedgerPillar.people,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    _collapsedPillarDot(
+                      context,
+                      p: LedgerPillar.tags,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            if (expanded)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: OutlinedButton.icon(
+                    onPressed: onInviteTap,
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      minimumSize: const Size(0, 0),
+                    ),
+                    icon: const Icon(Icons.person_add_alt_1_outlined, size: 16),
+                    label: const Text('Invite'),
                   ),
                 ),
-              ],
-            ] else ...[
-              const SizedBox(height: 12),
-              _collapsedPillarDot(
-                context,
-                p: LedgerPillar.home,
-                selected: selected,
-                onSelect: onSelect,
-              ),
-              const SizedBox(height: 14),
-              for (final p in _sidebarOrder)
-                _collapsedPillarDot(
-                  context,
-                  p: p,
-                  selected: selected,
-                  onSelect: onSelect,
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: IconButton(
+                  tooltip: 'Invite',
+                  onPressed: onInviteTap,
+                  icon: const Icon(Icons.person_add_alt_1_outlined),
                 ),
-              const SizedBox(height: 14),
-              _collapsedPillarDot(
-                context,
-                p: LedgerPillar.people,
-                selected: selected,
-                onSelect: onSelect,
               ),
-              _collapsedPillarDot(
-                context,
-                p: LedgerPillar.tags,
-                selected: selected,
-                onSelect: onSelect,
+            const Divider(height: 1),
+            if (expanded)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        CircleAvatar(
+                          radius: 16,
+                          child: Text(
+                            profileName.trim().isNotEmpty
+                                ? profileName.trim()[0].toUpperCase()
+                                : '?',
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                profileName.startsWith('@')
+                                    ? profileName
+                                    : '@$profileName',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              if ((profileTitle ?? '').trim().isNotEmpty)
+                                Text(
+                                  profileTitle!.trim(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: onLogout,
+                          style: TextButton.styleFrom(
+                            padding: EdgeInsets.zero,
+                            minimumSize: const Size(0, 0),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          child: const Text('Logout'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Column(
+                  children: [
+                    IconButton(
+                      tooltip: 'Logout',
+                      onPressed: onLogout,
+                      icon: const Icon(Icons.logout),
+                    ),
+                  ],
+                ),
               ),
-            ],
           ],
         ),
       ),
@@ -1150,110 +2323,65 @@ class _PillarRail extends StatelessWidget {
   }
 }
 
-enum _SupabaseProbeStatus {
-  checking,
-  connected,
-  tableMissing,
-  unauthorized,
-  failed,
-}
-
-class _SupabaseProbeBadge extends StatelessWidget {
-  const _SupabaseProbeBadge({
-    required this.status,
-    this.message,
-  });
-
-  final _SupabaseProbeStatus status;
-  final String? message;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final (IconData icon, String label, Color color) = switch (status) {
-      _SupabaseProbeStatus.checking => (
-          Icons.cloud_sync_outlined,
-          'Supabase: checking',
-          scheme.onSurfaceVariant,
-        ),
-      _SupabaseProbeStatus.connected => (
-          Icons.cloud_done_outlined,
-          'Supabase: reachable',
-          Colors.lightGreenAccent.shade200,
-        ),
-      _SupabaseProbeStatus.tableMissing => (
-          Icons.table_chart_outlined,
-          'Supabase: reachable, probe table missing',
-          Colors.orangeAccent.shade200,
-        ),
-      _SupabaseProbeStatus.unauthorized => (
-          Icons.key_off_outlined,
-          'Supabase: reachable but unauthorized',
-          Colors.amberAccent.shade200,
-        ),
-      _SupabaseProbeStatus.failed => (
-          Icons.cloud_off_outlined,
-          'Supabase: not reachable',
-          scheme.error,
-        ),
-    };
-    return Tooltip(
-      message: message == null ? label : '$label\n$message',
-      child: Icon(icon, size: 20, color: color),
-    );
-  }
-}
-
 class _PeopleGlassCard extends StatelessWidget {
   const _PeopleGlassCard({
     required this.person,
     required this.theme,
     required this.scheme,
+    required this.onTap,
   });
 
   final Person person;
   final ThemeData theme;
   final ColorScheme scheme;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return _Glass(
-      child: Row(
-        children: [
-          CircleAvatar(
-            radius: 18,
-            backgroundColor: scheme.onSurface.withValues(alpha: 0.12),
-            child: Text(
-              person.displayName.isNotEmpty
-                  ? person.displayName[0].toUpperCase()
-                  : '?',
-              style: TextStyle(color: scheme.onSurface),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  person.displayName,
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: scheme.onSurface,
-                  ),
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: _Glass(
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 18,
+                backgroundColor: scheme.onSurface.withValues(alpha: 0.12),
+                child: Text(
+                  person.displayName.isNotEmpty
+                      ? person.displayName[0].toUpperCase()
+                      : '?',
+                  style: TextStyle(color: scheme.onSurface),
                 ),
-                Text(
-                  (person.title?.isNotEmpty ?? false)
-                      ? person.title!
-                      : 'No title set',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      person.displayName,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onSurface,
+                      ),
+                    ),
+                    Text(
+                      (person.title?.isNotEmpty ?? false)
+                          ? person.title!
+                          : 'No title set',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -1264,11 +2392,13 @@ class _PeopleTileGrid extends StatelessWidget {
     required this.people,
     required this.theme,
     required this.scheme,
+    required this.onPersonTap,
   });
 
   final List<Person> people;
   final ThemeData theme;
   final ColorScheme scheme;
+  final ValueChanged<Person> onPersonTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1299,7 +2429,12 @@ class _PeopleTileGrid extends StatelessWidget {
             for (final p in people)
               SizedBox(
                 width: tileWidth,
-                child: _PeopleGlassCard(person: p, theme: theme, scheme: scheme),
+                child: _PeopleGlassCard(
+                  person: p,
+                  theme: theme,
+                  scheme: scheme,
+                  onTap: () => onPersonTap(p),
+                ),
               ),
           ],
         );
@@ -1363,13 +2498,17 @@ class _PeopleErrorCard extends StatelessWidget {
 class _RecentTagsCloud extends StatelessWidget {
   const _RecentTagsCloud({
     required this.tags,
+    required this.selectedTag,
     required this.theme,
     required this.scheme,
+    required this.onTagPressed,
   });
 
   final List<String> tags;
+  final String? selectedTag;
   final ThemeData theme;
   final ColorScheme scheme;
+  final ValueChanged<String> onTagPressed;
 
   @override
   Widget build(BuildContext context) {
@@ -1385,15 +2524,14 @@ class _RecentTagsCloud extends StatelessWidget {
     }
     return _Glass(
       child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
+        spacing: 6,
+        runSpacing: 6,
         children: [
           for (final tag in tags)
-            Chip(
-              avatar: Icon(Icons.tag, size: 16, color: scheme.primary),
-              label: Text('#$tag'),
-              backgroundColor: scheme.primaryContainer.withValues(alpha: 0.4),
-              side: BorderSide(color: scheme.outlineVariant),
+            LedgerTagChip(
+              tag: tag,
+              selected: selectedTag?.toLowerCase() == tag.toLowerCase(),
+              onPressed: () => onTagPressed(tag),
             ),
         ],
       ),
@@ -1424,6 +2562,58 @@ class _TagsLoadingCard extends StatelessWidget {
 
 class _TagsErrorCard extends StatelessWidget {
   const _TagsErrorCard({
+    required this.message,
+    required this.onRetry,
+  });
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return _Glass(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            message,
+            style: TextStyle(color: scheme.error),
+          ),
+          const SizedBox(height: 10),
+          FilledButton(
+            onPressed: onRetry,
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ExpectationsLoadingCard extends StatelessWidget {
+  const _ExpectationsLoadingCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return const _Glass(
+      child: Row(
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          SizedBox(width: 10),
+          Text('Loading expectations from Supabase...'),
+        ],
+      ),
+    );
+  }
+}
+
+class _ExpectationsErrorCard extends StatelessWidget {
+  const _ExpectationsErrorCard({
     required this.message,
     required this.onRetry,
   });
@@ -1522,67 +2712,196 @@ class _Glass extends StatelessWidget {
   }
 }
 
-class _UserCaptureGlassCard extends StatelessWidget {
-  const _UserCaptureGlassCard({
+class _RecentCaptureTile extends StatefulWidget {
+  const _RecentCaptureTile({
     required this.entry,
     required this.scheme,
     required this.theme,
+    required this.people,
+    this.onOpenDetails,
   });
 
   final FeedEntry entry;
   final ColorScheme scheme;
   final ThemeData theme;
+  final List<Person> people;
+  final VoidCallback? onOpenDetails;
+
+  @override
+  State<_RecentCaptureTile> createState() => _RecentCaptureTileState();
+}
+
+class _RecentCaptureTileState extends State<_RecentCaptureTile> {
+  static final RegExp _mentionRegex = RegExp(r'@([a-zA-Z0-9._-]+)');
+  bool _expanded = false;
+  bool _canExpand = false;
+
+  String _targetLabel() {
+    final parseHandle = widget.entry.parse?.personHandle?.trim();
+    final mentionHandle =
+        _mentionRegex.firstMatch(widget.entry.body)?.group(1)?.trim();
+    final handle =
+        (parseHandle?.isNotEmpty ?? false) ? parseHandle! : mentionHandle;
+    if (handle == null || handle.isEmpty) return 'Capture';
+    for (final person in widget.people) {
+      if (person.handle.toLowerCase() == handle.toLowerCase()) {
+        return person.displayName;
+      }
+    }
+    return '@$handle';
+  }
+
+  void _syncOverflowState({
+    required double maxWidth,
+    required TextStyle? style,
+  }) {
+    if (maxWidth <= 0) return;
+    final tp = TextPainter(
+      text: TextSpan(text: widget.entry.body, style: style),
+      maxLines: 2,
+      textDirection: Directionality.of(context),
+    )..layout(maxWidth: maxWidth);
+    final canExpand = tp.didExceedMaxLines;
+    if (canExpand == _canExpand && (canExpand || !_expanded)) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() {
+        _canExpand = canExpand;
+        if (!canExpand) {
+          _expanded = false;
+        }
+      });
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    final parse = entry.parse;
-    return _Glass(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Text(
-                'Capture',
-                style: theme.textTheme.labelLarge?.copyWith(
-                  color: scheme.onSurface,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const Spacer(),
-              Text(
-                _timeLabel(entry.createdAt),
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          SelectableText(
-            entry.body,
-            style: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 14,
-              height: 1.45,
-            ),
-          ),
-          if (parse != null && parse.hasAnySignal) ...[
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
+    final who = _targetLabel();
+    final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
+    final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
+      color: widget.scheme.onSurfaceVariant,
+      height: 1.35,
+      fontFamily: 'monospace',
+      fontSize: 14,
+    );
+    final parse = widget.entry.parse;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: widget.scheme.surfaceContainerHighest.withValues(alpha: 0.32),
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: widget.onOpenDetails,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (parse.personHandle != null)
-                  _MiniTag('!${parse.personHandle}', scheme),
-                if (parse.goalTag != null)
-                  _MiniTag('#${parse.goalTag}', scheme),
-                if (parse.deadlineHint != null)
-                  _MiniTag(parse.deadlineHint!, scheme),
+              CircleAvatar(
+                radius: 16,
+                backgroundColor:
+                    widget.scheme.primaryContainer.withValues(alpha: 0.6),
+                child: Text(
+                  initials,
+                  style: widget.theme.textTheme.labelMedium?.copyWith(
+                    color: widget.scheme.onPrimaryContainer,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      who,
+                      style: widget.theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: widget.scheme.onSurface,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    LayoutBuilder(
+                      builder: (context, constraints) {
+                        _syncOverflowState(
+                          maxWidth: constraints.maxWidth,
+                          style: summaryStyle,
+                        );
+                        return Text(
+                          widget.entry.body,
+                          maxLines: _expanded ? null : 2,
+                          overflow: _expanded
+                              ? TextOverflow.visible
+                              : TextOverflow.ellipsis,
+                          style: summaryStyle,
+                        );
+                      },
+                    ),
+                    if (parse != null && parse.hasAnySignal) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          if (parse.personHandle != null)
+                            _MiniTag('!${parse.personHandle}', widget.scheme),
+                          if (parse.goalTag != null)
+                            _MiniTag('#${parse.goalTag}', widget.scheme),
+                          if (parse.deadlineHint != null)
+                            _MiniTag(parse.deadlineHint!, widget.scheme),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Tooltip(
+                    message: _timeLabel(widget.entry.createdAt),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(999),
+                        color: widget.scheme.surfaceContainerHigh
+                            .withValues(alpha: 0.65),
+                      ),
+                      child: Text(
+                        _timeLabel(widget.entry.createdAt),
+                        style: widget.theme.textTheme.labelSmall?.copyWith(
+                          color: widget.scheme.onSurfaceVariant,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_canExpand) ...[
+                    const SizedBox(height: 4),
+                    IconButton(
+                      tooltip: _expanded ? 'Collapse' : 'Expand',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => setState(() => _expanded = !_expanded),
+                      icon: Icon(
+                        _expanded
+                            ? Icons.keyboard_arrow_up
+                            : Icons.keyboard_arrow_down,
+                        color: widget.scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
               ],
             ),
-          ],
-        ],
+          ),
+        ),
       ),
     );
   }
@@ -1617,59 +2936,2208 @@ String _timeLabel(DateTime t) {
       '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
 }
 
-class _ExpectationGlassCard extends StatelessWidget {
-  const _ExpectationGlassCard({
-    required this.e,
+String _deadlineDistanceLabel(Expectation e) {
+  final due = e.deadlineAt;
+  if (due == null) {
+    final label = e.deadlineLabel.trim();
+    if (label.isEmpty || label.toUpperCase() == 'TBD') return '∞';
+    return label;
+  }
+  final now = DateTime.now();
+  final localDue = due.toLocal();
+  final dueDate = DateTime(localDue.year, localDue.month, localDue.day);
+  final nowDate = DateTime(now.year, now.month, now.day);
+  final days = dueDate.difference(nowDate).inDays;
+  if (days < 0) return '${days.abs()}d late';
+  if (days == 0) return 'today';
+  final weeks = days ~/ 7;
+  final remDays = days % 7;
+  if (weeks > 0 && remDays > 0) return '${weeks}w ${remDays}d';
+  if (weeks > 0) return '${weeks}w';
+  return '${days}d';
+}
+
+String _exactDateTimeLabel(DateTime dt) {
+  final l = dt.toLocal();
+  return '${l.year}-${l.month.toString().padLeft(2, '0')}-${l.day.toString().padLeft(2, '0')} '
+      '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+}
+
+/// Calendar-day based, for "Created" in detail view.
+String _createdRelativeLabel(DateTime createdAt) {
+  final now = DateTime.now();
+  final local = createdAt.toLocal();
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(local.year, local.month, local.day);
+  final diffDays = today.difference(day).inDays;
+  if (diffDays < 0) return 'in ${diffDays.abs()} day${diffDays.abs() == 1 ? '' : 's'}';
+  if (diffDays == 0) return 'today';
+  if (diffDays == 1) return '1 day ago';
+  if (diffDays < 7) return '$diffDays days ago';
+  final weeks = diffDays ~/ 7;
+  if (weeks == 1) return '1 week ago';
+  return '$weeks weeks ago';
+}
+
+String _chatRelativeLabel(DateTime createdAt) {
+  final now = DateTime.now();
+  final local = createdAt.toLocal();
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(local.year, local.month, local.day);
+  final diffDays = today.difference(day).inDays;
+  if (diffDays <= 0) return 'today';
+  if (diffDays == 1) return '1 day ago';
+  if (diffDays < 7) return '$diffDays days ago';
+  final weeks = diffDays ~/ 7;
+  if (weeks == 1) return '1 week ago';
+  return '$weeks weeks ago';
+}
+
+String _deadlineTooltip(Expectation e) {
+  if (e.deadlineAt != null) {
+    return 'Due: ${_exactDateTimeLabel(e.deadlineAt!)}';
+  }
+  final label = e.deadlineLabel.trim();
+  if (label.isEmpty || label.toUpperCase() == 'TBD') {
+    return 'No deadline';
+  }
+  return 'Deadline: $label';
+}
+
+DateTime _finishedReferenceAt(Expectation e) {
+  return (e.seenAt ?? e.publishedAt ?? e.createdAt).toUtc();
+}
+
+ExpectationStatus _statusFromDb(int value) {
+  return switch (value) {
+    0 => ExpectationStatus.pending,
+    1 => ExpectationStatus.accepted, // legacy: contracted
+    2 => ExpectationStatus.finished, // legacy: breached/closed
+    3 => ExpectationStatus.abandoned,
+    _ => ExpectationStatus.pending,
+  };
+}
+
+int _statusToDb(ExpectationStatus status) {
+  return switch (status) {
+    ExpectationStatus.pending => 0,
+    ExpectationStatus.accepted => 1,
+    ExpectationStatus.finished => 2,
+    ExpectationStatus.abandoned => 3,
+  };
+}
+
+ExpectationHealth _healthFromDb(int value) {
+  return switch (value) {
+    1 => ExpectationHealth.onTrack,
+    2 => ExpectationHealth.atRisk,
+    3 => ExpectationHealth.offTrack,
+    _ => ExpectationHealth.unknown,
+  };
+}
+
+int _healthToDb(ExpectationHealth health) {
+  return switch (health) {
+    ExpectationHealth.unknown => 0,
+    ExpectationHealth.onTrack => 1,
+    ExpectationHealth.atRisk => 2,
+    ExpectationHealth.offTrack => 3,
+  };
+}
+
+(String, Color) _healthMeta(ExpectationHealth health) {
+  return switch (health) {
+    ExpectationHealth.onTrack => ('On track', Colors.greenAccent.shade200),
+    ExpectationHealth.atRisk => ('At risk', Colors.redAccent.shade100),
+    ExpectationHealth.offTrack => ('Off track', Colors.orangeAccent.shade200),
+    ExpectationHealth.unknown => ('Undefined', Colors.blueGrey.shade400),
+  };
+}
+
+(String, Color) _statusMeta(ExpectationStatus status) {
+  return switch (status) {
+    ExpectationStatus.pending => ('Pending', Colors.orangeAccent.shade200),
+    ExpectationStatus.accepted => ('Accepted', Colors.lightBlueAccent.shade200),
+    ExpectationStatus.finished => ('Finished', Colors.lightGreenAccent.shade200),
+    ExpectationStatus.abandoned => ('Abandoned', Colors.redAccent.shade100),
+  };
+}
+
+IconData _seenIcon(Expectation e) {
+  if (e.seenAt != null) return Icons.visibility_outlined;
+  return Icons.visibility_off_outlined;
+}
+
+String _seenTooltip(Expectation e) {
+  if (e.seenAt != null) {
+    return 'Seen: ${_exactDateTimeLabel(e.seenAt!)}';
+  }
+  if (e.publishedAt != null) {
+    return 'Published: ${_exactDateTimeLabel(e.publishedAt!)}';
+  }
+  return 'Shadowed';
+}
+
+final RegExp _inlineTagRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
+
+List<String> _extractInlineTags(String input) {
+  return _inlineTagRegex
+      .allMatches(input)
+      .map((m) => (m.group(1) ?? '').trim())
+      .where((t) => t.isNotEmpty)
+      .toSet()
+      .toList();
+}
+
+class _ExpectationsOthersSection extends StatelessWidget {
+  const _ExpectationsOthersSection({
+    required this.title,
+    required this.emptyText,
+    required this.items,
+    required this.peopleById,
     required this.theme,
     required this.scheme,
-    required this.peopleById,
+    required this.collapsed,
+    required this.hasUnreadChat,
+    this.onTagPressed,
+    required this.onOpenDetails,
+    this.onDeleteExpectation,
+    this.infoTooltip,
+    required this.onToggleCollapsed,
   });
 
-  final Expectation e;
+  final String title;
+  final String emptyText;
+  final List<Expectation> items;
+  final Map<String, Person> peopleById;
   final ThemeData theme;
   final ColorScheme scheme;
-  final Map<String, Person> peopleById;
+  final bool collapsed;
+  final bool Function(Expectation expectation) hasUnreadChat;
+  final ValueChanged<String>? onTagPressed;
+  final void Function(Expectation expectation, Person? person) onOpenDetails;
+  final Future<void> Function(Expectation expectation)? onDeleteExpectation;
+  final String? infoTooltip;
+  final VoidCallback onToggleCollapsed;
 
   @override
   Widget build(BuildContext context) {
-    final person = peopleById[e.personId];
-    final who = person?.displayName ?? e.personId;
-    return _Glass(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text(
+                      title,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: scheme.onSurface,
+                      ),
+                    ),
+                  ),
+                  if (infoTooltip != null) ...[
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: infoTooltip!,
+                      child: Icon(
+                        Icons.info_outline,
+                        size: 16,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: collapsed ? 'Show $title' : 'Hide $title',
+              onPressed: onToggleCollapsed,
+              icon: Icon(
+                collapsed
+                    ? Icons.visibility_off_outlined
+                    : Icons.visibility_outlined,
+                size: 20,
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+        if (!collapsed) ...[
+          const SizedBox(height: 6),
+          if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                emptyText,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            )
+          else
+            ...items.map(
+              (e) => _ExpectationOthersTile(
+                expectation: e,
+                person: peopleById[e.personId],
+                theme: theme,
+                scheme: scheme,
+                hasUnreadChat: hasUnreadChat(e),
+                onTagPressed: onTagPressed,
+                onOpenDetails: () => onOpenDetails(e, peopleById[e.personId]),
+                onDelete: onDeleteExpectation == null
+                    ? null
+                    : () => onDeleteExpectation!(e),
+              ),
+            ),
+        ],
+      ],
+    );
+  }
+}
+
+class _ExpectationsOthersFiltersBar extends StatelessWidget {
+  const _ExpectationsOthersFiltersBar({
+    required this.selectedStatus,
+    required this.selectedTag,
+    required this.selectedPersonId,
+    required this.tags,
+    required this.people,
+    required this.onStatusChanged,
+    required this.onTagChanged,
+    required this.onPersonChanged,
+  });
+
+  final ExpectationStatus? selectedStatus;
+  final String? selectedTag;
+  final String? selectedPersonId;
+  final List<String> tags;
+  final List<Person> people;
+  final ValueChanged<ExpectationStatus?> onStatusChanged;
+  final ValueChanged<String?> onTagChanged;
+  final ValueChanged<String?> onPersonChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    InputDecoration deco({
+      required String label,
+      required bool active,
+    }) {
+      final activeBorder = OutlineInputBorder(
+        borderSide: BorderSide(
+          color: scheme.primary.withValues(alpha: 0.85),
+          width: 1.4,
+        ),
+      );
+      return InputDecoration(
+        labelText: label,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        filled: true,
+        fillColor: active
+            ? scheme.primaryContainer.withValues(alpha: 0.18)
+            : scheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        border: const OutlineInputBorder(),
+        enabledBorder: active ? activeBorder : const OutlineInputBorder(),
+        focusedBorder: active
+            ? activeBorder
+            : OutlineInputBorder(
+                borderSide: BorderSide(
+                  color: scheme.primary.withValues(alpha: 0.85),
+                  width: 1.2,
+                ),
+              ),
+      );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 145,
+          child: DropdownButtonFormField<ExpectationStatus?>(
+              value: selectedStatus,
+              isExpanded: true,
+              style: theme.textTheme.bodySmall,
+              decoration: deco(
+                label: 'Status',
+                active: selectedStatus != null,
+              ),
+              items: [
+                const DropdownMenuItem<ExpectationStatus?>(
+                  value: null,
+                  child: Text('All statuses'),
+                ),
+                ...ExpectationStatus.values.map(
+                  (s) => DropdownMenuItem<ExpectationStatus?>(
+                    value: s,
+                    child: Text(_statusMeta(s).$1),
+                  ),
+                ),
+              ],
+              onChanged: onStatusChanged,
+            ),
+          ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 145,
+          child: DropdownButtonFormField<String?>(
+              value: selectedTag,
+              isExpanded: true,
+              style: theme.textTheme.bodySmall,
+              decoration: deco(
+                label: 'Tag',
+                active: selectedTag != null,
+              ),
+              items: [
+                const DropdownMenuItem<String?>(
+                  value: null,
+                  child: Text('All tags'),
+                ),
+                ...tags.map(
+                  (t) => DropdownMenuItem<String?>(
+                    value: t,
+                    child: Text('#$t'),
+                  ),
+                ),
+              ],
+              onChanged: onTagChanged,
+            ),
+          ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 155,
+          child: DropdownButtonFormField<String?>(
+              value: selectedPersonId,
+              isExpanded: true,
+              style: theme.textTheme.bodySmall,
+              decoration: deco(
+                label: 'Person',
+                active: selectedPersonId != null,
+              ),
+              items: [
+                const DropdownMenuItem<String?>(
+                  value: null,
+                  child: Text('All people'),
+                ),
+                ...people.map(
+                  (p) => DropdownMenuItem<String?>(
+                    value: p.id,
+                    child: Text(p.displayName),
+                  ),
+                ),
+              ],
+              onChanged: onPersonChanged,
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _ExpectationOthersTile extends StatefulWidget {
+  const _ExpectationOthersTile({
+    required this.expectation,
+    required this.person,
+    required this.theme,
+    required this.scheme,
+    required this.hasUnreadChat,
+    this.onTagPressed,
+    required this.onOpenDetails,
+    this.onDelete,
+  });
+
+  final Expectation expectation;
+  final Person? person;
+  final ThemeData theme;
+  final ColorScheme scheme;
+  final bool hasUnreadChat;
+  final ValueChanged<String>? onTagPressed;
+  final VoidCallback onOpenDetails;
+  final Future<void> Function()? onDelete;
+
+  @override
+  State<_ExpectationOthersTile> createState() => _ExpectationOthersTileState();
+}
+
+class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
+  bool _expanded = false;
+  bool _canExpand = false;
+  bool _deleting = false;
+
+  Color _stateTint({
+    required Brightness brightness,
+    required String state,
+  }) {
+    return _expectationStateTint(brightness: brightness, state: state);
+  }
+
+  Color _baseStateBackgroundColor() {
+    final e = widget.expectation;
+    final brightness = widget.theme.brightness;
+    if (e.status == ExpectationStatus.finished) {
+      return _stateTint(brightness: brightness, state: 'finished');
+    }
+    if (e.status == ExpectationStatus.abandoned) {
+      return _stateTint(brightness: brightness, state: 'abandoned');
+    }
+    if (e.visibility == ExpectationVisibility.echo) {
+      return _stateTint(brightness: brightness, state: 'published');
+    }
+    return _stateTint(brightness: brightness, state: 'unpublished');
+  }
+
+  Color _rowBackgroundColor() {
+    return _baseStateBackgroundColor();
+  }
+
+  void _syncOverflowState({
+    required double maxWidth,
+    required TextStyle? style,
+  }) {
+    if (maxWidth <= 0) return;
+    final tp = TextPainter(
+      text: TextSpan(text: widget.expectation.summary, style: style),
+      maxLines: 2,
+      textDirection: Directionality.of(context),
+    )..layout(maxWidth: maxWidth);
+    final canExpand = tp.didExceedMaxLines;
+    if (canExpand == _canExpand && (canExpand || !_expanded)) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() {
+        _canExpand = canExpand;
+        if (!canExpand) {
+          _expanded = false;
+        }
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final who = widget.person?.displayName ?? widget.expectation.personId;
+    final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
+    final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
+      color: widget.scheme.onSurfaceVariant,
+      height: 1.35,
+    );
+    final tags = _extractInlineTags(widget.expectation.summary);
+    final (healthLabel, healthColor) = _healthMeta(widget.expectation.health);
+    final showWarningIndicator =
+        widget.expectation.health == ExpectationHealth.unknown ||
+        widget.expectation.status == ExpectationStatus.pending;
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    final canDelete =
+        widget.onDelete != null &&
+        widget.expectation.writerUserId != null &&
+        widget.expectation.writerUserId == currentUserId;
+    final rowBackground = _rowBackgroundColor();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: rowBackground,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: widget.onOpenDetails,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircleAvatar(
+                        radius: 16,
+                        backgroundColor: widget.scheme.primaryContainer.withValues(alpha: 0.6),
+                        child: Text(
+                          initials,
+                          style: widget.theme.textTheme.labelMedium?.copyWith(
+                            color: widget.scheme.onPrimaryContainer,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (canDelete) const SizedBox(height: 22),
+                      if (canDelete)
+                        Tooltip(
+                          message: 'Delete expectation',
+                          child: IconButton(
+                            visualDensity: VisualDensity.compact,
+                            constraints: const BoxConstraints.tightFor(width: 26, height: 26),
+                            padding: EdgeInsets.zero,
+                            onPressed: _deleting
+                                ? null
+                                : () async {
+                                    setState(() => _deleting = true);
+                                    try {
+                                      await widget.onDelete!.call();
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() => _deleting = false);
+                                      }
+                                    }
+                                  },
+                            icon: _deleting
+                                ? SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: widget.scheme.onSurfaceVariant.withValues(alpha: 0.75),
+                                    ),
+                                  )
+                                : Icon(
+                                    Icons.delete_outline,
+                                    size: 16,
+                                    color: widget.scheme.onSurfaceVariant.withValues(alpha: 0.75),
+                                  ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          who,
+                          style: widget.theme.textTheme.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w700,
+                            color: widget.scheme.onSurface,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        LayoutBuilder(
+                          builder: (context, constraints) {
+                            _syncOverflowState(maxWidth: constraints.maxWidth, style: summaryStyle);
+                            return Text(
+                              widget.expectation.summary,
+                              maxLines: _expanded ? null : 2,
+                              overflow: _expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                              style: summaryStyle,
+                            );
+                          },
+                        ),
+                        if (tags.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              for (final t in tags)
+                                LedgerTagChip(
+                                  tag: t,
+                                  onPressed: widget.onTagPressed == null
+                                      ? null
+                                      : () => widget.onTagPressed!(t),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      if (widget.expectation.status != ExpectationStatus.finished &&
+                          widget.expectation.deadlineAt != null)
+                        Tooltip(
+                          message: _deadlineTooltip(widget.expectation),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(999),
+                              color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.65),
+                            ),
+                            child: Text(
+                              _deadlineDistanceLabel(widget.expectation),
+                              style: widget.theme.textTheme.labelSmall?.copyWith(
+                                color: widget.scheme.onSurfaceVariant,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (widget.expectation.status != ExpectationStatus.finished &&
+                          widget.expectation.deadlineAt != null)
+                        const SizedBox(height: 8),
+                      Container(
+                        width: 36,
+                        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(10),
+                          color: widget.scheme.surfaceContainerHighest.withValues(alpha: 0.22),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            if (widget.expectation.status != ExpectationStatus.finished)
+                              Tooltip(
+                                message: showWarningIndicator
+                                    ? (widget.expectation.health == ExpectationHealth.unknown
+                                        ? 'Warning: Health is undefined'
+                                        : 'Warning: Status is pending')
+                                    : 'Health: $healthLabel',
+                                child: showWarningIndicator
+                                    ? Icon(
+                                        Icons.warning_amber_rounded,
+                                        size: 16,
+                                        color: Colors.amberAccent.shade200,
+                                      )
+                                    : Container(
+                                        width: 10,
+                                        height: 10,
+                                        decoration: BoxDecoration(
+                                          color: healthColor,
+                                          shape: BoxShape.circle,
+                                        ),
+                                      ),
+                              ),
+                            if (widget.expectation.status != ExpectationStatus.finished)
+                              const SizedBox(height: 8),
+                            if (widget.expectation.visibility == ExpectationVisibility.shadow)
+                              Tooltip(
+                                message: _seenTooltip(widget.expectation),
+                                child: Icon(
+                                  Icons.visibility_off_outlined,
+                                  size: 16,
+                                  color: widget.scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            if (widget.hasUnreadChat) ...[
+                              const SizedBox(height: 8),
+                              Tooltip(
+                                message: 'New chat activity',
+                                child: Icon(
+                                  Icons.mark_chat_unread_outlined,
+                                  size: 16,
+                                  color: widget.scheme.primary,
+                                ),
+                              ),
+                            ],
+                            if (widget.expectation.visibility == ExpectationVisibility.echo &&
+                                widget.expectation.progress != null &&
+                                !showWarningIndicator) ...[
+                              const SizedBox(height: 8),
+                              Tooltip(
+                                message:
+                                    'Progress: ${(widget.expectation.progress ?? 0).clamp(0, 100)}%',
+                                child: SizedBox(
+                                  width: 30,
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(999),
+                                    child: LinearProgressIndicator(
+                                      value: ((widget.expectation.progress ?? 0).clamp(0, 100)) /
+                                          100.0,
+                                      minHeight: 4,
+                                      backgroundColor: widget.scheme.surfaceContainerHigh
+                                          .withValues(alpha: 0.65),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                            if (_canExpand) ...[
+                              const SizedBox(height: 4),
+                              IconButton(
+                                tooltip: _expanded ? 'Collapse' : 'Expand',
+                                visualDensity: VisualDensity.compact,
+                                constraints: const BoxConstraints.tightFor(width: 24, height: 24),
+                                padding: EdgeInsets.zero,
+                                onPressed: () => setState(() => _expanded = !_expanded),
+                                icon: Icon(
+                                  _expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                                  size: 18,
+                                  color: widget.scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Color _expectationStateTint({
+  required Brightness brightness,
+  required String state,
+}) {
+  final isDark = brightness == Brightness.dark;
+  return switch (state) {
+    'unpublished' => isDark
+        ? const Color(0xFF1C1F22)
+        : const Color(0xFFF8F9FA),
+    'published' => isDark
+        ? const Color(0xFF2B3138)
+        : const Color(0xFFE4E8ED),
+    'finished' => isDark
+        ? const Color(0xFF24402C)
+        : const Color(0xFFDDF3E3),
+    'abandoned' => isDark
+        ? const Color(0xFF3B2424)
+        : const Color(0xFFFFE9E9),
+    _ => isDark ? const Color(0xFF1C1F22) : const Color(0xFFF8F9FA),
+  };
+}
+
+class _PendingAttachment {
+  const _PendingAttachment({
+    required this.fileName,
+    required this.fileUrl,
+  });
+
+  final String fileName;
+  final String fileUrl;
+}
+
+class _ExpectationMessageVm {
+  const _ExpectationMessageVm({
+    required this.id,
+    required this.senderPersonId,
+    required this.senderLabel,
+    required this.messageText,
+    required this.createdAt,
+    required this.attachments,
+  });
+
+  final String id;
+  final String senderPersonId;
+  final String senderLabel;
+  final String messageText;
+  final DateTime createdAt;
+  final List<_PendingAttachment> attachments;
+}
+
+class _ExpectationDetailsPanel extends StatefulWidget {
+  const _ExpectationDetailsPanel({
+    required this.expectation,
+    required this.person,
+    required this.canEdit,
+    this.onInvitePerson,
+  });
+
+  final Expectation expectation;
+  final Person? person;
+  final bool canEdit;
+  final Future<void> Function(String? personId)? onInvitePerson;
+
+  @override
+  State<_ExpectationDetailsPanel> createState() => _ExpectationDetailsPanelState();
+}
+
+class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
+  static final RegExp _tagsRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
+  static const int _messageTypeChat = 0;
+  static const int _messageTypeChangeLog = 1;
+  late final TextEditingController _descriptionController;
+  late final TextEditingController _messageController;
+  late ExpectationStatus _status;
+  late ExpectationHealth _health;
+  DateTime? _deadlineAt;
+  late String _deadlineLabel;
+  late ExpectationVisibility _visibility;
+  int? _progress;
+  bool _editingDescription = false;
+  bool _saving = false;
+  bool _deleting = false;
+  bool _inviting = false;
+  bool _messagesLoading = true;
+  bool _sendingMessage = false;
+  bool _uploadingAttachment = false;
+  String? _messagesError;
+  String? _myPersonId;
+  String? _companyId;
+  String? _myActorLabel;
+  String _senderLabel = 'Unknown sender';
+  final List<_ExpectationMessageVm> _messages = [];
+  final List<_PendingAttachment> _pendingAttachments = [];
+  bool _hasSavedChanges = false;
+  late String _savedSummary;
+  late ExpectationStatus _savedStatus;
+  late ExpectationHealth _savedHealth;
+  DateTime? _savedDeadlineAt;
+  late String _savedDeadlineLabel;
+  late ExpectationVisibility _savedVisibility;
+  int? _savedProgress;
+
+  @override
+  void initState() {
+    super.initState();
+    _descriptionController = TextEditingController(text: widget.expectation.summary);
+    _descriptionController.addListener(_onDescriptionChanged);
+    _messageController = TextEditingController();
+    _status = widget.expectation.status;
+    _health = widget.expectation.health;
+    _deadlineAt = widget.expectation.deadlineAt;
+    _deadlineLabel = widget.expectation.deadlineLabel;
+    _visibility = widget.expectation.visibility;
+    _progress = widget.expectation.progress;
+    _savedSummary = widget.expectation.summary.trim();
+    _savedStatus = widget.expectation.status;
+    _savedHealth = widget.expectation.health;
+    _savedDeadlineAt = widget.expectation.deadlineAt;
+    _savedDeadlineLabel = widget.expectation.deadlineLabel.trim();
+    _savedVisibility = widget.expectation.visibility;
+    _savedProgress = widget.expectation.progress;
+    _senderLabel = _initialSenderLabel();
+    _loadSenderLabel();
+    _loadConversation();
+  }
+
+  void _onDescriptionChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _descriptionController.removeListener(_onDescriptionChanged);
+    _descriptionController.dispose();
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  bool get _dirty =>
+      _descriptionController.text.trim() != _savedSummary ||
+      _status != _savedStatus ||
+      _health != _savedHealth ||
+      _deadlineAt != _savedDeadlineAt ||
+      _deadlineLabel.trim() != _savedDeadlineLabel ||
+      _visibility != _savedVisibility ||
+      _progress != _savedProgress;
+
+  Future<bool> _ensureActorContext() async {
+    if (_myPersonId != null && _companyId != null) return true;
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) return false;
+    final meRows = await client
+        .from('people')
+        .select('id,company_id,display_name,handle')
+        .eq('auth_user_id', user.id)
+        .limit(1);
+    if ((meRows as List).isEmpty) return false;
+    final me = meRows.first as Map;
+    _myPersonId = me['id'] as String;
+    _companyId = me['company_id'] as String;
+    final display = ((me['display_name'] as String?) ?? '').trim();
+    final handle = ((me['handle'] as String?) ?? '').trim();
+    _myActorLabel = display.isNotEmpty
+        ? display
+        : (handle.isNotEmpty ? '@$handle' : null);
+    return true;
+  }
+
+  Future<String> _insertExpectationMessage({
+    required String text,
+    required int type,
+  }) async {
+    final client = Supabase.instance.client;
+    try {
+      final inserted = await client
+          .from('expectation_messages')
+          .insert({
+            'company_id': _companyId,
+            'expectation_id': widget.expectation.id,
+            'sender_person_id': _myPersonId,
+            'type': type,
+            'message_text': text,
+          })
+          .select('id')
+          .single();
+      return inserted['id'] as String;
+    } on PostgrestException catch (e) {
+      final msg = e.message.toLowerCase();
+      final typeColumnIssue = msg.contains('column') && msg.contains('type');
+      if (!typeColumnIssue) rethrow;
+      final inserted = await client
+          .from('expectation_messages')
+          .insert({
+            'company_id': _companyId,
+            'expectation_id': widget.expectation.id,
+            'sender_person_id': _myPersonId,
+            'message_text': text,
+          })
+          .select('id')
+          .single();
+      return inserted['id'] as String;
+    }
+  }
+
+  Future<void> _touchChatActivity() async {
+    final client = Supabase.instance.client;
+    final nowIso = DateTime.now().toUtc().toIso8601String();
+    final currentUserId = client.auth.currentUser?.id;
+    final isWriter = currentUserId != null &&
+        widget.expectation.writerUserId != null &&
+        currentUserId == widget.expectation.writerUserId;
+    await client
+        .from('expectations')
+        .update({
+          if (isWriter) 'last_chatted_sender_at': nowIso,
+          if (!isWriter) 'last_chatted_receiver_at': nowIso,
+        })
+        .eq('id', widget.expectation.id);
+  }
+
+  String? _buildCriticalChangeLogText() {
+    final changes = <String>[];
+    if (_status != _savedStatus) {
+      changes.add('status to ${_statusMeta(_status).$1}');
+    }
+    if (_health != _savedHealth) {
+      changes.add('health to ${_healthMeta(_health).$1}');
+    }
+    if (_deadlineAt != _savedDeadlineAt ||
+        _deadlineLabel.trim() != _savedDeadlineLabel) {
+      final deadlineText = _deadlineAt == null
+          ? (_deadlineLabel.trim().isEmpty ? 'no deadline' : _deadlineLabel.trim())
+          : _dateOnlyLabel(_deadlineAt!);
+      changes.add('deadline to $deadlineText');
+    }
+    if (changes.isEmpty) return null;
+    return 'Update: ${changes.join(', ')}.';
+  }
+
+  String _dateOnlyLabel(DateTime dt) {
+    final local = dt.toLocal();
+    return '${local.year}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
+  }
+
+  String _initialSenderLabel() {
+    final writer = widget.expectation.writerUserId?.trim();
+    if (writer == null || writer.isEmpty) return 'Unknown sender';
+    return writer;
+  }
+
+  Future<void> _loadSenderLabel() async {
+    final writer = widget.expectation.writerUserId?.trim();
+    if (writer == null || writer.isEmpty) return;
+    try {
+      final rows = await Supabase.instance.client
+          .from('people')
+          .select('display_name,handle')
+          .eq('auth_user_id', writer)
+          .limit(1);
+      if (!mounted || (rows as List).isEmpty) return;
+      final row = rows.first as Map;
+      final display = ((row['display_name'] as String?) ?? '').trim();
+      final handle = ((row['handle'] as String?) ?? '').trim();
+      final label = display.isNotEmpty
+          ? display
+          : (handle.isNotEmpty ? '@$handle' : 'Unknown sender');
+      setState(() => _senderLabel = label);
+    } catch (_) {
+      // Keep fallback sender label.
+    }
+  }
+
+  Future<void> _editProgress() async {
+    if (!widget.canEdit) return;
+    final start = (_progress ?? 0).clamp(0, 100);
+    var working = start.toDouble();
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Progress'),
+          content: StatefulBuilder(
+            builder: (context, setLocalState) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('${working.round()}%'),
+                  const SizedBox(height: 8),
+                  Slider(
+                    value: working,
+                    min: 0,
+                    max: 100,
+                    divisions: 20,
+                    label: '${working.round()}%',
+                    onChanged: (v) => setLocalState(() => working = v),
+                  ),
+                ],
+              );
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(working.round()),
+              child: const Text('Set'),
+            ),
+          ],
+        );
+      },
+    );
+    if (picked == null) return;
+    setState(() => _progress = picked.clamp(0, 100));
+  }
+
+  Future<void> _pickDeadline() async {
+    final initial = _deadlineAt ?? DateTime.now().add(const Duration(days: 7));
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (picked == null) return;
+    setState(() {
+      _deadlineAt = DateTime(picked.year, picked.month, picked.day).toUtc();
+      _deadlineLabel =
+          '${picked.year}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+    });
+  }
+
+  Future<void> _save({bool publish = false}) async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    final client = Supabase.instance.client;
+    await _ensureActorContext();
+    final isReceiverActor = _myPersonId != null && _myPersonId == widget.expectation.personId;
+    // If receiver saves while still pending, auto-promote to accepted.
+    if (isReceiverActor && _status == ExpectationStatus.pending) {
+      _status = ExpectationStatus.accepted;
+    }
+    final summary = _descriptionController.text.trim();
+    final nextVisibility = publish ? ExpectationVisibility.echo : _visibility;
+    final nextFinishedAt = _status == ExpectationStatus.finished
+        ? (widget.expectation.finishedAt ?? DateTime.now().toUtc())
+        : null;
+    final responsibleFieldsChanged = _status != _savedStatus ||
+        _health != _savedHealth ||
+        _deadlineAt != _savedDeadlineAt ||
+        _deadlineLabel.trim() != _savedDeadlineLabel ||
+        _progress != _savedProgress;
+    final updates = <String, dynamic>{
+      'summary': summary,
+      'title': summary.length > 80 ? '${summary.substring(0, 80)}...' : summary,
+      'expectation_status': _statusToDb(_status),
+      'expectation_health': _healthToDb(_health),
+      'deadline_label': _deadlineLabel.trim().isEmpty ? 'TBD' : _deadlineLabel.trim(),
+      'deadline_at': _deadlineAt?.toIso8601String(),
+      'finished_at': nextFinishedAt?.toIso8601String(),
+      if (responsibleFieldsChanged)
+        'responsible_updated_at': DateTime.now().toUtc().toIso8601String(),
+      'progress': _progress,
+      'expectation_visibility': nextVisibility.index,
+    };
+    if (publish && widget.expectation.publishedAt == null) {
+      updates['published_at'] = DateTime.now().toUtc().toIso8601String();
+    }
+    final changeLogText = _buildCriticalChangeLogText();
+    try {
+      await client.from('expectations').update(updates).eq('id', widget.expectation.id);
+      if (changeLogText != null) {
+        var actorReady = await _ensureActorContext();
+        if (!actorReady) {
+          // Fallback path: conversation load also initializes actor context.
+          await _loadConversation();
+          actorReady = _myPersonId != null && _companyId != null;
+        }
+        if (actorReady) {
+          await _insertExpectationMessage(
+            text: changeLogText,
+            type: _messageTypeChangeLog,
+          );
+          await _touchChatActivity();
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _saving = false;
+        _hasSavedChanges = true;
+        _editingDescription = false;
+        _visibility = nextVisibility;
+        _savedSummary = summary;
+        _savedStatus = _status;
+        _savedHealth = _health;
+        _savedDeadlineAt = _deadlineAt;
+        _savedDeadlineLabel =
+            _deadlineLabel.trim().isEmpty ? 'TBD' : _deadlineLabel.trim();
+        _savedVisibility = _visibility;
+        _savedProgress = _progress;
+      });
+      await _loadConversation();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Expectation saved.')),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to save expectation changes.')),
+      );
+    }
+  }
+
+  Future<void> _deleteExpectation() async {
+    if (_saving || _deleting) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Delete expectation?'),
+          content: const Text(
+            'This will permanently remove the expectation and its conversation.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error,
+                foregroundColor: Theme.of(context).colorScheme.onError,
+              ),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true) return;
+    setState(() => _deleting = true);
+    try {
+      await Supabase.instance.client
+          .from('expectations')
+          .delete()
+          .eq('id', widget.expectation.id);
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _deleting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to delete expectation.')),
+      );
+    }
+  }
+
+  Future<void> _inviteReceiver() async {
+    final receiver = widget.person;
+    if (receiver == null || _inviting) return;
+    if (widget.onInvitePerson == null) return;
+    setState(() => _inviting = true);
+    try {
+      await widget.onInvitePerson!(receiver.id);
+      if (!mounted) return;
+      setState(() => _inviting = false);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _inviting = false);
+    }
+  }
+
+  Future<void> _loadConversation() async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      if (!mounted) return;
+      setState(() {
+        _messagesLoading = false;
+        _messagesError = 'No authenticated user.';
+      });
+      return;
+    }
+    try {
+      final meRows = await client
+          .from('people')
+          .select('id,company_id,display_name,handle')
+          .eq('auth_user_id', user.id)
+          .limit(1);
+      if ((meRows as List).isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _messagesLoading = false;
+          _messagesError = 'No linked person/company found for this user.';
+        });
+        return;
+      }
+      _myPersonId = meRows.first['id'] as String;
+      _companyId = meRows.first['company_id'] as String;
+      final meDisplay = ((meRows.first['display_name'] as String?) ?? '').trim();
+      final meHandle = ((meRows.first['handle'] as String?) ?? '').trim();
+      _myActorLabel = meDisplay.isNotEmpty
+          ? meDisplay
+          : (meHandle.isNotEmpty ? '@$meHandle' : null);
+
+      final rows = await client
+          .from('expectation_messages')
+          .select(
+            'id,sender_person_id,message_text,created_at,'
+            'people!inner(display_name,handle),'
+            'expectation_message_attachments(file_name,file_url)',
+          )
+          .eq('expectation_id', widget.expectation.id)
+          .order('created_at', ascending: true);
+
+      final mapped = (rows as List).map((r) {
+        final personObj = r['people'];
+        final senderLabel = personObj is Map
+            ? ((personObj['display_name'] as String?)?.trim().isNotEmpty == true
+                ? (personObj['display_name'] as String).trim()
+                : '@${(personObj['handle'] as String?) ?? 'unknown'}')
+            : (r['sender_person_id'] as String);
+        final attachmentRows = (r['expectation_message_attachments'] as List?) ?? const [];
+        final attachments = attachmentRows
+            .map(
+              (a) => _PendingAttachment(
+                fileName: ((a as Map)['file_name'] as String?)?.trim().isNotEmpty == true
+                    ? (a['file_name'] as String).trim()
+                    : 'Attachment',
+                fileUrl: ((a['file_url'] as String?) ?? '').trim(),
+              ),
+            )
+            .where((a) => a.fileUrl.isNotEmpty)
+            .toList();
+        return _ExpectationMessageVm(
+          id: r['id'] as String,
+          senderPersonId: r['sender_person_id'] as String,
+          senderLabel: senderLabel,
+          messageText: ((r['message_text'] as String?) ?? '').trim(),
+          createdAt: DateTime.tryParse((r['created_at'] as String?) ?? '') ??
+              DateTime.now().toUtc(),
+          attachments: attachments,
+        );
+      }).toList();
+
+      if (!mounted) return;
+      setState(() {
+        _messages
+          ..clear()
+          ..addAll(mapped);
+        _messagesLoading = false;
+        _messagesError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messagesLoading = false;
+        _messagesError = 'Failed to load conversation: $e';
+      });
+    }
+  }
+
+  Future<void> _pickAndUploadAttachment() async {
+    if (_uploadingAttachment || _sendingMessage) return;
+    final result = await FilePicker.platform.pickFiles(allowMultiple: false);
+    if (result == null || result.files.isEmpty) return;
+    final picked = result.files.first;
+    final path = picked.path;
+    if (path == null || path.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not access selected file path.')),
+      );
+      return;
+    }
+    if (_companyId == null) {
+      await _loadConversation();
+      if (_companyId == null) return;
+    }
+    setState(() => _uploadingAttachment = true);
+    final client = Supabase.instance.client;
+    final file = File(path);
+    final fileName = picked.name.trim().isEmpty ? 'attachment' : picked.name.trim();
+    final safeName = fileName.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    final objectPath =
+        '${_companyId!}/expectations/${widget.expectation.id}/${DateTime.now().millisecondsSinceEpoch}_$safeName';
+    try {
+      await client.storage.from('storage').upload(
+            objectPath,
+            file,
+            fileOptions: const FileOptions(upsert: false),
+          );
+      final publicUrl = client.storage.from('storage').getPublicUrl(objectPath);
+      if (!mounted) return;
+      setState(() {
+        _uploadingAttachment = false;
+        _pendingAttachments.add(
+          _PendingAttachment(fileName: fileName, fileUrl: publicUrl),
+        );
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _uploadingAttachment = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to upload attachment: $e')),
+      );
+    }
+  }
+
+  Future<void> _sendMessage() async {
+    if (_sendingMessage) return;
+    final text = _messageController.text.trim();
+    if (text.isEmpty && _pendingAttachments.isEmpty) return;
+    if (_myPersonId == null || _companyId == null) {
+      final ready = await _ensureActorContext();
+      if (!ready) return;
+    }
+    setState(() => _sendingMessage = true);
+    final client = Supabase.instance.client;
+    try {
+      final messageId = await _insertExpectationMessage(
+        text: text.isEmpty ? '[Attachment]' : text,
+        type: _messageTypeChat,
+      );
+      for (final a in _pendingAttachments) {
+        await client.from('expectation_message_attachments').insert({
+          'company_id': _companyId,
+          'expectation_message_id': messageId,
+          'file_name': a.fileName,
+          'file_url': a.fileUrl,
+        });
+      }
+      await _touchChatActivity();
+      if (!mounted) return;
+      setState(() {
+        _sendingMessage = false;
+        _messageController.clear();
+        _pendingAttachments.clear();
+      });
+      await _loadConversation();
+    } on PostgrestException catch (e) {
+      if (!mounted) return;
+      setState(() => _sendingMessage = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send message: ${e.message}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sendingMessage = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send message: $e')),
+      );
+    }
+  }
+
+  Future<void> _openAttachmentUrl(String rawUrl) async {
+    final client = Supabase.instance.client;
+    Uri? uri = Uri.tryParse(rawUrl);
+    // If we stored/received a public storage URL, prefer a signed URL at click time
+    // to avoid bucket visibility mismatches.
+    if (uri != null) {
+      final marker = '/storage/v1/object/public/storage/';
+      final absolute = uri.toString();
+      final idx = absolute.indexOf(marker);
+      if (idx >= 0) {
+        final objectPath = absolute.substring(idx + marker.length);
+        if (objectPath.isNotEmpty) {
+          try {
+            final signed = await client.storage
+                .from('storage')
+                .createSignedUrl(objectPath, 60 * 30);
+            final signedUri = Uri.tryParse(signed);
+            if (signedUri != null) {
+              uri = signedUri;
+            }
+          } catch (_) {
+            // Fall back to raw URL open below.
+          }
+        }
+      }
+    }
+    if (uri == null) return;
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open attachment link.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final handle = widget.person?.handle;
+    final (statusLabel, statusColor) = _statusMeta(_status);
+    final (healthLabel, healthColor) = _healthMeta(_health);
+    final canEdit = widget.canEdit;
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    final canSendMessage =
+        !_sendingMessage && _messageController.text.trim().isNotEmpty;
+    final canDelete = canEdit &&
+        widget.expectation.writerUserId != null &&
+        widget.expectation.writerUserId == currentUserId;
+    final showInviteForReceiver = canEdit &&
+        widget.person != null &&
+        (widget.person!.authUserId ?? '').trim().isEmpty;
+    final working = Expectation(
+      id: widget.expectation.id,
+      createdAt: widget.expectation.createdAt,
+      writerUserId: widget.expectation.writerUserId,
+      personId: widget.expectation.personId,
+      summary: _descriptionController.text,
+      deadlineLabel: _deadlineLabel,
+      deadlineAt: _deadlineAt,
+      finishedAt: widget.expectation.finishedAt,
+      responsibleUpdatedAt: widget.expectation.responsibleUpdatedAt,
+      publishedAt: widget.expectation.publishedAt,
+      seenAt: widget.expectation.seenAt,
+      lastChattedSenderAt: widget.expectation.lastChattedSenderAt,
+      lastChattedReceiverAt: widget.expectation.lastChattedReceiverAt,
+      progress: _progress,
+      health: _health,
+      status: _status,
+      visibility: _visibility,
+    );
+    final tags = _tagsRegex
+        .allMatches(_descriptionController.text)
+        .map((m) => (m.group(1) ?? '').trim())
+        .where((x) => x.isNotEmpty)
+        .toSet()
+        .toList();
+
+    return Container(
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerLow.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.35)),
+      ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              VisibilityGlyph(visibility: e.visibility),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  who,
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 10, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          _visibility == ExpectationVisibility.shadow
+                              ? 'Expectation Details - SHADOWED'
+                              : 'Expectation Details',
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (_visibility == ExpectationVisibility.shadow) ...[
+                        const SizedBox(width: 8),
+                        Icon(
+                          Icons.visibility_off_outlined,
+                          size: 18,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Close',
+                  onPressed: () => Navigator.of(context).pop(_hasSavedChanges),
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+              children: [
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final left = <Widget>[
+                      _DetailRow(
+                        label: 'From',
+                        value: _senderLabel.startsWith('@')
+                            ? _senderLabel
+                            : '@$_senderLabel',
+                      ),
+                      if (handle != null && handle.trim().isNotEmpty)
+                        _DetailRow(
+                          label: 'To',
+                          valueWidget: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                handle.startsWith('@') ? handle : '@$handle',
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: scheme.onSurface,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              if (showInviteForReceiver) ...[
+                                const SizedBox(width: 8),
+                                TextButton(
+                                  onPressed: _inviting ? null : _inviteReceiver,
+                                  style: TextButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    minimumSize: const Size(0, 0),
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  child: _inviting
+                                      ? const SizedBox(
+                                          width: 12,
+                                          height: 12,
+                                          child: CircularProgressIndicator(strokeWidth: 2),
+                                        )
+                                      : const Text('Invite'),
+                                ),
+                              ],
+                            ],
+                          ),
+                        )
+                      else
+                        _DetailRow(
+                          label: 'To',
+                          value: widget.expectation.personId,
+                        ),
+                      if (widget.expectation.seenAt != null)
+                        _DetailRow(
+                          label: 'Seen',
+                          valueWidget: Text(
+                            _createdRelativeLabel(widget.expectation.seenAt!),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: scheme.onSurface,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          hint: _exactDateTimeLabel(widget.expectation.seenAt!),
+                        )
+                      else if (widget.expectation.publishedAt != null)
+                        _DetailRow(
+                          label: 'Published',
+                          valueWidget: Text(
+                            _createdRelativeLabel(widget.expectation.publishedAt!),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: scheme.onSurface,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          hint: _exactDateTimeLabel(widget.expectation.publishedAt!),
+                        )
+                      else if (working.responsibleUpdatedAt != null)
+                        _DetailRow(
+                          label: 'Updated',
+                          valueWidget: Text(
+                            _createdRelativeLabel(working.responsibleUpdatedAt!),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: scheme.onSurface,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          hint: _exactDateTimeLabel(working.responsibleUpdatedAt!),
+                        )
+                      else
+                        _DetailRow(
+                          label: 'Created',
+                          valueWidget: Text(
+                            _createdRelativeLabel(widget.expectation.createdAt),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: scheme.onSurface,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          hint: _exactDateTimeLabel(widget.expectation.createdAt),
+                        ),
+                      if (tags.isNotEmpty)
+                        _DetailRow(
+                          label: 'Tags',
+                          alignTop: true,
+                          valueWidget: Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              for (final t in tags) LedgerTagChip(tag: t),
+                            ],
+                          ),
+                        ),
+                    ];
+                    final right = <Widget>[
+                      _DetailRow(
+                        label: 'Health',
+                        valueWidget: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: canEdit
+                                  ? DropdownButtonHideUnderline(
+                                      child: DropdownButton<ExpectationHealth>(
+                                        value: _health,
+                                        isDense: true,
+                                        style: theme.textTheme.bodySmall?.copyWith(
+                                          color: scheme.onSurface,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                        iconSize: 18,
+                                        items: const [
+                                          DropdownMenuItem(
+                                            value: ExpectationHealth.unknown,
+                                            child: Text('Unknown'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationHealth.onTrack,
+                                            child: Text('On track'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationHealth.atRisk,
+                                            child: Text('At risk'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationHealth.offTrack,
+                                            child: Text('Off track'),
+                                          ),
+                                        ],
+                                        onChanged: (v) => setState(() => _health = v ?? _health),
+                                      ),
+                                    )
+                                  : Text(healthLabel),
+                            ),
+                            if (_health == ExpectationHealth.unknown) ...[
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: 'Set health state',
+                                child: Icon(
+                                  Icons.warning_amber_rounded,
+                                  size: 16,
+                                  color: Colors.amberAccent.shade200,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        dotColor: healthColor,
+                      ),
+                      _DetailRow(
+                        label: 'Status',
+                        valueWidget: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: canEdit
+                                  ? DropdownButtonHideUnderline(
+                                      child: DropdownButton<ExpectationStatus>(
+                                        value: _status,
+                                        isDense: true,
+                                        style: theme.textTheme.bodySmall?.copyWith(
+                                          color: scheme.onSurface,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                        iconSize: 18,
+                                        items: const [
+                                          DropdownMenuItem(
+                                            value: ExpectationStatus.pending,
+                                            child: Text('Pending'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationStatus.accepted,
+                                            child: Text('Accepted'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationStatus.finished,
+                                            child: Text('Finished'),
+                                          ),
+                                          DropdownMenuItem(
+                                            value: ExpectationStatus.abandoned,
+                                            child: Text('Abandoned'),
+                                          ),
+                                        ],
+                                        onChanged: (v) => setState(() => _status = v ?? _status),
+                                      ),
+                                    )
+                                  : Text(statusLabel),
+                            ),
+                            if (_status == ExpectationStatus.pending) ...[
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: 'Status still pending',
+                                child: Icon(
+                                  Icons.warning_amber_rounded,
+                                  size: 16,
+                                  color: Colors.amberAccent.shade200,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        dotColor: statusColor,
+                      ),
+                      _DetailRow(
+                        label: 'Deadline',
+                        valueWidget: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              _deadlineDistanceLabel(working),
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: scheme.onSurface,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            if (canEdit) ...[
+                              const SizedBox(width: 8),
+                              InkResponse(
+                                onTap: _pickDeadline,
+                                radius: 14,
+                                child: Icon(
+                                  Icons.edit_outlined,
+                                  size: 16,
+                                  color: scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        hint: _deadlineTooltip(working),
+                        alignTop: true,
+                      ),
+                      if (_visibility == ExpectationVisibility.echo)
+                        _DetailRow(
+                          label: 'Progress',
+                          valueWidget: Row(
+                            children: [
+                              Flexible(
+                                child: FractionallySizedBox(
+                                  widthFactor: 0.8,
+                                  alignment: Alignment.centerLeft,
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(999),
+                                    child: LinearProgressIndicator(
+                                      value: ((working.progress ?? 0).clamp(0, 100)) / 100.0,
+                                      minHeight: 8,
+                                      backgroundColor: scheme.surfaceContainerHighest,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '${(working.progress ?? 0).clamp(0, 100)}%',
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: scheme.onSurface,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                          trailing: canEdit
+                              ? InkResponse(
+                                  onTap: _editProgress,
+                                  radius: 14,
+                                  child: Icon(
+                                    Icons.edit_outlined,
+                                    size: 16,
+                                    color: scheme.onSurfaceVariant,
+                                  ),
+                                )
+                              : null,
+                        ),
+                    ];
+                    if (constraints.maxWidth < 620) {
+                      return Column(children: [...left, ...right]);
+                    }
+                    final rowCount = left.length > right.length
+                        ? left.length
+                        : right.length;
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            children: [
+                              for (var i = 0; i < rowCount; i++)
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Expanded(
+                                      child: i < left.length
+                                          ? left[i]
+                                          : const SizedBox.shrink(),
+                                    ),
+                                    const SizedBox(width: 16),
+                                    Expanded(
+                                      child: i < right.length
+                                          ? right[i]
+                                          : const SizedBox.shrink(),
+                                    ),
+                                  ],
+                                ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Description',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
                     color: scheme.onSurface,
                   ),
                 ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(10),
+                    color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
+                    border: Border.all(color: scheme.outline.withValues(alpha: 0.28)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: _editingDescription && canEdit
+                                ? TextField(
+                                    controller: _descriptionController,
+                                    minLines: 4,
+                                    maxLines: 10,
+                                    decoration: const InputDecoration(
+                                      border: OutlineInputBorder(),
+                                    ),
+                                  )
+                                : Text(
+                                    _descriptionController.text,
+                                    style: theme.textTheme.bodyMedium
+                                        ?.copyWith(height: 1.45),
+                                  ),
+                          ),
+                          if (canEdit) ...[
+                            const SizedBox(width: 8),
+                            SizedBox(
+                              width: 32,
+                              child: IconButton(
+                                tooltip: 'Edit description',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () => setState(() {
+                                  _editingDescription = !_editingDescription;
+                                }),
+                                icon: Icon(
+                                  _editingDescription
+                                      ? Icons.edit_off_outlined
+                                      : Icons.edit_outlined,
+                                  size: 18,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    if (canDelete)
+                      TextButton.icon(
+                        onPressed: (_saving || _deleting) ? null : _deleteExpectation,
+                        icon: _deleting
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.delete_outline),
+                        label: const Text('Delete'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: scheme.error,
+                        ),
+                      ),
+                    const Spacer(),
+                    FilledButton(
+                      onPressed: (_saving || _deleting || !_dirty || !canEdit)
+                          ? null
+                          : _save,
+                      child: const Text('Save'),
+                    ),
+                    const SizedBox(width: 8),
+                    if (canEdit &&
+                        _visibility == ExpectationVisibility.shadow &&
+                        !_editingDescription)
+                      FilledButton(
+                        onPressed: (_saving || _deleting)
+                            ? null
+                            : () => _save(publish: true),
+                        child: const Text('Publish'),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 15),
+                const Divider(height: 1),
+                const SizedBox(height: 15),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(minHeight: 300),
+                  child: _messagesLoading
+                      ? const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 8),
+                          child: Text('Loading conversation...'),
+                        )
+                      : _messagesError != null
+                      ? Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(
+                            _messagesError!,
+                            style: TextStyle(color: scheme.error),
+                          ),
+                        )
+                      : _messages.isNotEmpty
+                      ? Column(
+                          children: [
+                            for (var i = 0; i < _messages.length; i++) ...[
+                              if (i > 0) const SizedBox(height: 14),
+                              (() {
+                                final m = _messages[i];
+                                final mine = m.senderPersonId == _myPersonId;
+                                return Align(
+                                  alignment:
+                                      mine ? Alignment.centerRight : Alignment.centerLeft,
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                                    child: Container(
+                                      constraints: const BoxConstraints(maxWidth: 520),
+                                      padding: const EdgeInsets.all(12),
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(10),
+                                        color: mine
+                                            ? scheme.primaryContainer.withValues(alpha: 0.55)
+                                            : scheme.surfaceContainerHigh.withValues(alpha: 0.45),
+                                      ),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '${m.senderLabel} · ${_chatRelativeLabel(m.createdAt)}',
+                                            style: theme.textTheme.labelSmall?.copyWith(
+                                              color: scheme.onSurfaceVariant,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            m.messageText,
+                                            style: theme.textTheme.bodyMedium,
+                                          ),
+                                          for (final a in m.attachments) ...[
+                                            const SizedBox(height: 4),
+                                            InkWell(
+                                              onTap: () => _openAttachmentUrl(a.fileUrl),
+                                              borderRadius: BorderRadius.circular(6),
+                                              child: MouseRegion(
+                                                cursor: SystemMouseCursors.click,
+                                                child: Padding(
+                                                  padding: const EdgeInsets.symmetric(
+                                                    horizontal: 2,
+                                                    vertical: 2,
+                                                  ),
+                                                  child: Text(
+                                                    a.fileName,
+                                                    style: theme.textTheme.bodySmall?.copyWith(
+                                                      color: scheme.primary,
+                                                      decoration: TextDecoration.underline,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              })(),
+                            ],
+                          ],
+                        )
+                      : const SizedBox.shrink(),
+                ),
+                const SizedBox(height: 15),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _messageController,
+                        onChanged: (_) => setState(() {}),
+                        minLines: 2,
+                        maxLines: 5,
+                        style: theme.textTheme.bodySmall,
+                        decoration: InputDecoration(
+                          hintText: 'Write a message...',
+                          hintStyle: theme.textTheme.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant.withValues(alpha: 0.78),
+                          ),
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 10,
+                          ),
+                          border: const OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    IconButton(
+                      tooltip: 'Attach file',
+                      onPressed: _uploadingAttachment ? null : _pickAndUploadAttachment,
+                      icon: _uploadingAttachment
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.attach_file),
+                    ),
+                  ],
+                ),
+                if (_pendingAttachments.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (var i = 0; i < _pendingAttachments.length; i++)
+                        InputChip(
+                          label: Text(_pendingAttachments[i].fileName),
+                          onDeleted: () {
+                            setState(() {
+                              _pendingAttachments.removeAt(i);
+                            });
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton.icon(
+                    onPressed: canSendMessage ? _sendMessage : null,
+                    icon: const Icon(Icons.send_outlined),
+                    label: const Text('Send'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DetailRow extends StatelessWidget {
+  const _DetailRow({
+    required this.label,
+    this.value,
+    this.valueWidget,
+    this.hint,
+    this.dotColor,
+    this.trailing,
+    this.alignTop = false,
+  });
+
+  final String label;
+  final String? value;
+  final Widget? valueWidget;
+  final String? hint;
+  final Color? dotColor;
+  final Widget? trailing;
+  final bool alignTop;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final valueNode = Row(
+      mainAxisSize: MainAxisSize.max,
+      crossAxisAlignment: alignTop ? CrossAxisAlignment.start : CrossAxisAlignment.center,
+      children: [
+        if (dotColor != null) ...[
+          Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 6),
+        ],
+        Expanded(
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: valueWidget ??
+                Text(
+                  value ?? '',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: scheme.onSurface,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+          ),
+        ),
+        if (trailing != null) ...[
+          const SizedBox(width: 4),
+          Align(
+            alignment: alignTop ? Alignment.topCenter : Alignment.center,
+            child: trailing!,
+          ),
+        ],
+      ],
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: alignTop ? CrossAxisAlignment.start : CrossAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 98,
+            child: Text(
+              label,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
               ),
-              ExpectationStatusBadge(status: e.status),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            e.summary,
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: scheme.onSurfaceVariant,
-              height: 1.4,
             ),
           ),
-          const SizedBox(height: 6),
-          Text(
-            e.deadlineLabel,
-            style: theme.textTheme.bodySmall?.copyWith(
-              fontFamily: 'monospace',
-              color: const Color(0xFF9E9E9E),
-            ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: hint == null ? valueNode : Tooltip(message: hint!, child: valueNode),
           ),
         ],
       ),

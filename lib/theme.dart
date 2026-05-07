@@ -4,8 +4,6 @@ import 'package:flutter/material.dart';
 abstract final class AppColors {
   static const Color charcoal = Color(0xFF121212);
   static const Color glassBorder = Color(0x33FFFFFF);
-  static const Color modernSeed = Color(0xFF4F46E5);
-  static const Color modernSurface = Color(0xFFF8FAFC);
   static const Color lightSeed = Color(0xFF1565C0);
   static const Color darkSeed = Color(0xFF90CAF9);
 }
@@ -71,24 +69,6 @@ abstract final class AppTheme {
     );
   }
 
-  static ThemeData get modern {
-    final base = ColorScheme.fromSeed(
-      seedColor: AppColors.modernSeed,
-      brightness: Brightness.light,
-      surface: AppColors.modernSurface,
-    );
-    return _base(base).copyWith(
-      scaffoldBackgroundColor: AppColors.modernSurface,
-      cardTheme: CardThemeData(
-        elevation: 0,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-          side: BorderSide(color: base.outlineVariant.withValues(alpha: 0.5)),
-        ),
-      ),
-    );
-  }
-
   static ThemeData _base(ColorScheme scheme) {
     return ThemeData(
       useMaterial3: true,
@@ -120,13 +100,11 @@ abstract final class AppTheme {
 enum AppThemeVariant {
   light,
   dark,
-  modern,
 }
 
 extension AppThemeVariantX on AppThemeVariant {
   ThemeData get themeData => switch (this) {
         AppThemeVariant.light => AppTheme.light,
         AppThemeVariant.dark => AppTheme.dark,
-        AppThemeVariant.modern => AppTheme.modern,
       };
 }

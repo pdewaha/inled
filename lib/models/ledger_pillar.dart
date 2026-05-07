@@ -23,7 +23,7 @@ extension LedgerPillarX on LedgerPillar {
 
   String get description => switch (this) {
         LedgerPillar.home =>
-          'Draft a commitment line. Hit Enter to capture it.',
+          'Capture a commitment line. Hit Enter to save it.',
         LedgerPillar.expectationsMe =>
           'Inbound commitments',
         LedgerPillar.expectationsOthers =>

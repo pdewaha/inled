@@ -15,13 +15,18 @@ class ExpectationStatusBadge extends StatelessWidget {
           scheme.onSurfaceVariant,
           scheme.surfaceContainerHighest,
         ),
-      ExpectationStatus.contracted => (
-          'Contracted',
+      ExpectationStatus.accepted => (
+          'Accepted',
           scheme.onTertiaryContainer,
           scheme.tertiaryContainer,
         ),
-      ExpectationStatus.breached => (
-          'Breached',
+      ExpectationStatus.finished => (
+          'Finished',
+          scheme.onPrimaryContainer,
+          scheme.primaryContainer,
+        ),
+      ExpectationStatus.abandoned => (
+          'Abandoned',
           scheme.onErrorContainer,
           scheme.errorContainer,
         ),

@@ -371,11 +371,9 @@ class _IdeaBullet extends StatelessWidget {
 IconData _iconFor(AppThemeVariant v) => switch (v) {
       AppThemeVariant.light => Icons.light_mode_outlined,
       AppThemeVariant.dark => Icons.dark_mode_outlined,
-      AppThemeVariant.modern => Icons.auto_awesome_outlined,
     };
 
 String _labelFor(AppThemeVariant v) => switch (v) {
       AppThemeVariant.light => 'Light',
       AppThemeVariant.dark => 'Dark',
-      AppThemeVariant.modern => 'Modern',
     };

@@ -1,5 +1,6 @@
 import 'package:inled/data_sources/ledger_data_source.dart';
 import 'package:inled/models/expectation.dart';
+import 'package:inled/models/expectation_health.dart';
 import 'package:inled/models/expectation_status.dart';
 import 'package:inled/models/expectation_visibility.dart';
 import 'package:inled/models/person.dart';
@@ -17,6 +18,7 @@ class LocalLedgerDataSource implements LedgerDataSource {
           createdAt: _t,
           displayName: 'John Mercer',
           handle: 'John',
+          authUserId: null,
           email: 'john.mercer@company.com',
           title: 'Head of Operations',
         ),
@@ -25,6 +27,7 @@ class LocalLedgerDataSource implements LedgerDataSource {
           createdAt: _t,
           displayName: 'Ava Lindström',
           handle: 'Ava',
+          authUserId: null,
           email: 'ava.lindstrom@company.com',
           title: 'Engineering Lead',
         ),
@@ -38,7 +41,13 @@ class LocalLedgerDataSource implements LedgerDataSource {
           personId: 'person_john',
           summary: 'Audit access reviews for prod admin roles.',
           deadlineLabel: 'Fri 9 May',
-          status: ExpectationStatus.contracted,
+          deadlineAt: null,
+          responsibleUpdatedAt: _t,
+          publishedAt: _t,
+          seenAt: null,
+          progress: 35,
+          health: ExpectationHealth.onTrack,
+          status: ExpectationStatus.accepted,
           visibility: ExpectationVisibility.echo,
         ),
         Expectation(
@@ -47,6 +56,12 @@ class LocalLedgerDataSource implements LedgerDataSource {
           personId: 'person_ava',
           summary: 'Publish error-budget policy draft to leadership.',
           deadlineLabel: 'Mon 12 May',
+          deadlineAt: null,
+          responsibleUpdatedAt: _t,
+          publishedAt: null,
+          seenAt: null,
+          progress: 0,
+          health: ExpectationHealth.unknown,
           status: ExpectationStatus.pending,
           visibility: ExpectationVisibility.shadow,
         ),
@@ -56,7 +71,13 @@ class LocalLedgerDataSource implements LedgerDataSource {
           personId: 'person_john',
           summary: 'Rotate legacy integration secrets.',
           deadlineLabel: 'Wed 30 Apr',
-          status: ExpectationStatus.breached,
+          deadlineAt: null,
+          responsibleUpdatedAt: _t,
+          publishedAt: _t,
+          seenAt: null,
+          progress: 80,
+          health: ExpectationHealth.offTrack,
+          status: ExpectationStatus.finished,
           visibility: ExpectationVisibility.echo,
         ),
       ];

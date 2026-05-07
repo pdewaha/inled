@@ -7,6 +7,7 @@ class FeedEntry {
     required this.createdAt,
     required this.body,
     this.parse,
+    this.linkedExpectationId,
     this.isUserCapture = false,
   });
 
@@ -14,5 +15,6 @@ class FeedEntry {
   final DateTime createdAt;
   final String body;
   final CaptureParseResult? parse;
+  final String? linkedExpectationId;
   final bool isUserCapture;
 }

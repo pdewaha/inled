@@ -5,6 +5,7 @@ class Person {
     required this.createdAt,
     required this.displayName,
     required this.handle,
+    this.authUserId,
     this.email,
     this.title,
   });
@@ -13,6 +14,7 @@ class Person {
   final DateTime createdAt;
   final String displayName;
   final String handle;
+  final String? authUserId;
   final String? email;
   final String? title;
 }

@@ -86,8 +86,13 @@ CREATE TABLE IF NOT EXISTS expectations (
   summary text NOT NULL,
   deadline_label text,
   deadline_at timestamptz,
+  finished_at timestamptz,
+  responsible_updated_at timestamptz,
+  last_chatted_sender_at timestamptz,
+  last_chatted_receiver_at timestamptz,
   progress integer,
   expectation_status integer NOT NULL,
+  expectation_health integer NOT NULL DEFAULT 0,
   expectation_visibility integer NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz
@@ -101,6 +106,13 @@ CREATE INDEX IF NOT EXISTS idx_expectations_company_target
 
 CREATE INDEX IF NOT EXISTS idx_expectations_company_status
   ON expectations (company_id, expectation_status);
+
+ALTER TABLE expectations
+  ADD COLUMN IF NOT EXISTS finished_at timestamptz,
+  ADD COLUMN IF NOT EXISTS responsible_updated_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_chatted_sender_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_chatted_receiver_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expectation_health integer NOT NULL DEFAULT 0;
 
 -- Reusable tag dictionary per company
 CREATE TABLE IF NOT EXISTS expectation_tags (
@@ -152,3 +164,34 @@ CREATE TABLE IF NOT EXISTS ledger_captures (
 
 CREATE INDEX IF NOT EXISTS idx_ledger_captures_company_pillar_created
   ON ledger_captures (company_id, ledger_pillar, created_at DESC);
+
+-- Private sender/receiver chat per expectation (text first, optional attachments).
+CREATE TABLE IF NOT EXISTS expectation_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  expectation_id uuid NOT NULL REFERENCES expectations(id) ON DELETE CASCADE,
+  sender_person_id uuid NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
+  message_text text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_messages_expectation_created
+  ON expectation_messages (expectation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_messages_company_expectation
+  ON expectation_messages (company_id, expectation_id);
+
+CREATE TABLE IF NOT EXISTS expectation_message_attachments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  expectation_message_id uuid NOT NULL REFERENCES expectation_messages(id) ON DELETE CASCADE,
+  file_name text NOT NULL,
+  file_url text NOT NULL,
+  mime_type text,
+  file_size_bytes bigint,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_message_attachments_message_id
+  ON expectation_message_attachments (expectation_message_id);
