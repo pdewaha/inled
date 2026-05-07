@@ -8,12 +8,14 @@ class CommandCaptureBar extends StatefulWidget {
     required this.controller,
     required this.focusNode,
     required this.accentColor,
+    required this.hintText,
     this.onTabPressed,
   });
 
   final TextEditingController controller;
   final FocusNode focusNode;
   final Color accentColor;
+  final String hintText;
   final VoidCallback? onTabPressed;
 
   @override
@@ -51,6 +53,9 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
     final scheme = Theme.of(context).colorScheme;
     final focused = widget.focusNode.hasFocus;
     final focusGlowColor = Color.lerp(scheme.onSurface, Colors.white, 0.55)!;
+    final indicatorColor = focused
+        ? focusGlowColor.withValues(alpha: 0.92)
+        : scheme.onSurfaceVariant.withValues(alpha: 0.85);
     final glow = focused
         ? [
             BoxShadow(
@@ -87,7 +92,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
           children: [
             Padding(
               padding: const EdgeInsets.only(top: 4),
-              child: Icon(Icons.chevron_right, color: widget.accentColor, size: 22),
+              child: Icon(Icons.chevron_right, color: indicatorColor, size: 22),
             ),
             Expanded(
               child: Shortcuts(
@@ -112,9 +117,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
                     textInputAction: TextInputAction.newline,
                     decoration: InputDecoration(
                       isDense: true,
-                      hintText:
-                          'Take note of your expectation. Use @<name> to target someone specific, '
-                          'or @me for yourself. #<hashtags> are allowed too to link expectations to a topic.',
+                      hintText: widget.hintText,
                       hintStyle: _mono.copyWith(
                         color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
                         height: 1.35,

@@ -1,0 +1,4 @@
+enum ExpectationType {
+  expectation,
+  topic,
+}

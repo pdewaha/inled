@@ -1,5 +1,6 @@
 import 'package:inled/models/expectation_health.dart';
 import 'package:inled/models/expectation_status.dart';
+import 'package:inled/models/expectation_type.dart';
 import 'package:inled/models/expectation_visibility.dart';
 
 /// Specific handshake — the "How".
@@ -20,6 +21,7 @@ class Expectation {
     this.lastChattedReceiverAt,
     this.progress,
     this.health = ExpectationHealth.unknown,
+    this.type = ExpectationType.expectation,
     required this.status,
     required this.visibility,
   });
@@ -40,6 +42,7 @@ class Expectation {
   /// 0..100, nullable when unknown.
   final int? progress;
   final ExpectationHealth health;
+  final ExpectationType type;
   final ExpectationStatus status;
   final ExpectationVisibility visibility;
 }

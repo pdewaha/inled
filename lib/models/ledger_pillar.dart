@@ -18,7 +18,7 @@ extension LedgerPillarX on LedgerPillar {
         LedgerPillar.expectationsMe => 'Towards me',
         LedgerPillar.expectationsOthers => 'Towards others',
         LedgerPillar.people => 'People',
-        LedgerPillar.tags => 'Tags',
+        LedgerPillar.tags => 'Topics',
       };
 
   String get description => switch (this) {
@@ -29,7 +29,7 @@ extension LedgerPillarX on LedgerPillar {
         LedgerPillar.expectationsOthers =>
           'Dispatched expectations',
         LedgerPillar.people => 'Your team and collaborators.',
-        LedgerPillar.tags => 'Classification tags across expectations.',
+        LedgerPillar.tags => 'Browse and manage topics grouped by #hashtags.',
       };
 
   /// Accent for focus glow and sidebar selection (not full theme tint).

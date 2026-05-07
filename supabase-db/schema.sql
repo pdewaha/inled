@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS expectations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   writer_user_id uuid NOT NULL,
-  target_person_id uuid NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
+  target_person_id uuid REFERENCES people(id) ON DELETE RESTRICT,
   title text NOT NULL,
   summary text NOT NULL,
   deadline_label text,
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS expectations (
   progress integer,
   expectation_status integer NOT NULL,
   expectation_health integer NOT NULL DEFAULT 0,
+  expectation_type integer NOT NULL DEFAULT 0,
   expectation_visibility integer NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz
@@ -112,7 +113,15 @@ ALTER TABLE expectations
   ADD COLUMN IF NOT EXISTS responsible_updated_at timestamptz,
   ADD COLUMN IF NOT EXISTS last_chatted_sender_at timestamptz,
   ADD COLUMN IF NOT EXISTS last_chatted_receiver_at timestamptz,
-  ADD COLUMN IF NOT EXISTS expectation_health integer NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS expectation_health integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS expectation_type integer NOT NULL DEFAULT 0;
+
+ALTER TABLE expectations
+  ALTER COLUMN target_person_id DROP NOT NULL;
+
+UPDATE expectations
+SET expectation_type = 1
+WHERE target_person_id IS NULL;
 
 -- Reusable tag dictionary per company
 CREATE TABLE IF NOT EXISTS expectation_tags (

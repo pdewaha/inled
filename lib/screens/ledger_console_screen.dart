@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:inled/models/expectation.dart';
 import 'package:inled/models/expectation_health.dart';
+import 'package:inled/models/expectation_type.dart';
 import 'package:inled/models/feed_entry.dart';
 import 'package:inled/models/ledger_pillar.dart';
 import 'package:inled/models/person.dart';
@@ -33,6 +34,7 @@ class LedgerConsoleScreen extends StatefulWidget {
 }
 
 class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
+  static const _composerDefaultMode = _ComposerEntryMode.topic;
   final _captureController = TextEditingController();
   final _captureFocus = FocusNode();
   final _scrollController = ScrollController();
@@ -60,6 +62,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   bool _keyboardHookRegistered = false;
   bool _submitInFlight = false;
   bool _refreshInFlight = false;
+  _ComposerEntryMode _composerMode = _composerDefaultMode;
   String? _activeMentionQuery;
   int? _activeMentionStart;
   int? _activeMentionEnd;
@@ -365,7 +368,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       final rows = await client
           .from('expectations')
           .select(
-            'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,progress,expectation_status,expectation_health,expectation_visibility',
+            'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,progress,expectation_status,expectation_health,expectation_visibility,expectation_type',
           )
           .eq('company_id', companyId)
           .order('created_at', ascending: false);
@@ -374,8 +377,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         final statusIdx = (r['expectation_status'] as num?)?.toInt() ?? 0;
         final healthIdx = (r['expectation_health'] as num?)?.toInt() ?? 0;
         final visIdx = (r['expectation_visibility'] as num?)?.toInt() ?? 0;
+        final typeIdx = (r['expectation_type'] as num?)?.toInt() ?? 0;
         final status = _statusFromDb(statusIdx);
         final health = _healthFromDb(healthIdx);
+        final type = _typeFromDb(typeIdx);
         final visibility =
             (visIdx >= 0 && visIdx < ExpectationVisibility.values.length)
             ? ExpectationVisibility.values[visIdx]
@@ -385,7 +390,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           createdAt: DateTime.tryParse(r['created_at'] as String? ?? '') ??
               DateTime.now().toUtc(),
           writerUserId: r['writer_user_id'] as String?,
-          personId: r['target_person_id'] as String,
+          personId: (r['target_person_id'] as String?) ?? '',
           summary: ((r['summary'] as String?) ?? '').trim(),
           deadlineLabel: ((r['deadline_label'] as String?) ?? 'TBD').trim(),
           deadlineAt: DateTime.tryParse((r['deadline_at'] as String?) ?? ''),
@@ -406,6 +411,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           ),
           progress: (r['progress'] as num?)?.toInt(),
           health: health,
+          type: type,
           status: status,
           visibility: visibility,
         );
@@ -618,6 +624,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
     _submitInFlight = true;
     final handle = _extractMentionHandle(text);
+    final entryType = _composerMode == _ComposerEntryMode.topic
+        ? ExpectationType.topic
+        : ExpectationType.expectation;
     Person? person;
     var shouldAskSubmitMode = true;
     if (handle != null) {
@@ -653,6 +662,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
     final storedText = _normalizeExpectationTextForStorage(text);
     final parse = parseCaptureLine(text);
+    if (entryType == ExpectationType.topic && person == null && shouldAskSubmitMode) {
+      final acknowledged = await _acknowledgeDiscussionPointWithoutReceiver();
+      if (!acknowledged) {
+        _submitInFlight = false;
+        return;
+      }
+    }
     final mode = shouldAskSubmitMode
         ? await _askSubmitMode()
         : _ExpectationSubmitMode.inform;
@@ -675,40 +691,41 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         linkedExpectationId: person != null ? tempExpectationId : null,
         isUserCapture: true,
       ));
-      final target = person ?? (_people.isNotEmpty ? _people.first : null);
-      if (target != null) {
-        _expectations.insert(
-          0,
-          Expectation(
-            id: tempExpectationId,
-            createdAt: DateTime.now().toUtc(),
-            writerUserId: Supabase.instance.client.auth.currentUser?.id,
-            personId: target.id,
-            summary: storedText,
-            deadlineLabel: 'TBD',
-            deadlineAt: null,
-            finishedAt: null,
-            responsibleUpdatedAt: DateTime.now().toUtc(),
-            publishedAt: visibility == ExpectationVisibility.echo
-                ? DateTime.now().toUtc()
-                : null,
-            seenAt: null,
-            lastChattedSenderAt: null,
-            lastChattedReceiverAt: null,
-            progress: 0,
-            health: ExpectationHealth.unknown,
-            status: ExpectationStatus.pending,
-            visibility: visibility,
-          ),
-        );
-      }
+      final target = person;
+      _expectations.insert(
+        0,
+        Expectation(
+          id: tempExpectationId,
+          createdAt: DateTime.now().toUtc(),
+          writerUserId: Supabase.instance.client.auth.currentUser?.id,
+          personId: target?.id ?? '',
+          summary: storedText,
+          deadlineLabel: 'TBD',
+          deadlineAt: null,
+          finishedAt: null,
+          responsibleUpdatedAt: DateTime.now().toUtc(),
+          publishedAt: visibility == ExpectationVisibility.echo
+              ? DateTime.now().toUtc()
+              : null,
+          seenAt: null,
+          lastChattedSenderAt: null,
+          lastChattedReceiverAt: null,
+          progress: 0,
+          health: ExpectationHealth.unknown,
+          type: entryType,
+          status: ExpectationStatus.pending,
+          visibility: visibility,
+        ),
+      );
       _captureController.clear();
+      _composerMode = _composerDefaultMode;
     });
     try {
       final persistedExpectationId = await _persistExpectationToSupabase(
         text: storedText,
         visibility: visibility,
-        target: person ?? (_people.isNotEmpty ? _people.first : null),
+        type: entryType,
+        target: person,
       );
       if (mounted) {
         setState(() {
@@ -965,6 +982,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   Future<String> _persistExpectationToSupabase({
     required String text,
     required ExpectationVisibility visibility,
+    required ExpectationType type,
     required Person? target,
   }) async {
     final client = Supabase.instance.client;
@@ -981,12 +999,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if ((meRows as List).isEmpty) {
       throw Exception('No linked person/company for this user.');
     }
-    final writerPersonId = meRows.first['id'] as String;
     final companyId = meRows.first['company_id'] as String;
 
     final targetPersonId = (target != null && _uuidRegex.hasMatch(target.id))
         ? target.id
-        : writerPersonId;
+        : null;
     final title = text.length > 80 ? '${text.substring(0, 80)}...' : text;
 
     final inserted = await client.from('expectations').insert({
@@ -1000,6 +1017,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       'progress': 0,
       'expectation_status': _statusToDb(ExpectationStatus.pending),
       'expectation_health': _healthToDb(ExpectationHealth.unknown),
+      'expectation_type': _typeToDb(type),
       'expectation_visibility': visibility.index,
     }).select('id').single();
 
@@ -1223,7 +1241,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return AlertDialog(
           title: const Text('Save expectation'),
           content: const Text(
-            'Do you want to keep this shadowed, or directly publish it?',
+            'Do you want to keep this personal, to continue working on it on your own, or directly make it accessible to others by publishing?',
           ),
           actions: [
             TextButton(
@@ -1233,7 +1251,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             TextButton(
               onPressed: () =>
                   Navigator.of(context).pop(_ExpectationSubmitMode.draft),
-              child: const Text('Keep shadowed'),
+              child: const Text('Keep personal'),
             ),
             FilledButton(
               onPressed: () =>
@@ -1244,6 +1262,28 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         );
       },
     );
+  }
+
+  Future<bool> _acknowledgeDiscussionPointWithoutReceiver() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('No receiver selected'),
+          content: const Text(
+            'This topic has no receiver.',
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+    return confirmed == true;
   }
 
   Future<String?> _askOptionalEmailForHandle(String handle) async {
@@ -1323,7 +1363,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return Dialog(
           insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 760, maxHeight: 900),
+            constraints: BoxConstraints(
+              maxWidth: 760,
+              maxHeight: _isDiscussionPoint(e) ? 720 : 900,
+            ),
             child: _ExpectationDetailsPanel(
               expectation: e,
               person: person,
@@ -1428,6 +1471,29 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       _PillarHeader(pillar: _pillar, theme: theme),
                       const SizedBox(height: 12),
                       if (_pillar == LedgerPillar.home) ...[
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: SegmentedButton<_ComposerEntryMode>(
+                            segments: const [
+                              ButtonSegment<_ComposerEntryMode>(
+                                value: _ComposerEntryMode.topic,
+                                label: Text('Topic'),
+                                icon: Icon(Icons.forum_outlined),
+                              ),
+                              ButtonSegment<_ComposerEntryMode>(
+                                value: _ComposerEntryMode.expectation,
+                                label: Text('Expectation'),
+                                icon: Icon(Icons.flag_outlined),
+                              ),
+                            ],
+                            selected: {_composerMode},
+                            onSelectionChanged: (selection) {
+                              if (selection.isEmpty) return;
+                              setState(() => _composerMode = selection.first);
+                            },
+                          ),
+                        ),
+                        const SizedBox(height: 8),
                         Padding(
                           padding:
                               const EdgeInsets.symmetric(vertical: 8),
@@ -1435,6 +1501,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             controller: _captureController,
                             focusNode: _captureFocus,
                             accentColor: _pillar.accent,
+                            hintText: _composerMode == _ComposerEntryMode.topic
+                                ? 'Capture a topic for discussion or preparation. You can use #hashtags and @mentions (people or groups), but this stays a topic without expectation tracking (status/health/progress).'
+                                : 'Capture an expectation. Use @<name> (or @me) and #hashtags. Expectations include follow-up signals like status, health, deadline and progress.',
                             onTabPressed: _onComposerTabPressed,
                           ),
                         ),
@@ -1550,6 +1619,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               scheme: scheme,
               theme: theme,
               people: people,
+              linkedExpectation: linkedExpectation,
               onOpenDetails: linkedExpectation == null
                   ? null
                   : () =>
@@ -1621,8 +1691,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           );
         } else {
           final publicTagged = expectations.where((x) {
-            // Tagged expectations with explicit @mentions are private.
-            if (_atTagRegex.hasMatch(x.summary)) return false;
+            // Topics page: only published topics without receiver.
+            if (x.visibility != ExpectationVisibility.echo) return false;
+            if (x.type != ExpectationType.topic) return false;
+            if (x.personId.trim().isNotEmpty) return false;
             return _extractInlineTags(x.summary).isNotEmpty;
           }).toList();
           final availableTags = publicTagged
@@ -1667,8 +1739,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             _ExpectationsOthersSection(
               title: 'Inflow',
               emptyText: activeTag == null
-                  ? 'No public tagged expectations yet.'
-                  : 'No inflow expectations for #$activeTag.',
+                  ? 'No published topics yet.'
+                  : 'No inflow topics for #$activeTag.',
               items: inflow,
               peopleById: peopleById,
               theme: theme,
@@ -1686,8 +1758,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             _ExpectationsOthersSection(
               title: 'Archive',
               emptyText: activeTag == null
-                  ? 'No archived tagged expectations.'
-                  : 'No archive expectations for #$activeTag.',
+                  ? 'No archived topics.'
+                  : 'No archive topics for #$activeTag.',
               items: archive,
               peopleById: peopleById,
               theme: theme,
@@ -1874,10 +1946,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         final archive = filteredTowardsOthers.where(isTerminal).toList();
         out.add(
           _ExpectationsOthersSection(
-            title: 'Shadowed',
-            emptyText: 'No shadowed expectations towards others yet.',
+            title: 'Personal',
+            emptyText: 'No personal expectations towards others yet.',
             infoTooltip:
-                'Shadowed items, are only visible to you, you can use them to prepare a more definite version and then publish it, so it becomes visible to the chosen receiver',
+                'Personal items are only visible to you. You can use them to prepare a more definite version and then publish it, so it becomes visible to the chosen receiver',
             items: drafts,
             peopleById: peopleById,
             theme: theme,
@@ -1988,6 +2060,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       };
 }
 
+enum _ComposerEntryMode {
+  topic,
+  expectation,
+}
+
 enum _ExpectationSubmitMode {
   draft,
   inform,
@@ -2051,7 +2128,7 @@ class _PillarRail extends StatelessWidget {
                           LedgerPillar.home.accent.withValues(alpha: 0.12),
                       onTap: () => onSelect(LedgerPillar.home),
                     ),
-                    _railSectionHeading(context, 'Expectations', primary: true),
+                    _railSectionHeading(context, 'Actions & Topics', primary: true),
                     for (final p in _sidebarOrder)
                       _expandedPillarTile(
                         context,
@@ -2515,7 +2592,7 @@ class _RecentTagsCloud extends StatelessWidget {
     if (tags.isEmpty) {
       return _Glass(
         child: Text(
-          'No recent tags yet. Create expectations with #tags to build the cloud.',
+          'No recent topics yet. Create entries with #tags to build the cloud.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: scheme.onSurfaceVariant,
           ),
@@ -2553,7 +2630,7 @@ class _TagsLoadingCard extends StatelessWidget {
             child: CircularProgressIndicator(strokeWidth: 2),
           ),
           SizedBox(width: 10),
-          Text('Loading recent tags...'),
+          Text('Loading recent topics...'),
         ],
       ),
     );
@@ -2652,6 +2729,7 @@ class _PillarHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = theme.colorScheme;
+    final headerAccent = Color.lerp(scheme.onSurface, Colors.white, 0.55)!;
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Column(
@@ -2663,7 +2741,7 @@ class _PillarHeader extends StatelessWidget {
                 width: 4,
                 height: 22,
                 decoration: BoxDecoration(
-                  color: pillar.accent,
+                  color: headerAccent.withValues(alpha: 0.92),
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
@@ -2718,6 +2796,7 @@ class _RecentCaptureTile extends StatefulWidget {
     required this.scheme,
     required this.theme,
     required this.people,
+    this.linkedExpectation,
     this.onOpenDetails,
   });
 
@@ -2725,6 +2804,7 @@ class _RecentCaptureTile extends StatefulWidget {
   final ColorScheme scheme;
   final ThemeData theme;
   final List<Person> people;
+  final Expectation? linkedExpectation;
   final VoidCallback? onOpenDetails;
 
   @override
@@ -2742,13 +2822,18 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
         _mentionRegex.firstMatch(widget.entry.body)?.group(1)?.trim();
     final handle =
         (parseHandle?.isNotEmpty ?? false) ? parseHandle! : mentionHandle;
-    if (handle == null || handle.isEmpty) return 'Capture';
+    if (handle == null || handle.isEmpty) return 'General';
     for (final person in widget.people) {
       if (person.handle.toLowerCase() == handle.toLowerCase()) {
         return person.displayName;
       }
     }
     return '@$handle';
+  }
+
+  String _entryTypeLabel() {
+    final type = widget.linkedExpectation?.type ?? ExpectationType.expectation;
+    return type == ExpectationType.topic ? 'Topic' : 'Expectation';
   }
 
   void _syncOverflowState({
@@ -2777,6 +2862,7 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
   @override
   Widget build(BuildContext context) {
     final who = _targetLabel();
+    final typeLabel = _entryTypeLabel();
     final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
@@ -2785,6 +2871,8 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
       fontSize: 14,
     );
     final parse = widget.entry.parse;
+    final showPersonalIndicator =
+        widget.linkedExpectation?.visibility == ExpectationVisibility.shadow;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       child: Material(
@@ -2861,27 +2949,37 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
-                  Tooltip(
-                    message: _timeLabel(widget.entry.createdAt),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 2,
+                  if (showPersonalIndicator)
+                    Tooltip(
+                      message: 'Personal',
+                      child: Icon(
+                        Icons.visibility_off_outlined,
+                        size: 16,
+                        color: widget.scheme.onSurfaceVariant,
                       ),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(999),
-                        color: widget.scheme.surfaceContainerHigh
-                            .withValues(alpha: 0.65),
-                      ),
-                      child: Text(
-                        _timeLabel(widget.entry.createdAt),
-                        style: widget.theme.textTheme.labelSmall?.copyWith(
-                          color: widget.scheme.onSurfaceVariant,
-                          fontFamily: 'monospace',
+                    )
+                  else
+                    Tooltip(
+                      message: _timeLabel(widget.entry.createdAt),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(999),
+                          color: widget.scheme.surfaceContainerHigh
+                              .withValues(alpha: 0.65),
+                        ),
+                        child: Text(
+                          _timeLabel(widget.entry.createdAt),
+                          style: widget.theme.textTheme.labelSmall?.copyWith(
+                            color: widget.scheme.onSurfaceVariant,
+                            fontFamily: 'monospace',
+                          ),
                         ),
                       ),
                     ),
-                  ),
                   if (_canExpand) ...[
                     const SizedBox(height: 4),
                     IconButton(
@@ -2896,6 +2994,8 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
                       ),
                     ),
                   ],
+                  const SizedBox(height: 8),
+                  _MiniTag(typeLabel, widget.scheme),
                 ],
               ),
               ],
@@ -3008,6 +3108,20 @@ DateTime _finishedReferenceAt(Expectation e) {
   return (e.seenAt ?? e.publishedAt ?? e.createdAt).toUtc();
 }
 
+ExpectationType _typeFromDb(int value) {
+  return switch (value) {
+    1 => ExpectationType.topic,
+    _ => ExpectationType.expectation,
+  };
+}
+
+int _typeToDb(ExpectationType type) {
+  return switch (type) {
+    ExpectationType.expectation => 0,
+    ExpectationType.topic => 1,
+  };
+}
+
 ExpectationStatus _statusFromDb(int value) {
   return switch (value) {
     0 => ExpectationStatus.pending,
@@ -3075,7 +3189,11 @@ String _seenTooltip(Expectation e) {
   if (e.publishedAt != null) {
     return 'Published: ${_exactDateTimeLabel(e.publishedAt!)}';
   }
-  return 'Shadowed';
+  return 'Personal';
+}
+
+bool _isDiscussionPoint(Expectation e) {
+  return e.type == ExpectationType.topic;
 }
 
 final RegExp _inlineTagRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
@@ -3296,7 +3414,7 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
               items: [
                 const DropdownMenuItem<String?>(
                   value: null,
-                  child: Text('All tags'),
+                  child: Text('All topics'),
                 ),
                 ...tags.map(
                   (t) => DropdownMenuItem<String?>(
@@ -3420,7 +3538,12 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
 
   @override
   Widget build(BuildContext context) {
-    final who = widget.person?.displayName ?? widget.expectation.personId;
+    final who = widget.person?.displayName ??
+        (widget.expectation.personId.trim().isEmpty
+            ? 'General'
+            : widget.expectation.personId);
+    final typeLabel =
+        widget.expectation.type == ExpectationType.topic ? 'Topic' : 'Expectation';
     final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
@@ -3428,9 +3551,11 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
     );
     final tags = _extractInlineTags(widget.expectation.summary);
     final (healthLabel, healthColor) = _healthMeta(widget.expectation.health);
+    final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
     final showWarningIndicator =
-        widget.expectation.health == ExpectationHealth.unknown ||
-        widget.expectation.status == ExpectationStatus.pending;
+        !isDiscussionPoint &&
+        (widget.expectation.health == ExpectationHealth.unknown ||
+            widget.expectation.status == ExpectationStatus.pending);
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     final canDelete =
         widget.onDelete != null &&
@@ -3581,7 +3706,8 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
-                            if (widget.expectation.status != ExpectationStatus.finished)
+                            if (!isDiscussionPoint &&
+                                widget.expectation.status != ExpectationStatus.finished)
                               Tooltip(
                                 message: showWarningIndicator
                                     ? (widget.expectation.health == ExpectationHealth.unknown
@@ -3603,7 +3729,8 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                                         ),
                                       ),
                               ),
-                            if (widget.expectation.status != ExpectationStatus.finished)
+                            if (!isDiscussionPoint &&
+                                widget.expectation.status != ExpectationStatus.finished)
                               const SizedBox(height: 8),
                             if (widget.expectation.visibility == ExpectationVisibility.shadow)
                               Tooltip(
@@ -3665,6 +3792,8 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                           ],
                         ),
                       ),
+                      const SizedBox(height: 8),
+                      _MiniTag(typeLabel, widget.scheme),
                     ],
                   ),
               ],
@@ -4386,6 +4515,10 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     final canDelete = canEdit &&
         widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
+    final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
+    final hasReceiver = handle != null &&
+        handle.trim().isNotEmpty &&
+        widget.expectation.personId.trim().isNotEmpty;
     final showInviteForReceiver = canEdit &&
         widget.person != null &&
         (widget.person!.authUserId ?? '').trim().isEmpty;
@@ -4405,6 +4538,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       lastChattedReceiverAt: widget.expectation.lastChattedReceiverAt,
       progress: _progress,
       health: _health,
+      type: widget.expectation.type,
       status: _status,
       visibility: _visibility,
     );
@@ -4432,9 +4566,13 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                     children: [
                       Flexible(
                         child: Text(
-                          _visibility == ExpectationVisibility.shadow
-                              ? 'Expectation Details - SHADOWED'
-                              : 'Expectation Details',
+                          isDiscussionPoint
+                              ? (_visibility == ExpectationVisibility.shadow
+                                    ? 'Topic - PERSONAL'
+                                    : 'Topic')
+                              : (_visibility == ExpectationVisibility.shadow
+                                    ? 'Expectation Details - PERSONAL'
+                                    : 'Expectation Details'),
                           style: theme.textTheme.titleLarge?.copyWith(
                             fontWeight: FontWeight.w700,
                           ),
@@ -4473,7 +4611,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             ? _senderLabel
                             : '@$_senderLabel',
                       ),
-                      if (handle != null && handle.trim().isNotEmpty)
+                      if (hasReceiver)
                         _DetailRow(
                           label: 'To',
                           valueWidget: Row(
@@ -4510,11 +4648,6 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                               ],
                             ],
                           ),
-                        )
-                      else
-                        _DetailRow(
-                          label: 'To',
-                          value: widget.expectation.personId,
                         ),
                       if (widget.expectation.seenAt != null)
                         _DetailRow(
@@ -4578,114 +4711,116 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                         ),
                     ];
                     final right = <Widget>[
-                      _DetailRow(
-                        label: 'Health',
-                        valueWidget: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Flexible(
-                              child: canEdit
-                                  ? DropdownButtonHideUnderline(
-                                      child: DropdownButton<ExpectationHealth>(
-                                        value: _health,
-                                        isDense: true,
-                                        style: theme.textTheme.bodySmall?.copyWith(
-                                          color: scheme.onSurface,
-                                          fontWeight: FontWeight.w600,
+                      if (!isDiscussionPoint) ...[
+                        _DetailRow(
+                          label: 'Health',
+                          valueWidget: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Flexible(
+                                child: canEdit
+                                    ? DropdownButtonHideUnderline(
+                                        child: DropdownButton<ExpectationHealth>(
+                                          value: _health,
+                                          isDense: true,
+                                          style: theme.textTheme.bodySmall?.copyWith(
+                                            color: scheme.onSurface,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          iconSize: 18,
+                                          items: const [
+                                            DropdownMenuItem(
+                                              value: ExpectationHealth.unknown,
+                                              child: Text('Unknown'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationHealth.onTrack,
+                                              child: Text('On track'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationHealth.atRisk,
+                                              child: Text('At risk'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationHealth.offTrack,
+                                              child: Text('Off track'),
+                                            ),
+                                          ],
+                                          onChanged: (v) => setState(() => _health = v ?? _health),
                                         ),
-                                        iconSize: 18,
-                                        items: const [
-                                          DropdownMenuItem(
-                                            value: ExpectationHealth.unknown,
-                                            child: Text('Unknown'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationHealth.onTrack,
-                                            child: Text('On track'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationHealth.atRisk,
-                                            child: Text('At risk'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationHealth.offTrack,
-                                            child: Text('Off track'),
-                                          ),
-                                        ],
-                                        onChanged: (v) => setState(() => _health = v ?? _health),
-                                      ),
-                                    )
-                                  : Text(healthLabel),
-                            ),
-                            if (_health == ExpectationHealth.unknown) ...[
-                              const SizedBox(width: 6),
-                              Tooltip(
-                                message: 'Set health state',
-                                child: Icon(
-                                  Icons.warning_amber_rounded,
-                                  size: 16,
-                                  color: Colors.amberAccent.shade200,
-                                ),
+                                      )
+                                    : Text(healthLabel),
                               ),
+                              if (_health == ExpectationHealth.unknown) ...[
+                                const SizedBox(width: 6),
+                                Tooltip(
+                                  message: 'Set health state',
+                                  child: Icon(
+                                    Icons.warning_amber_rounded,
+                                    size: 16,
+                                    color: Colors.amberAccent.shade200,
+                                  ),
+                                ),
+                              ],
                             ],
-                          ],
+                          ),
+                          dotColor: healthColor,
                         ),
-                        dotColor: healthColor,
-                      ),
-                      _DetailRow(
-                        label: 'Status',
-                        valueWidget: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Flexible(
-                              child: canEdit
-                                  ? DropdownButtonHideUnderline(
-                                      child: DropdownButton<ExpectationStatus>(
-                                        value: _status,
-                                        isDense: true,
-                                        style: theme.textTheme.bodySmall?.copyWith(
-                                          color: scheme.onSurface,
-                                          fontWeight: FontWeight.w600,
+                        _DetailRow(
+                          label: 'Status',
+                          valueWidget: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Flexible(
+                                child: canEdit
+                                    ? DropdownButtonHideUnderline(
+                                        child: DropdownButton<ExpectationStatus>(
+                                          value: _status,
+                                          isDense: true,
+                                          style: theme.textTheme.bodySmall?.copyWith(
+                                            color: scheme.onSurface,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          iconSize: 18,
+                                          items: const [
+                                            DropdownMenuItem(
+                                              value: ExpectationStatus.pending,
+                                              child: Text('Pending'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationStatus.accepted,
+                                              child: Text('Accepted'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationStatus.finished,
+                                              child: Text('Finished'),
+                                            ),
+                                            DropdownMenuItem(
+                                              value: ExpectationStatus.abandoned,
+                                              child: Text('Abandoned'),
+                                            ),
+                                          ],
+                                          onChanged: (v) => setState(() => _status = v ?? _status),
                                         ),
-                                        iconSize: 18,
-                                        items: const [
-                                          DropdownMenuItem(
-                                            value: ExpectationStatus.pending,
-                                            child: Text('Pending'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationStatus.accepted,
-                                            child: Text('Accepted'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationStatus.finished,
-                                            child: Text('Finished'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: ExpectationStatus.abandoned,
-                                            child: Text('Abandoned'),
-                                          ),
-                                        ],
-                                        onChanged: (v) => setState(() => _status = v ?? _status),
-                                      ),
-                                    )
-                                  : Text(statusLabel),
-                            ),
-                            if (_status == ExpectationStatus.pending) ...[
-                              const SizedBox(width: 6),
-                              Tooltip(
-                                message: 'Status still pending',
-                                child: Icon(
-                                  Icons.warning_amber_rounded,
-                                  size: 16,
-                                  color: Colors.amberAccent.shade200,
-                                ),
+                                      )
+                                    : Text(statusLabel),
                               ),
+                              if (_status == ExpectationStatus.pending) ...[
+                                const SizedBox(width: 6),
+                                Tooltip(
+                                  message: 'Status still pending',
+                                  child: Icon(
+                                    Icons.warning_amber_rounded,
+                                    size: 16,
+                                    color: Colors.amberAccent.shade200,
+                                  ),
+                                ),
+                              ],
                             ],
-                          ],
+                          ),
+                          dotColor: statusColor,
                         ),
-                        dotColor: statusColor,
-                      ),
+                      ],
                       _DetailRow(
                         label: 'Deadline',
                         valueWidget: Row(
@@ -4817,19 +4952,53 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                         children: [
                           Expanded(
                             child: _editingDescription && canEdit
-                                ? TextField(
-                                    controller: _descriptionController,
-                                    minLines: 4,
-                                    maxLines: 10,
-                                    decoration: const InputDecoration(
-                                      border: OutlineInputBorder(),
+                                ? Focus(
+                                    onKeyEvent: (node, event) {
+                                      if (event is KeyDownEvent &&
+                                          event.logicalKey == LogicalKeyboardKey.escape) {
+                                        setState(() {
+                                          _descriptionController.text = _savedSummary;
+                                          _descriptionController.selection =
+                                              TextSelection.collapsed(
+                                                offset: _descriptionController.text.length,
+                                              );
+                                          _editingDescription = false;
+                                        });
+                                        return KeyEventResult.handled;
+                                      }
+                                      return KeyEventResult.ignored;
+                                    },
+                                    child: TextField(
+                                      controller: _descriptionController,
+                                      minLines: 4,
+                                      maxLines: 10,
+                                      decoration: const InputDecoration(
+                                        border: OutlineInputBorder(),
+                                      ),
                                     ),
                                   )
-                                : Text(
-                                    _descriptionController.text,
-                                    style: theme.textTheme.bodyMedium
-                                        ?.copyWith(height: 1.45),
-                                  ),
+                                : canEdit
+                                    ? InkWell(
+                                        borderRadius: BorderRadius.circular(6),
+                                        onTap: () => setState(() {
+                                          _editingDescription = true;
+                                        }),
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 2,
+                                          ),
+                                          child: Text(
+                                            _descriptionController.text,
+                                            style: theme.textTheme.bodyMedium
+                                                ?.copyWith(height: 1.45),
+                                          ),
+                                        ),
+                                      )
+                                    : Text(
+                                        _descriptionController.text,
+                                        style: theme.textTheme.bodyMedium
+                                            ?.copyWith(height: 1.45),
+                                      ),
                           ),
                           if (canEdit) ...[
                             const SizedBox(width: 8),
@@ -4896,7 +5065,11 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                 const Divider(height: 1),
                 const SizedBox(height: 15),
                 ConstrainedBox(
-                  constraints: const BoxConstraints(minHeight: 300),
+                  constraints: BoxConstraints(
+                    minHeight: _messagesLoading || _messagesError != null
+                        ? 80
+                        : (_messages.isNotEmpty ? 210 : 24),
+                  ),
                   child: _messagesLoading
                       ? const Padding(
                           padding: EdgeInsets.symmetric(vertical: 8),
