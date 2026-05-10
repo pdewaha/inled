@@ -1,49 +1,51 @@
-Inled App Summary
-Inled is an executive accountability ledger, not a typical task manager.
-It governs commitments between people with clear ownership, strategic context, and auditability.
+inled — what it is
+inled is a Flutter client for a small team expectations / talking-points ledger. Users capture one-line entries with @people and #tags, store them as expectations (commitments) or talking points (lighter prep / threads), and browse inbox, outbox, people, and talking points views. Backend is Supabase (auth, people, companies, expectations, tags-related reads).
 
-Core product ideas:
+App shell and navigation
+main.dart — Initializes Supabase, runs MaterialApp with theme variant (light/dark).
+Auth — StreamBuilder on auth.onAuthStateChange: no session → AuthWelcomeScreen (sign-in + theme menu); session → CompanyOnboardingGate.
+CompanyOnboardingGate — Ensures the user is linked to a company / people row (join or create company flow). When ready → LedgerConsoleScreen (the main app UI).
+Main UI: LedgerConsoleScreen
+Single large screen: persistent left rail + main column.
 
-Strategic anchoring: every expectation can tie to a strategic goal (ideation_goals) so work has a documented “why”.
-Contractual handshake: expectations are explicit agreements between a writer and a target person.
-Definitive accountability: lifecycle status + event history provide objective records (e.g., pending/contracted/breached flow in app semantics).
-UI/mental model:
+Pillars (LedgerPillar)
+The rail switches pillars (sections). Each has title, accent colors, and optional capture accent for the composer chrome:
 
-“Objective” and “Expectation” are treated as two perspectives of the same row:
-writer view => expectation I set
-target view => objective for me
-Composer/capture flow supports quick entry and parsed hints (@people, #tags, deadlines).
-Data Model Summary
-Current schema is in supabase-db/schema.sql.
-
-1) Multi-company tenancy and access
-companies: tenant root.
-company_members: users affiliated to companies (multi-company capable).
-invites: invitation workflow for membership onboarding.
-This supports a future where one user can belong to multiple companies, while the app can still behave as “one active company” for now.
-
-2) People and strategy context
-people: collaborators/targets inside a company; may optionally map to a real auth user.
-ideation_goals: strategic goal layer used to anchor expectations.
-3) Core ledger entity
-expectations: the central directed commitment record, including:
-writer_user_id (who authored/owns it)
-target_person_id (who it is about/for)
-title, summary
-deadline_label, deadline_at
-progress (integer, app-defined)
-expectation_status (integer, app-defined)
-expectation_visibility (integer, app-defined)
-optional ideation_goal_id
-4) Tagging model (reusable and coherent)
-expectation_tags: reusable tag dictionary per company.
-expectation_tag_links: many-to-many link between expectations and tags.
-Uniqueness is enforced per company via lower(name) so tag naming stays coherent.
-5) Audit and capture
-expectation_events: immutable history/events for lifecycle and change tracking.
-ledger_captures: raw composer entries plus optional parsed JSON payload.
-Modeling Principles We Agreed
-Use UUID primary keys and timestamptz.
-Use integer semantic codes (status, visibility, pillar, role, etc.) mapped in app code.
-No CHECK constraints on semantic integer ranges, to avoid blocking future app evolution.
-Keep data company-scoped for clean tenancy and future RLS.
+Pillar	Role
+Home
+Short lead copy + dual-mode composer (talking point vs expectation) + recent thread-style list
+Add expectation
+Dedicated capture for expectations
+Add talking point
+Dedicated capture for talking points
+Inbox / Outbox
+Filtered expectation lists (“towards me” / “dispatched”)
+People
+Colleague directory
+Talking points
+Tags / colleagues / meetings-style browsing
+Layout pattern
+Top: pillar header.
+Composer block (only on Home, Add expectation, Add talking point): wrapped in a Focus node with onKeyEvent for custom Tab / Enter behavior; ExcludeFocus on the thread ListView so Tab does not enter the feed during capture.
+Bottom: Expanded ListView of “thread” cards (guides, expectations, people, tags content — depends on pillar).
+Composer and capture model
+CommandCaptureBar — Shared multiline TextField (TextEditingController + FocusNode), monospace styling, optional @/# suggestion strip under the field, CallbackShortcuts for Enter when inline picks are active.
+Parsing — parseCaptureLine (capture_parser.dart) extracts rough signals (handles, tags, deadline hints) for display; submit rules are enforced in the screen (regex for @ / #, “content word” checks, etc.).
+Persistence — _submitCapture (and helpers) builds Expectation rows, optimistic FeedEntry on Home, writes to Supabase, reloads lists; visibility (shadow = private/draft, echo = published) and type (topic vs expectation) drive behavior.
+Home vs dedicated capture pillars
+Home
+Two-step save: first row Save as Talking Point / Save as Expectation; second row Save privately / Save publicly (topics) or Save as Draft / Send immediately (expectations), with back control to re-pick type.
+State: _homePendingEntry, _composerMode, Listenable.merge on controller + revision notifier so the save row stays in sync after clear() / reset.
+After successful save: hard reset (block key + token + neutral state) so UI returns to the kind row; home-only refocus path (GlobalKey host + FocusScope.requestFocus + delayed retries) so the capture field gets focus again.
+Enter (hardware): resolves single valid mode and advances to visibility step; token picks delegate to the bar’s Enter handling.
+Add expectation / Add talking point
+Single row of two _PairedSaveAction buttons (draft/send or private/public).
+Enter from field: expectation uses _expectationPillarQuickChoice (synced from which save button last had focus via FocusNode listeners); Add talking point Enter submits private save explicitly (aligned with UX copy).
+Visual “Enter default” without stealing focus: emphasizeAsKeyboardDefault on the left (or matching) button — primary colors while the field is focused and the line is valid; Listenable.merge(controller, captureFocus) so it updates when focus moves.
+Tab cycles field → left save → right save (custom handler; list excluded).
+Supporting widgets / models
+Models: Expectation, Person, FeedEntry, enums for status, health, visibility, type, pillar.
+Widgets: LedgerTagChip, ExpectationStatusBadge, VisibilityGlyph, ResponsiveCenteredBody, etc.
+Theme: theme.dart / AppThemeVariant.
+Security / ops note for GitHub
+main.dart embeds the Supabase URL and anon key. For a public repo, move secrets to --dart-define, CI secrets, or a non-committed config file and document how to run the app locally.
