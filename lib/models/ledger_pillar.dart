@@ -47,7 +47,7 @@ extension LedgerPillarX on LedgerPillar {
           'Dispatched expectations',
         LedgerPillar.people => 'Your colleagues',
         LedgerPillar.tags =>
-          'Colleagues: private @prep only you see. Meetings or tags: published '
+          'Private: @people, private #tags, and prep only you see. Public: published '
           '#hashtags you (and others) chose to share.',
       };
 

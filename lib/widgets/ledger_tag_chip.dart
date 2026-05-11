@@ -10,6 +10,8 @@ class LedgerTagChip extends StatelessWidget {
     this.onPressed,
     /// When set, selected state uses this instead of [ColorScheme.primary].
     this.selectionAccent,
+    /// Label color when not using [selectionAccent] contrast (e.g. rail @ vs #).
+    this.unselectedLabelColor,
   });
 
   /// Display prefix before [tag] (default `#` for hashtags, `@` for handles).
@@ -20,6 +22,7 @@ class LedgerTagChip extends StatelessWidget {
   final bool selected;
   final VoidCallback? onPressed;
   final Color? selectionAccent;
+  final Color? unselectedLabelColor;
 
   @override
   Widget build(BuildContext context) {
@@ -27,14 +30,16 @@ class LedgerTagChip extends StatelessWidget {
     final scheme = theme.colorScheme;
     final accent = selectionAccent;
     final labelStyle = theme.textTheme.labelSmall;
-    final Color? labelColor = selected && accent != null
+    final Color? labelColorOverride = selected && accent != null
         ? (ThemeData.estimateBrightnessForColor(accent) == Brightness.dark
             ? Colors.white
             : scheme.onSurface)
-        : null;
+        : unselectedLabelColor;
     final label = Text(
       '$tokenPrefix$tag',
-      style: labelStyle?.copyWith(color: labelColor),
+      style: labelColorOverride != null
+          ? labelStyle?.copyWith(color: labelColorOverride)
+          : labelStyle,
     );
     if (onPressed != null) {
       return ActionChip(

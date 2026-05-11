@@ -123,7 +123,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   bool _colleagueArchiveCollapsed = true;
   String? _tagsSelectedTag;
   _TalkingPointsSubView _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
-  /// Colleagues view: filter talking points @'d at this person (author-only).
+  /// Private view: filter talking points @'d at this person (author-only).
   String? _colleagueFilterPersonId;
   ExpectationStatus? _othersStatusFilter;
   String? _othersTagFilter;
@@ -156,7 +156,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     _captureFocus.unfocus();
   }
 
-  /// Colleagues with @-linked talking points (author, non-empty receiver), for cloud + filters.
+  /// Private (@-person) talking points (author, non-empty receiver), for cloud + filters.
   List<_ColleagueCloudEntry> _colleagueTalkingPointCloudEntries() {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     if (currentUserId == null) return [];
@@ -185,6 +185,93 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return out;
   }
 
+  /// #tags on your shadow talking points (Private), newest-first for the rail cloud.
+  List<String> _privateRailTagsFromExpectations({int max = 20}) {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return [];
+    final pool = _expectations
+        .where(
+          (x) =>
+              x.type == ExpectationType.topic &&
+              x.writerUserId == uid &&
+              x.visibility == ExpectationVisibility.shadow &&
+              _extractInlineTags(x.summary).isNotEmpty,
+        )
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    final seen = <String>{};
+    final out = <String>[];
+    for (final e in pool) {
+      for (final tag in _extractInlineTags(e.summary)) {
+        final k = tag.toLowerCase();
+        if (seen.add(k)) out.add(tag);
+        if (out.length >= max) return out;
+      }
+    }
+    return out;
+  }
+
+  /// #tags on echo talking points (Public), merged with [\_recentTags].
+  /// [_recentTags] is loaded from Supabase as **echo topic** rows only (see
+  /// [_loadRecentTagsFromSupabase]) so this cloud stays separate from [\_privateRailTagsFromExpectations].
+  List<String> _mergedPublicRailTags({int max = 20}) {
+    final seen = <String>{};
+    final out = <String>[];
+    void addDisplay(String tag) {
+      final k = tag.toLowerCase();
+      if (seen.add(k)) out.add(tag);
+    }
+    final pool = _expectations
+        .where(
+          (x) =>
+              x.type == ExpectationType.topic &&
+              x.visibility == ExpectationVisibility.echo &&
+              x.personId.trim().isEmpty &&
+              _extractInlineTags(x.summary).isNotEmpty,
+        )
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    for (final e in pool) {
+      for (final tag in _extractInlineTags(e.summary)) {
+        addDisplay(tag);
+        if (out.length >= max) return out;
+      }
+    }
+    for (final tag in _recentTags) {
+      addDisplay(tag);
+      if (out.length >= max) return out;
+    }
+    return out;
+  }
+
+  /// # suggestions in the composer: public echo tags plus your private (shadow) tags.
+  List<String> _hashtagAutocompletePool() {
+    final seen = <String>{};
+    final out = <String>[];
+    void add(String t) {
+      if (t.trim().isEmpty) return;
+      final k = t.toLowerCase();
+      if (seen.add(k)) out.add(t);
+    }
+
+    for (final t in _recentTags) {
+      add(t);
+    }
+    for (final t in _privateRailTagsFromExpectations(max: 40)) {
+      add(t);
+    }
+    return out;
+  }
+
+  void _onPrivateRailTagSelect(String tag) {
+    setState(() {
+      _pillar = LedgerPillar.tags;
+      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
+      _tagsSelectedTag = tag.trim().toLowerCase();
+      _colleagueFilterPersonId = null;
+    });
+  }
+
   void _openTalkingPointsSubView(_TalkingPointsSubView view) {
     setState(() {
       _homePendingEntry = null;
@@ -199,7 +286,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     _captureFocus.unfocus();
   }
 
-  /// Rail @ chip: open Colleagues with this person selected (main page uses dropdown).
+  /// Rail @ chip: open Private with this person selected (main page uses dropdown).
   void _openColleaguesFilteredToPerson(String personId) {
     setState(() {
       _homePendingEntry = null;
@@ -265,6 +352,195 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Failed to delete expectation.')));
+    }
+  }
+
+  /// Outbox draft → published (visible to receiver): echo visibility + published_at.
+  Future<void> _publishOutboxDraft(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null || expectation.writerUserId != currentUserId) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only the author can publish this item.')),
+      );
+      return;
+    }
+    if (expectation.visibility != ExpectationVisibility.shadow) return;
+    final now = DateTime.now().toUtc();
+    try {
+      await Supabase.instance.client.from('expectations').update({
+        'expectation_visibility': ExpectationVisibility.echo.index,
+        'published_at': now.toIso8601String(),
+        'responsible_updated_at': now.toIso8601String(),
+      }).eq('id', expectation.id);
+      if (!mounted) return;
+      setState(() {
+        final i = _expectations.indexWhere((e) => e.id == expectation.id);
+        if (i >= 0) {
+          final e = _expectations[i];
+          _expectations[i] = Expectation(
+            id: e.id,
+            createdAt: e.createdAt,
+            writerUserId: e.writerUserId,
+            personId: e.personId,
+            summary: e.summary,
+            deadlineLabel: e.deadlineLabel,
+            deadlineAt: e.deadlineAt,
+            finishedAt: e.finishedAt,
+            responsibleUpdatedAt: now,
+            publishedAt: now,
+            seenAt: e.seenAt,
+            lastChattedSenderAt: e.lastChattedSenderAt,
+            lastChattedReceiverAt: e.lastChattedReceiverAt,
+            progress: e.progress,
+            health: e.health,
+            type: e.type,
+            status: e.status,
+            visibility: ExpectationVisibility.echo,
+          );
+        }
+        if (_pillar == LedgerPillar.expectationsOthers) {
+          _outboxListingTab = _OutboxListingTab.published;
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Published — now visible to your receiver.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to publish: $e')),
+      );
+    }
+  }
+
+  /// Writer archives an expectation: [ExpectationStatus.abandoned]. Shadow drafts stay drafts (visibility unchanged); UI stays on Drafts when applicable.
+  Future<void> _archiveOutboxDraft(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null || expectation.writerUserId != currentUserId) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only the author can archive this item.')),
+      );
+      return;
+    }
+    final ok = await _persistExpectationAbandoned(expectation);
+    if (!ok || !mounted) return;
+    setState(() {
+      if (_pillar == LedgerPillar.expectationsOthers) {
+        _othersArchiveCollapsed = false;
+        // Keep Drafts tab when archiving a shadow draft; do not imply publish.
+        if (expectation.visibility != ExpectationVisibility.shadow) {
+          _outboxListingTab = _OutboxListingTab.published;
+        }
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Archived.')),
+    );
+  }
+
+  /// Inbox: author or addressee (person) may mark abandoned; visibility unchanged.
+  Future<void> _archiveInboxExpectation(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    final meId = _myPersonId;
+    if (currentUserId == null || meId == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sign in to archive this item.')),
+      );
+      return;
+    }
+    final isWriter = expectation.writerUserId == currentUserId;
+    final isReceiver =
+        expectation.personId.trim().isNotEmpty && expectation.personId == meId;
+    if (!isWriter && !isReceiver) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You cannot archive this item.')),
+      );
+      return;
+    }
+    final ok = await _persistExpectationAbandoned(expectation);
+    if (!ok || !mounted) return;
+    setState(() {
+      if (_pillar == LedgerPillar.expectationsMe) {
+        _meArchiveCollapsed = false;
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Archived.')),
+    );
+  }
+
+  /// Tags pillar (Private / Public lists): writer archives a talking point.
+  Future<void> _archiveTalkingPointBrowse(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null || expectation.writerUserId != currentUserId) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only the author can archive this item.')),
+      );
+      return;
+    }
+    final ok = await _persistExpectationAbandoned(expectation);
+    if (!ok || !mounted) return;
+    setState(() {
+      if (_pillar == LedgerPillar.tags) {
+        if (_talkingPointsSubView == _TalkingPointsSubView.colleagues) {
+          _colleagueArchiveCollapsed = false;
+        } else {
+          _tagsArchiveCollapsed = false;
+        }
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Archived.')),
+    );
+  }
+
+  /// DB + local list: status abandoned, [responsible_updated_at] updated. Returns false on failure.
+  Future<bool> _persistExpectationAbandoned(Expectation expectation) async {
+    final now = DateTime.now().toUtc();
+    try {
+      await Supabase.instance.client.from('expectations').update({
+        'expectation_status': _statusToDb(ExpectationStatus.abandoned),
+        'responsible_updated_at': now.toIso8601String(),
+      }).eq('id', expectation.id);
+      if (!mounted) return false;
+      setState(() {
+        final i = _expectations.indexWhere((e) => e.id == expectation.id);
+        if (i >= 0) {
+          final e = _expectations[i];
+          _expectations[i] = Expectation(
+            id: e.id,
+            createdAt: e.createdAt,
+            writerUserId: e.writerUserId,
+            personId: e.personId,
+            summary: e.summary,
+            deadlineLabel: e.deadlineLabel,
+            deadlineAt: e.deadlineAt,
+            finishedAt: e.finishedAt,
+            responsibleUpdatedAt: now,
+            publishedAt: e.publishedAt,
+            seenAt: e.seenAt,
+            lastChattedSenderAt: e.lastChattedSenderAt,
+            lastChattedReceiverAt: e.lastChattedReceiverAt,
+            progress: e.progress,
+            health: e.health,
+            type: e.type,
+            status: ExpectationStatus.abandoned,
+            visibility: e.visibility,
+          );
+        }
+      });
+      return true;
+    } catch (e) {
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to archive: $e')),
+      );
+      return false;
     }
   }
 
@@ -496,16 +772,25 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
 
       final companyId = meRows.first['company_id'] as String;
+      // Public rail only: published talking points (echo + topic + no addressee),
+      // same constraints as [_mergedPublicRailTags] in-memory pool — not shadow/private rows.
       final rows = await client
           .from('expectations')
-          .select('summary,created_at')
+          .select('summary,created_at,target_person_id')
           .eq('company_id', companyId)
+          .eq('expectation_type', ExpectationType.topic.index)
+          .eq('expectation_visibility', ExpectationVisibility.echo.index)
           .order('created_at', ascending: false)
           .limit(200);
 
       final seen = <String>{};
       final tags = <String>[];
       for (final row in (rows as List)) {
+        final rawTarget = row['target_person_id'];
+        final personKey = rawTarget == null
+            ? ''
+            : (rawTarget as String).trim();
+        if (personKey.isNotEmpty) continue;
         final summary = ((row['summary'] as String?) ?? '').trim();
         if (summary.isEmpty) continue;
         for (final tag in _extractInlineTags(summary)) {
@@ -711,8 +996,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     switch (_pillar) {
       case LedgerPillar.home:
         if (_homePendingEntry == _ComposerEntryMode.topic) {
-          final can = _talkingPointCaptureTextIsSubmittable(t) && !busy;
-          return (can, can && !_talkingPointLineHasPersonMention(t));
+          final priv = _talkingPointPrivateSubmittable(t) && !busy;
+          final pub = _talkingPointPublicSubmittable(t) && !busy;
+          return (priv, pub);
         }
         if (_homePendingEntry == _ComposerEntryMode.expectation) {
           final e = _composerCaptureTextIsSubmittable(t) &&
@@ -721,14 +1007,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           return (e, e);
         }
         return (
-          _talkingPointCaptureTextIsSubmittable(t) && !busy,
+          _talkingPointPrivateSubmittable(t) && !busy,
           _composerCaptureTextIsSubmittable(t) &&
               _talkingPointLineHasPersonMention(t) &&
               !busy,
         );
       case LedgerPillar.addTopic:
-        final can = _talkingPointCaptureTextIsSubmittable(t) && !busy;
-        return (can, can && !_talkingPointLineHasPersonMention(t));
+        return (
+          _talkingPointPrivateSubmittable(t) && !busy,
+          _talkingPointPublicSubmittable(t) && !busy,
+        );
       case LedgerPillar.addExpectation:
         final e = _composerCaptureTextIsSubmittable(t) && !busy;
         return (e, e);
@@ -850,7 +1138,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
       if (_pillar == LedgerPillar.addTopic) {
         final text = _captureController.text;
-        if (!_talkingPointCaptureTextIsSubmittable(text) || _submitInFlight) {
+        if (!_talkingPointPrivateSubmittable(text) || _submitInFlight) {
           return true;
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -967,7 +1255,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       if (query.isEmpty) {
         unique = null;
         if (_people.isNotEmpty) {
-          disambiguation = 'Type after @ to narrow colleagues';
+          disambiguation = 'Type after @ to narrow people';
         }
       } else if (handleHits.length == 1) {
         unique = handleHits.single;
@@ -1006,7 +1294,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _clearTokenAutocomplete();
       return;
     }
-    final tagHits = _recentTags
+    final tagHits = _hashtagAutocompletePool()
         .where((tag) => tag.toLowerCase().startsWith(query))
         .toList();
     tagHits.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
@@ -1250,7 +1538,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           'or whichever you Tab-selected last).';
     }
     if (_pillar == LedgerPillar.addTopic) {
-      return 'Talking-point line: at least one #hashtag; @mentions optional. '
+      return 'Talking-point line: use #hashtags for public threads, or @person for a private colleague note (no # required). '
           'While completing @ or #, Tab completes or cycles matches; Enter inserts. '
           'Otherwise Tab moves between the field, Save privately, and Save publicly; '
           'Enter from the field saves privately (same as Save privately).';
@@ -1263,7 +1551,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return 'Choose Save as Draft or Send immediately (back arrow to re-pick type).';
       }
       return 'Pick Talking Point or Expectation, then choose visibility. '
-          'Talking points need #hashtags; expectations need @someone and tags. '
+          'Talking points use # for public or @person for private notes; expectations need @someone and tags. '
           'Enter skips to visibility when only one type applies.';
     }
     return 'Use @people and #tags where helpful.';
@@ -1424,11 +1712,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// Enter on Home: only runs when exactly one of the two save actions is valid.
   _ComposerEntryMode? _homeEnterResolvedComposerMode(String text) {
     if (_submitInFlight) return null;
-    final tpOk = _talkingPointCaptureTextIsSubmittable(text);
+    final tpPrivate = _talkingPointPrivateSubmittable(text);
     final expOk = _composerCaptureTextIsSubmittable(text) &&
         _talkingPointLineHasPersonMention(text);
-    if (tpOk && !expOk) return _ComposerEntryMode.topic;
-    if (!tpOk && expOk) return _ComposerEntryMode.expectation;
+    final t = text.trim();
+    // @-person note without # is a colleague talking point only, not an expectation.
+    if (tpPrivate &&
+        _talkingPointLineHasPersonMention(t) &&
+        !_hashTagRegex.hasMatch(t)) {
+      return _ComposerEntryMode.topic;
+    }
+    if (tpPrivate && !expOk) return _ComposerEntryMode.topic;
+    if (!tpPrivate && expOk) return _ComposerEntryMode.expectation;
     return null;
   }
 
@@ -1441,11 +1736,20 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return _hasContentWord(t);
   }
 
-  /// Talking points must classify the thread with at least one #hashtag (not @-only).
-  bool _talkingPointCaptureTextIsSubmittable(String text) {
+  /// Talking point can be saved **privately**: at least one # and/or an @person, plus real content.
+  bool _talkingPointPrivateSubmittable(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return false;
+    if (!_hasContentWord(t)) return false;
+    return _hashTagRegex.hasMatch(t) || _talkingPointLineHasPersonMention(t);
+  }
+
+  /// Talking point can be saved **publicly**: needs #, no @-person (colleague notes stay private).
+  bool _talkingPointPublicSubmittable(String text) {
     final t = text.trim();
     if (t.isEmpty) return false;
     if (!_hashTagRegex.hasMatch(t)) return false;
+    if (_talkingPointLineHasPersonMention(t)) return false;
     return _hasContentWord(t);
   }
 
@@ -1545,10 +1849,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         (_pillar == LedgerPillar.home &&
             _composerMode == _ComposerEntryMode.expectation);
     if (isTalkingPointSubmit && !_hashTagRegex.hasMatch(text)) {
-      _showComposerToast(
-        'Talking points need at least one #hashtag to classify the thread.',
-      );
-      return;
+      final colleagueShadowOk =
+          forcedTalkingPointVisibility == ExpectationVisibility.shadow &&
+              _talkingPointLineHasPersonMention(text) &&
+              _hasContentWord(text);
+      if (!colleagueShadowOk) {
+        _showComposerToast(
+          'Talking points need at least one #hashtag to publish, or @person for a private colleague note.',
+        );
+        return;
+      }
     }
     if (_pillar == LedgerPillar.home &&
         _composerMode == _ComposerEntryMode.expectation &&
@@ -2298,7 +2608,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 content: Text(
                   talkingPoint
                       ? 'Keep this private while you refine it, or publish so it '
-                          'appears under Meetings or tags for others.'
+                          'appears under Public for others.'
                       : 'Save as a draft to keep refining it yourself, or send '
                           'immediately so others can see it.',
                 ),
@@ -2531,8 +2841,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               child: _PillarRail(
                 expanded: _railExpanded,
                 selected: _pillar,
-                recentTags: _recentTags,
+                recentTags: _mergedPublicRailTags(),
                 recentTagsHasMore: _recentTagsHasMore,
+                privateRailTags: _privateRailTagsFromExpectations(),
+                onPrivateRailTag: _onPrivateRailTagSelect,
                 tagsLoading: _tagsLoading,
                 tagsLoadError: _tagsLoadError,
                 onRetryTags: () {
@@ -2639,8 +2951,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                               final canSaveExpectation =
                                   _composerCaptureTextIsSubmittable(value.text);
                               final canSaveTalkingPoint =
-                                  _talkingPointCaptureTextIsSubmittable(
-                                      value.text);
+                                  _talkingPointPrivateSubmittable(value.text);
                               final hasPerson =
                                   _talkingPointLineHasPersonMention(value.text);
                               final busy = _submitInFlight;
@@ -2792,15 +3103,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             listenable: _composerSaveRowListenable,
                             builder: (context, _) {
                               final value = _captureController.value;
-                              final canSave =
-                                  _talkingPointCaptureTextIsSubmittable(
-                                      value.text);
-                              final hasPersonMention =
-                                  _talkingPointLineHasPersonMention(value.text);
+                              final personalOk =
+                                  _talkingPointPrivateSubmittable(value.text);
+                              final publicOk =
+                                  _talkingPointPublicSubmittable(value.text);
                               final busy = _submitInFlight;
-                              final personalEnabled = canSave && !busy;
-                              final publicEnabled =
-                                  canSave && !busy && !hasPersonMention;
+                              final personalEnabled = personalOk && !busy;
+                              final publicEnabled = publicOk && !busy;
                               final fieldFocused = _captureFocus.hasFocus;
                               return Row(
                                 children: [
@@ -3012,6 +3321,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onTagPressed: _openTagPillar,
               onDelete: () => _deleteExpectationFromList(x),
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
+              composerRecentListing: true,
             ),
           );
         }
@@ -3071,13 +3381,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
 
         final currentUserIdTags = Supabase.instance.client.auth.currentUser?.id;
+        // All of your private talking points (shadow topics), regardless of whether
+        // they @-mention a specific person. The rail @ cloud still only surfaces
+        // person-linked topics, but the listing itself should include general
+        // private #tag lines as well.
         final colleagueTopics = (expectations
                 .where(
                   (x) =>
                       x.type == ExpectationType.topic &&
                       currentUserIdTags != null &&
                       x.writerUserId == currentUserIdTags &&
-                      x.personId.trim().isNotEmpty,
+                      x.visibility == ExpectationVisibility.shadow,
                 )
                 .toList()
               ..sort((a, b) => b.createdAt.compareTo(a.createdAt)));
@@ -3096,67 +3410,118 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           ..sort();
         final effectiveMeetingsTag =
             availableTags.contains(_tagsSelectedTag) ? _tagsSelectedTag : null;
+        final availablePrivateTags = expectations
+            .where(
+              (x) =>
+                  x.type == ExpectationType.topic &&
+                  currentUserIdTags != null &&
+                  x.writerUserId == currentUserIdTags &&
+                  x.visibility == ExpectationVisibility.shadow &&
+                  _extractInlineTags(x.summary).isNotEmpty,
+            )
+            .expand((e) => _extractInlineTags(e.summary))
+            .map((t) => t.toLowerCase())
+            .toSet()
+            .toList()
+          ..sort();
+        final effectivePrivateTag = availablePrivateTags.contains(_tagsSelectedTag)
+            ? _tagsSelectedTag
+            : null;
 
-        out.add(
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                const Spacer(),
-                _ExpectationsOthersFiltersBar(
-                  showStatus: false,
-                  showTag: true,
-                  showPerson: false,
-                  selectedStatus: null,
-                  selectedTag: effectiveMeetingsTag,
-                  selectedPersonId: null,
-                  tags: availableTags,
-                  people: const [],
-                  tagFieldWidth: 240,
-                  onStatusChanged: (_) {},
-                  onTagChanged: (v) {
-                    setState(() {
-                      _tagsSelectedTag = v;
-                      _talkingPointsSubView =
-                          _TalkingPointsSubView.meetingsOrTags;
-                    });
-                  },
-                  onPersonChanged: (_) {},
-                ),
-              ],
+        if (_talkingPointsSubView == _TalkingPointsSubView.meetingsOrTags) {
+          out.add(
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  const Spacer(),
+                  _ExpectationsOthersFiltersBar(
+                    showStatus: false,
+                    showTag: true,
+                    showPerson: false,
+                    selectedStatus: null,
+                    selectedTag: effectiveMeetingsTag,
+                    selectedPersonId: null,
+                    tags: availableTags,
+                    people: const [],
+                    tagFieldWidth: 240,
+                    onStatusChanged: (_) {},
+                    onTagChanged: (v) {
+                      setState(() {
+                        _tagsSelectedTag = v;
+                        _talkingPointsSubView =
+                            _TalkingPointsSubView.meetingsOrTags;
+                      });
+                    },
+                    onPersonChanged: (_) {},
+                  ),
+                ],
+              ),
             ),
-          ),
-        );
+          );
+        }
 
         if (_talkingPointsSubView == _TalkingPointsSubView.colleagues) {
           out.add(
             Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: Text(
-                'Colleagues',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: scheme.onSurface,
-                ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Private',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: scheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'People you @mention, private #hashtags, and talking-point prep—only you, not Public.',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      height: 1.4,
+                    ),
+                  ),
+                ],
               ),
             ),
           );
-          if (colleagueCloudEntries.isEmpty) {
+          if (availablePrivateTags.isNotEmpty) {
             out.add(
               Padding(
-                padding: const EdgeInsets.only(bottom: 16),
-                child: Text(
-                  'No colleague-linked talking points yet. @mention someone in '
-                  'Add talking point—those stay visible only to you.',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                    height: 1.45,
-                  ),
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    const Spacer(),
+                    _ExpectationsOthersFiltersBar(
+                      showStatus: false,
+                      showTag: true,
+                      showPerson: false,
+                      selectedStatus: null,
+                      selectedTag: effectivePrivateTag,
+                      selectedPersonId: null,
+                      tags: availablePrivateTags,
+                      people: const [],
+                      tagFieldWidth: 240,
+                      onStatusChanged: (_) {},
+                      onTagChanged: (v) {
+                        setState(() {
+                          _tagsSelectedTag = v;
+                          _talkingPointsSubView =
+                              _TalkingPointsSubView.colleagues;
+                        });
+                      },
+                      onPersonChanged: (_) {},
+                    ),
+                  ],
                 ),
               ),
             );
-          } else {
+          }
+          if (true) {
             final colleaguePersonIds = {
               for (final c in colleagueCloudEntries) c.person.id,
             };
@@ -3165,11 +3530,20 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                         colleaguePersonIds.contains(_colleagueFilterPersonId!)
                     ? _colleagueFilterPersonId
                     : null;
-            final filtered = effectiveTalkingPointPerson == null
+            var filtered = effectiveTalkingPointPerson == null
                 ? colleagueTopics
                 : colleagueTopics
                     .where((x) => x.personId == effectiveTalkingPointPerson)
                     .toList();
+            if (effectivePrivateTag != null) {
+              filtered = filtered
+                  .where(
+                    (x) => _extractInlineTags(x.summary)
+                        .map((t) => t.toLowerCase())
+                        .contains(effectivePrivateTag),
+                  )
+                  .toList();
+            }
             final activeColleague = filtered
                 .where(
                   (x) =>
@@ -3188,8 +3562,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               _ExpectationsOthersSection(
                 title: 'Active',
                 emptyText: effectiveTalkingPointPerson == null
-                    ? 'No active talking points for colleagues.'
-                    : 'No active talking points for this colleague.',
+                    ? 'No active private talking points yet.'
+                    : 'No active private talking points for this person.',
                 items: activeColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -3200,6 +3574,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 onOpenDetails: (e, p) => onOpenExpectationDetails(e, p),
                 onDeleteExpectation: _deleteExpectationFromList,
                 onToggleCollapsed: () {},
+                talkingPointsBrowseListing: true,
+                onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               ),
             );
             out.add(const SizedBox(height: 12));
@@ -3207,8 +3583,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               _ExpectationsOthersSection(
                 title: 'Archive',
                 emptyText: effectiveTalkingPointPerson == null
-                    ? 'No archived colleague talking points yet.'
-                    : 'No archived talking points for this colleague.',
+                    ? 'No archived private talking points yet.'
+                    : 'No archived private talking points for this person.',
                 items: archiveColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -3223,12 +3599,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _colleagueArchiveCollapsed = !_colleagueArchiveCollapsed;
                   });
                 },
+                talkingPointsBrowseListing: true,
+                onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               ),
             );
+          } else {
+            // Unreachable: kept only to preserve previous brace structure.
           }
           break;
         }
-        // meetingsOrTags
+        // Public (#tags, echo, no @person)
         if (_tagsLoading) {
           out.add(const _TagsLoadingCard());
         } else if (_tagsLoadError != null) {
@@ -3239,18 +3619,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             ),
           );
         } else {
-          out.add(
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(
-                'Meetings or tags',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: scheme.onSurface,
-                ),
-              ),
-            ),
-          );
+          // Public is already implied by this subview; avoid an extra "Public" heading.
           final activeTag = effectiveMeetingsTag;
           final filtered = activeTag == null
               ? publicTagged
@@ -3269,19 +3638,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   x.status == ExpectationStatus.finished ||
                   x.status == ExpectationStatus.abandoned)
               .toList();
-          if (availableTags.isEmpty) {
-            out.add(
-              _Glass(
-                child: Text(
-                  'No published #tags yet. Publish talking points without an '
-                  '@person so they appear here.',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ),
-            );
-          }
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
@@ -3298,31 +3654,33 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {},
+              talkingPointsBrowseListing: true,
+              onArchiveTalkingPoint: _archiveTalkingPointBrowse,
             ),
           );
-          if (archive.isNotEmpty) {
-            out.add(const SizedBox(height: 12));
-            out.add(
-              _ExpectationsOthersSection(
-                title: 'Archive',
-                emptyText: activeTag == null
-                    ? 'No archived talking points.'
-                    : 'No archive for #$activeTag.',
-                items: archive,
-                peopleById: peopleById,
-                theme: theme,
-                scheme: scheme,
-                collapsed: _tagsArchiveCollapsed,
-                hasUnreadChat: _hasUnreadChat,
-                onTagPressed: _openTagPillar,
-                onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
-                onDeleteExpectation: _deleteExpectationFromList,
-                onToggleCollapsed: () {
-                  setState(() => _tagsArchiveCollapsed = !_tagsArchiveCollapsed);
-                },
-              ),
-            );
-          }
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: activeTag == null
+                  ? 'No archived published talking points.'
+                  : 'No archive for #$activeTag.',
+              items: archive,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _tagsArchiveCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(() => _tagsArchiveCollapsed = !_tagsArchiveCollapsed);
+              },
+              talkingPointsBrowseListing: true,
+              onArchiveTalkingPoint: _archiveTalkingPointBrowse,
+            ),
+          );
         }
         break;
 
@@ -3475,7 +3833,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _finishedReferenceAt(x).isAfter(twoWeeksAgo),
               )
               .toList();
-          final archive = inboundPublished.where(isTerminal).toList();
+          final archive = filteredTowardsMe.where(isTerminal).toList();
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
@@ -3496,6 +3854,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onToggleCollapsed: () {
                 setState(() => _meOngoingCollapsed = !_meOngoingCollapsed);
               },
+              inboxHoverListing: true,
+              inboxHoverIncludeDelete:
+                  _inboxListingTab == _InboxListingTab.personal,
+              inboxReceiverPersonId: mePerson.id,
+              onArchiveInbox: _archiveInboxExpectation,
             ),
           );
           if (recentlyFinished.isNotEmpty) {
@@ -3518,32 +3881,35 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 onToggleCollapsed: () {
                   setState(() => _meFinishedCollapsed = !_meFinishedCollapsed);
                 },
+                inboxHoverListing: true,
+                inboxHoverIncludeDelete:
+                    _inboxListingTab == _InboxListingTab.personal,
+                inboxReceiverPersonId: mePerson.id,
+                onArchiveInbox: _archiveInboxExpectation,
               ),
             );
           }
-          if (archive.isNotEmpty) {
-            out.add(const SizedBox(height: 12));
-            out.add(
-              _ExpectationsOthersSection(
-                title: 'Archive',
-                emptyText: 'No archived expectations.',
-                items: archive,
-                peopleById: peopleById,
-                theme: theme,
-                scheme: scheme,
-                collapsed: _meArchiveCollapsed,
-                hasUnreadChat: _hasUnreadChat,
-                onTagPressed: _openTagPillar,
-                personForItem: (e) => _writerPersonForExpectation(e, people),
-                onOpenDetails: (e, p) =>
-                    _openExpectationDetails(e: e, person: p),
-                onDeleteExpectation: _deleteExpectationFromList,
-                onToggleCollapsed: () {
-                  setState(() => _meArchiveCollapsed = !_meArchiveCollapsed);
-                },
-              ),
-            );
-          }
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: 'No archived expectations.',
+              items: archive,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _meArchiveCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              personForItem: (e) => _writerPersonForExpectation(e, people),
+              onOpenDetails: (e, p) =>
+                  _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(() => _meArchiveCollapsed = !_meArchiveCollapsed);
+              },
+            ),
+          );
         }
         break;
 
@@ -3669,7 +4035,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             x.status == ExpectationStatus.abandoned;
         if (_outboxListingTab == _OutboxListingTab.drafts) {
           final draftsOnly = filteredTowardsOthers
-              .where((x) => x.visibility == ExpectationVisibility.shadow)
+              .where(
+                (x) =>
+                    x.visibility == ExpectationVisibility.shadow &&
+                    !isTerminal(x),
+              )
               .toList();
           out.add(
             _ExpectationsOthersSection(
@@ -3689,6 +4059,37 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onToggleCollapsed: () {
                 setState(() => _othersDraftsCollapsed = !_othersDraftsCollapsed);
               },
+              outboxDraftsListing: true,
+              onPublishDraft: _publishOutboxDraft,
+              onArchiveDraft: _archiveOutboxDraft,
+            ),
+          );
+          final archiveDrafts = filteredTowardsOthers
+              .where(
+                (x) =>
+                    x.visibility == ExpectationVisibility.shadow &&
+                    isTerminal(x),
+              )
+              .toList();
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: 'No archived drafts yet.',
+              items: archiveDrafts,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _othersArchiveCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(
+                  () => _othersArchiveCollapsed = !_othersArchiveCollapsed,
+                );
+              },
             ),
           );
         } else {
@@ -3705,11 +4106,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _finishedReferenceAt(x).isAfter(twoWeeksAgo),
               )
               .toList();
-          final archive = publishedPool.where(isTerminal).toList();
+          final archive = filteredTowardsOthers
+              .where(
+                (x) =>
+                    x.visibility == ExpectationVisibility.echo && isTerminal(x),
+              )
+              .toList();
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
-              emptyText: 'No active5 expectations towards others yet.',
+              emptyText: 'No active expectations towards others yet.',
               infoTooltip:
                   'Active items are published and can be seen by you and your receiver, but nobody else',
               items: published,
@@ -3726,6 +4132,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   () => _othersPublishedCollapsed = !_othersPublishedCollapsed,
                 );
               },
+              outboxPublishedListing: true,
+              onArchiveDraft: _archiveOutboxDraft,
             ),
           );
           if (recentlyFinished.isNotEmpty) {
@@ -3748,32 +4156,32 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     () => _othersFinishedCollapsed = !_othersFinishedCollapsed,
                   );
                 },
+                outboxPublishedListing: true,
+                onArchiveDraft: _archiveOutboxDraft,
               ),
             );
           }
-          if (archive.isNotEmpty) {
-            out.add(const SizedBox(height: 12));
-            out.add(
-              _ExpectationsOthersSection(
-                title: 'Archive',
-                emptyText: 'No archived expectations.',
-                items: archive,
-                peopleById: peopleById,
-                theme: theme,
-                scheme: scheme,
-                collapsed: _othersArchiveCollapsed,
-                hasUnreadChat: _hasUnreadChat,
-                onTagPressed: _openTagPillar,
-                onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
-                onDeleteExpectation: _deleteExpectationFromList,
-                onToggleCollapsed: () {
-                  setState(
-                    () => _othersArchiveCollapsed = !_othersArchiveCollapsed,
-                  );
-                },
-              ),
-            );
-          }
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: 'No archived expectations.',
+              items: archive,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _othersArchiveCollapsed,
+              hasUnreadChat: _hasUnreadChat,
+              onTagPressed: _openTagPillar,
+              onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(
+                  () => _othersArchiveCollapsed = !_othersArchiveCollapsed,
+                );
+              },
+            ),
+          );
         }
         break;
     }
@@ -3844,7 +4252,7 @@ class _ColleagueCloudEntry {
   final int count;
 }
 
-/// @-handle chips for the rail (not the Colleagues page Person dropdown).
+/// @-handle chips for the rail (Private view uses the main dropdown; rail is quick filter).
 class _ColleagueAtNameCloud extends StatelessWidget {
   const _ColleagueAtNameCloud({
     required this.entries,
@@ -3878,6 +4286,7 @@ class _ColleagueAtNameCloud extends StatelessWidget {
           LedgerTagChip(
             tag: e.person.handle,
             tokenPrefix: '@',
+            unselectedLabelColor: LedgerListingAccents.topic,
             selected: selectedPersonId == e.person.id,
             selectionAccent: LedgerListingAccents.topic,
             onPressed: () {
@@ -3909,6 +4318,8 @@ class _PillarRail extends StatelessWidget {
     required this.selected,
     required this.recentTags,
     required this.recentTagsHasMore,
+    required this.privateRailTags,
+    required this.onPrivateRailTag,
     required this.tagsLoading,
     required this.tagsLoadError,
     required this.onRetryTags,
@@ -3946,6 +4357,8 @@ class _PillarRail extends StatelessWidget {
   final LedgerPillar selected;
   final List<String> recentTags;
   final bool recentTagsHasMore;
+  final List<String> privateRailTags;
+  final ValueChanged<String> onPrivateRailTag;
   final bool tagsLoading;
   final String? tagsLoadError;
   final VoidCallback onRetryTags;
@@ -3971,12 +4384,7 @@ class _PillarRail extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final colleagueRailCloudChild = colleagueCloudEntries.isEmpty
-        ? Text(
-            'No @ colleagues yet',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: scheme.onSurfaceVariant,
-            ),
-          )
+        ? const SizedBox.shrink()
         : _ColleagueAtNameCloud(
             entries: colleagueCloudEntries,
             selectedPersonId: colleagueFilterPersonId,
@@ -4049,11 +4457,11 @@ class _PillarRail extends StatelessWidget {
                       dense: true,
                       contentPadding: const EdgeInsets.fromLTRB(20, 0, 12, 0),
                       leading: Icon(
-                        Icons.people_outline,
+                        Icons.lock_outline,
                         size: 20,
                         color: LedgerListingAccents.topic,
                       ),
-                      title: const Text('Colleagues'),
+                      title: const Text('Private'),
                       selected: selected == LedgerPillar.tags &&
                           talkingPointsSubView ==
                               _TalkingPointsSubView.colleagues,
@@ -4066,15 +4474,31 @@ class _PillarRail extends StatelessWidget {
                       padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
                       child: colleagueRailCloudChild,
                     ),
+                    if (privateRailTags.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                        child: Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            for (final tag in privateRailTags)
+                              LedgerTagChip(
+                                tag: tag,
+                                onPressed: () => onPrivateRailTag(tag),
+                              ),
+                          ],
+                        ),
+                      ),
                     ListTile(
                       dense: true,
                       contentPadding: const EdgeInsets.fromLTRB(20, 0, 12, 0),
                       leading: Icon(
-                        Icons.tag_outlined,
+                        Icons.public_outlined,
                         size: 20,
                         color: LedgerListingAccents.topic,
                       ),
-                      title: const Text('Meetings or tags'),
+                      title: const Text('Public'),
                       selected: selected == LedgerPillar.tags &&
                           talkingPointsSubView ==
                               _TalkingPointsSubView.meetingsOrTags,
@@ -4127,12 +4551,7 @@ class _PillarRail extends StatelessWidget {
                                   ),
                               ],
                             )
-                          : Text(
-                              'No #tags yet',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: scheme.onSurfaceVariant,
-                              ),
-                            ),
+                          : const SizedBox.shrink(),
                     ),
                   ] else ...[
                     const SizedBox(height: 12),
@@ -5617,6 +6036,10 @@ bool _isDiscussionPoint(Expectation e) {
 
 final RegExp _inlineTagRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
 
+/// Inline `@handle` and `#hashtag` runs in private talking-point summaries (browse list).
+final RegExp _privateTalkingInlineTokenRegex =
+    RegExp(r'(@[a-zA-Z0-9._-]+|#[a-zA-Z0-9._-]+)');
+
 List<String> _extractInlineTags(String input) {
   return _inlineTagRegex
       .allMatches(input)
@@ -5624,6 +6047,41 @@ List<String> _extractInlineTags(String input) {
       .where((t) => t.isNotEmpty)
       .toSet()
       .toList();
+}
+
+TextSpan _richPrivateTalkingSummarySpan({
+  required String summary,
+  required TextStyle baseStyle,
+  required Color mentionColor,
+  required Color hashtagColor,
+}) {
+  final mentionStyle =
+      baseStyle.copyWith(color: mentionColor, fontWeight: FontWeight.w600);
+  final hashtagStyle =
+      baseStyle.copyWith(color: hashtagColor, fontWeight: FontWeight.w600);
+  final children = <InlineSpan>[];
+  var start = 0;
+  for (final m in _privateTalkingInlineTokenRegex.allMatches(summary)) {
+    if (m.start > start) {
+      children.add(TextSpan(
+        text: summary.substring(start, m.start),
+        style: baseStyle,
+      ));
+    }
+    final token = m.group(0)!;
+    children.add(TextSpan(
+      text: token,
+      style: token.startsWith('@') ? mentionStyle : hashtagStyle,
+    ));
+    start = m.end;
+  }
+  if (start < summary.length) {
+    children.add(TextSpan(text: summary.substring(start), style: baseStyle));
+  }
+  if (children.isEmpty) {
+    return TextSpan(text: summary, style: baseStyle);
+  }
+  return TextSpan(style: baseStyle, children: children);
 }
 
 class _ExpectationsOthersSection extends StatelessWidget {
@@ -5642,6 +6100,16 @@ class _ExpectationsOthersSection extends StatelessWidget {
     this.infoTooltip,
     required this.onToggleCollapsed,
     this.personForItem,
+    this.outboxDraftsListing = false,
+    this.outboxPublishedListing = false,
+    this.onPublishDraft,
+    this.onArchiveDraft,
+    this.inboxHoverListing = false,
+    this.inboxHoverIncludeDelete = false,
+    this.inboxReceiverPersonId,
+    this.onArchiveInbox,
+    this.talkingPointsBrowseListing = false,
+    this.onArchiveTalkingPoint,
   });
 
   final String title;
@@ -5659,6 +6127,20 @@ class _ExpectationsOthersSection extends StatelessWidget {
   final VoidCallback onToggleCollapsed;
   /// When set (e.g. inbox), overrides [peopleById]\[[Expectation.personId]] for tiles.
   final Person? Function(Expectation e)? personForItem;
+  /// Outbox drafts: deadline rail + hover Publish / Archive / Delete instead of permanent trash icon.
+  final bool outboxDraftsListing;
+  /// Outbox published (echo) active rows: hover Archive / Delete instead of permanent trash icon.
+  final bool outboxPublishedListing;
+  final Future<void> Function(Expectation expectation)? onPublishDraft;
+  final Future<void> Function(Expectation expectation)? onArchiveDraft;
+  /// Inbox Active/Finished: hover Archive (author or addressee); optional Delete on Personal only.
+  final bool inboxHoverListing;
+  final bool inboxHoverIncludeDelete;
+  final String? inboxReceiverPersonId;
+  final Future<void> Function(Expectation expectation)? onArchiveInbox;
+  /// Tags pillar (Private / Public lists): hover Archive + owner Delete.
+  final bool talkingPointsBrowseListing;
+  final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
 
   @override
   Widget build(BuildContext context) {
@@ -5734,6 +6216,16 @@ class _ExpectationsOthersSection extends StatelessWidget {
                   onDelete: onDeleteExpectation == null
                       ? null
                       : () => onDeleteExpectation!(e),
+                  outboxDraftsListing: outboxDraftsListing,
+                  outboxPublishedListing: outboxPublishedListing,
+                  onPublishDraft: onPublishDraft,
+                  onArchiveDraft: onArchiveDraft,
+                  inboxHoverListing: inboxHoverListing,
+                  inboxHoverIncludeDelete: inboxHoverIncludeDelete,
+                  inboxReceiverPersonId: inboxReceiverPersonId,
+                  onArchiveInbox: onArchiveInbox,
+                  talkingPointsBrowseListing: talkingPointsBrowseListing,
+                  onArchiveTalkingPoint: onArchiveTalkingPoint,
                 );
               },
             ),
@@ -5756,9 +6248,9 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
     this.showStatus = true,
     this.showTag = true,
     this.showPerson = true,
-    /// Wider Person field when Status/Tag are hidden (e.g. Colleagues). Defaults to 220.
+    /// Wider Person field when Status/Tag are hidden (e.g. Private). Defaults to 220.
     this.personFieldWidth,
-    /// Wider Tag field when Status/Person are hidden (e.g. Meetings or tags). Defaults to 220.
+    /// Wider Tag field when Status/Person are hidden (e.g. Public). Defaults to 220.
     this.tagFieldWidth,
   });
 
@@ -5927,6 +6419,17 @@ class _ExpectationOthersTile extends StatefulWidget {
     this.onTagPressed,
     required this.onOpenDetails,
     this.onDelete,
+    this.outboxDraftsListing = false,
+    this.outboxPublishedListing = false,
+    this.onPublishDraft,
+    this.onArchiveDraft,
+    this.inboxHoverListing = false,
+    this.inboxHoverIncludeDelete = false,
+    this.inboxReceiverPersonId,
+    this.onArchiveInbox,
+    this.composerRecentListing = false,
+    this.talkingPointsBrowseListing = false,
+    this.onArchiveTalkingPoint,
   });
 
   final Expectation expectation;
@@ -5937,6 +6440,19 @@ class _ExpectationOthersTile extends StatefulWidget {
   final ValueChanged<String>? onTagPressed;
   final VoidCallback onOpenDetails;
   final Future<void> Function()? onDelete;
+  final bool outboxDraftsListing;
+  final bool outboxPublishedListing;
+  final Future<void> Function(Expectation expectation)? onPublishDraft;
+  final Future<void> Function(Expectation expectation)? onArchiveDraft;
+  final bool inboxHoverListing;
+  final bool inboxHoverIncludeDelete;
+  final String? inboxReceiverPersonId;
+  final Future<void> Function(Expectation expectation)? onArchiveInbox;
+  /// Add Expectation / Add talking point — Recent: hover Delete (no under-avatar trash).
+  final bool composerRecentListing;
+  /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
+  final bool talkingPointsBrowseListing;
+  final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
 
   @override
   State<_ExpectationOthersTile> createState() => _ExpectationOthersTileState();
@@ -5946,6 +6462,13 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   bool _expanded = false;
   bool _canExpand = false;
   bool _deleting = false;
+  bool _publishing = false;
+  bool _archiving = false;
+  bool _hoverOutboxDraftRow = false;
+  bool _hoverOutboxPublishedRow = false;
+  bool _hoverInboxRow = false;
+  bool _hoverComposerRecentRow = false;
+  bool _hoverTalkingPointsBrowseRow = false;
 
   Color _rowBackgroundColor() {
     return _ledgerListingRowSurface(
@@ -5957,10 +6480,13 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   void _syncOverflowState({
     required double maxWidth,
     required TextStyle? style,
+    InlineSpan? summarySpan,
   }) {
     if (maxWidth <= 0) return;
+    final span = summarySpan ??
+        TextSpan(text: widget.expectation.summary, style: style);
     final tp = TextPainter(
-      text: TextSpan(text: widget.expectation.summary, style: style),
+      text: span,
       maxLines: 2,
       textDirection: Directionality.of(context),
     )..layout(maxWidth: maxWidth);
@@ -5991,29 +6517,72 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
     final tags = _extractInlineTags(widget.expectation.summary);
     final (healthLabel, healthColor) = _healthMeta(widget.expectation.health);
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
+    final colorPrivateTalkingSummaryTokens = widget.talkingPointsBrowseListing &&
+        isDiscussionPoint &&
+        widget.expectation.visibility == ExpectationVisibility.shadow;
     final showWarningIndicator =
         !isDiscussionPoint &&
         (widget.expectation.health == ExpectationHealth.unknown ||
             widget.expectation.status == ExpectationStatus.pending);
+    final draftDeadlineRail = widget.outboxDraftsListing &&
+        !isDiscussionPoint &&
+        widget.expectation.status != ExpectationStatus.finished;
+    final showUpperDeadlinePill = widget.expectation.status !=
+            ExpectationStatus.finished &&
+        widget.expectation.deadlineAt != null &&
+        !draftDeadlineRail;
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-    final canDelete =
-        widget.onDelete != null &&
-        widget.expectation.writerUserId != null &&
+    final isWriter = widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
+    final canDelete = widget.onDelete != null && isWriter;
     final rowBackground = _rowBackgroundColor();
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      child: Material(
-        color: rowBackground,
+    final showOutboxDraftHoverBar = widget.outboxDraftsListing &&
+        _hoverOutboxDraftRow &&
+        canDelete &&
+        widget.onPublishDraft != null &&
+        widget.onArchiveDraft != null;
+    final showOutboxPublishedHoverBar = widget.outboxPublishedListing &&
+        _hoverOutboxPublishedRow &&
+        canDelete &&
+        widget.onArchiveDraft != null &&
+        widget.onDelete != null;
+    final recvId = widget.inboxReceiverPersonId?.trim() ?? '';
+    final canArchiveInbox = widget.inboxHoverListing &&
+        widget.onArchiveInbox != null &&
+        (isWriter ||
+            (recvId.isNotEmpty &&
+                widget.expectation.personId.trim() == recvId));
+    final showInboxHoverBar = widget.inboxHoverListing &&
+        _hoverInboxRow &&
+        canArchiveInbox;
+    final showInboxDeleteInHover = widget.inboxHoverIncludeDelete &&
+        canDelete &&
+        widget.onDelete != null;
+    final showComposerRecentHoverBar = widget.composerRecentListing &&
+        _hoverComposerRecentRow &&
+        canDelete &&
+        widget.onDelete != null;
+    final isTerminalTpBrowse =
+        widget.expectation.status == ExpectationStatus.finished ||
+            widget.expectation.status == ExpectationStatus.abandoned;
+    final canTpBrowseArchive = widget.talkingPointsBrowseListing &&
+        widget.onArchiveTalkingPoint != null &&
+        isWriter &&
+        !isTerminalTpBrowse;
+    final showTalkingPointsBrowseHoverBar = widget.talkingPointsBrowseListing &&
+        _hoverTalkingPointsBrowseRow &&
+        (canTpBrowseArchive || canDelete);
+    final card = Material(
+      color: rowBackground,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
         borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: widget.onOpenDetails,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+        onTap: widget.onOpenDetails,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
                   Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -6028,8 +6597,13 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                           ),
                         ),
                       ),
-                      if (canDelete) const SizedBox(height: 22),
-                      if (canDelete)
+                      if (canDelete &&
+                          !widget.outboxDraftsListing &&
+                          !widget.outboxPublishedListing &&
+                          !widget.inboxHoverListing &&
+                          !widget.composerRecentListing &&
+                          !widget.talkingPointsBrowseListing) ...[
+                        const SizedBox(height: 22),
                         Tooltip(
                           message: 'Delete expectation',
                           child: IconButton(
@@ -6064,6 +6638,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                                   ),
                           ),
                         ),
+                      ],
                     ],
                   ),
                   const SizedBox(width: 10),
@@ -6081,11 +6656,35 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                         const SizedBox(height: 6),
                         LayoutBuilder(
                           builder: (context, constraints) {
-                            _syncOverflowState(maxWidth: constraints.maxWidth, style: summaryStyle);
+                            final richSummary = summaryStyle != null &&
+                                    colorPrivateTalkingSummaryTokens
+                                ? _richPrivateTalkingSummarySpan(
+                                    summary: widget.expectation.summary,
+                                    baseStyle: summaryStyle,
+                                    mentionColor: LedgerListingAccents.topic,
+                                    hashtagColor: widget.scheme.onSurfaceVariant,
+                                  )
+                                : null;
+                            _syncOverflowState(
+                              maxWidth: constraints.maxWidth,
+                              style: summaryStyle,
+                              summarySpan: richSummary,
+                            );
+                            if (richSummary != null) {
+                              return Text.rich(
+                                richSummary,
+                                maxLines: _expanded ? null : 2,
+                                overflow: _expanded
+                                    ? TextOverflow.visible
+                                    : TextOverflow.ellipsis,
+                              );
+                            }
                             return Text(
                               widget.expectation.summary,
                               maxLines: _expanded ? null : 2,
-                              overflow: _expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                              overflow: _expanded
+                                  ? TextOverflow.visible
+                                  : TextOverflow.ellipsis,
                               style: summaryStyle,
                             );
                           },
@@ -6113,8 +6712,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      if (widget.expectation.status != ExpectationStatus.finished &&
-                          widget.expectation.deadlineAt != null)
+                      if (showUpperDeadlinePill)
                         Tooltip(
                           message: _deadlineTooltip(widget.expectation),
                           child: Container(
@@ -6132,11 +6730,11 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                             ),
                           ),
                         ),
-                      if (widget.expectation.status != ExpectationStatus.finished &&
-                          widget.expectation.deadlineAt != null)
-                        const SizedBox(height: 8),
+                      if (showUpperDeadlinePill) const SizedBox(height: 8),
                       Container(
-                        width: 36,
+                        constraints: draftDeadlineRail
+                            ? const BoxConstraints(minWidth: 40, maxWidth: 96)
+                            : const BoxConstraints.tightFor(width: 36),
                         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(10),
@@ -6145,7 +6743,24 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
-                            if (!isDiscussionPoint &&
+                            if (draftDeadlineRail)
+                              Tooltip(
+                                message: _deadlineTooltip(widget.expectation),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                                  child: Text(
+                                    _deadlineDistanceLabel(widget.expectation),
+                                    textAlign: TextAlign.center,
+                                    maxLines: 2,
+                                    style: widget.theme.textTheme.labelSmall?.copyWith(
+                                      color: widget.scheme.onSurfaceVariant,
+                                      fontFamily: 'monospace',
+                                      height: 1.2,
+                                    ),
+                                  ),
+                                ),
+                              )
+                            else if (!isDiscussionPoint &&
                                 widget.expectation.status != ExpectationStatus.finished)
                               Tooltip(
                                 message: showWarningIndicator
@@ -6168,8 +6783,9 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                                         ),
                                       ),
                               ),
-                            if (!isDiscussionPoint &&
-                                widget.expectation.status != ExpectationStatus.finished)
+                            if (draftDeadlineRail ||
+                                (!isDiscussionPoint &&
+                                    widget.expectation.status != ExpectationStatus.finished))
                               const SizedBox(height: 8),
                             if (widget.expectation.visibility == ExpectationVisibility.shadow)
                               Tooltip(
@@ -6236,6 +6852,449 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
               ],
             ),
           ),
+        ),
+    );
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: MouseRegion(
+        onEnter: (_) {
+          if (widget.outboxDraftsListing) {
+            setState(() => _hoverOutboxDraftRow = true);
+          }
+          if (widget.outboxPublishedListing) {
+            setState(() => _hoverOutboxPublishedRow = true);
+          }
+          if (widget.inboxHoverListing) {
+            setState(() => _hoverInboxRow = true);
+          }
+          if (widget.composerRecentListing) {
+            setState(() => _hoverComposerRecentRow = true);
+          }
+          if (widget.talkingPointsBrowseListing) {
+            setState(() => _hoverTalkingPointsBrowseRow = true);
+          }
+        },
+        onExit: (_) {
+          if (widget.outboxDraftsListing) {
+            setState(() => _hoverOutboxDraftRow = false);
+          }
+          if (widget.outboxPublishedListing) {
+            setState(() => _hoverOutboxPublishedRow = false);
+          }
+          if (widget.inboxHoverListing) {
+            setState(() => _hoverInboxRow = false);
+          }
+          if (widget.composerRecentListing) {
+            setState(() => _hoverComposerRecentRow = false);
+          }
+          if (widget.talkingPointsBrowseListing) {
+            setState(() => _hoverTalkingPointsBrowseRow = false);
+          }
+        },
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            card,
+            if (showOutboxDraftHoverBar)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.97),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Wrap(
+                      spacing: 0,
+                      runSpacing: 0,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        TextButton(
+                          onPressed: (_publishing || _archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _publishing = true);
+                                  try {
+                                    await widget.onPublishDraft!(widget.expectation);
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _publishing = false);
+                                    }
+                                  }
+                                },
+                          child: _publishing
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.primary,
+                                  ),
+                                )
+                              : Text(
+                                  'Publish',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: widget.scheme.primary,
+                                  ),
+                                ),
+                        ),
+                        TextButton(
+                          onPressed: (_publishing || _archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _archiving = true);
+                                  try {
+                                    await widget.onArchiveDraft!(widget.expectation);
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _archiving = false);
+                                    }
+                                  }
+                                },
+                          child: _archiving
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                )
+                              : Text(
+                                  'Archive',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                        ),
+                        TextButton(
+                          onPressed: (_publishing || _archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _deleting = true);
+                                  try {
+                                    await widget.onDelete!.call();
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _deleting = false);
+                                    }
+                                  }
+                                },
+                          child: _deleting
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.error,
+                                  ),
+                                )
+                              : Text(
+                                  'Delete',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                    color: widget.scheme.error,
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (showOutboxPublishedHoverBar)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.97),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Wrap(
+                      spacing: 0,
+                      runSpacing: 0,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        TextButton(
+                          onPressed: (_archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _archiving = true);
+                                  try {
+                                    await widget.onArchiveDraft!(widget.expectation);
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _archiving = false);
+                                    }
+                                  }
+                                },
+                          child: _archiving
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                )
+                              : Text(
+                                  'Archive',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                        ),
+                        TextButton(
+                          onPressed: (_archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _deleting = true);
+                                  try {
+                                    await widget.onDelete!.call();
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _deleting = false);
+                                    }
+                                  }
+                                },
+                          child: _deleting
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.error,
+                                  ),
+                                )
+                              : Text(
+                                  'Delete',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                    color: widget.scheme.error,
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (showInboxHoverBar)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.97),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Wrap(
+                      spacing: 0,
+                      runSpacing: 0,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        TextButton(
+                          onPressed: (_archiving || _deleting)
+                              ? null
+                              : () async {
+                                  setState(() => _archiving = true);
+                                  try {
+                                    await widget.onArchiveInbox!(widget.expectation);
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _archiving = false);
+                                    }
+                                  }
+                                },
+                          child: _archiving
+                              ? SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                )
+                              : Text(
+                                  'Archive',
+                                  style: widget.theme.textTheme.labelLarge?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: widget.scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                        ),
+                        if (showInboxDeleteInHover)
+                          TextButton(
+                            onPressed: (_archiving || _deleting)
+                                ? null
+                                : () async {
+                                    setState(() => _deleting = true);
+                                    try {
+                                      await widget.onDelete!.call();
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() => _deleting = false);
+                                      }
+                                    }
+                                  },
+                            child: _deleting
+                                ? SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: widget.scheme.error,
+                                    ),
+                                  )
+                                : Text(
+                                    'Delete',
+                                    style: widget.theme.textTheme.labelLarge?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: widget.scheme.error,
+                                    ),
+                                  ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (showComposerRecentHoverBar)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.97),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: TextButton(
+                      onPressed: _deleting
+                          ? null
+                          : () async {
+                              setState(() => _deleting = true);
+                              try {
+                                await widget.onDelete!.call();
+                              } finally {
+                                if (mounted) {
+                                  setState(() => _deleting = false);
+                                }
+                              }
+                            },
+                      child: _deleting
+                          ? SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: widget.scheme.error,
+                              ),
+                            )
+                          : Text(
+                              'Delete',
+                              style: widget.theme.textTheme.labelLarge?.copyWith(
+                                fontWeight: FontWeight.w600,
+                                color: widget.scheme.error,
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+              ),
+            if (showTalkingPointsBrowseHoverBar)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.97),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Wrap(
+                      spacing: 0,
+                      runSpacing: 0,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        if (canTpBrowseArchive)
+                          TextButton(
+                            onPressed: (_archiving || _deleting)
+                                ? null
+                                : () async {
+                                    setState(() => _archiving = true);
+                                    try {
+                                      await widget.onArchiveTalkingPoint!(
+                                        widget.expectation,
+                                      );
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() => _archiving = false);
+                                      }
+                                    }
+                                  },
+                            child: _archiving
+                                ? SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: widget.scheme.onSurfaceVariant,
+                                    ),
+                                  )
+                                : Text(
+                                    'Archive',
+                                    style: widget.theme.textTheme.labelLarge?.copyWith(
+                                      fontWeight: FontWeight.w700,
+                                      color: widget.scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                          ),
+                        if (canDelete)
+                          TextButton(
+                            onPressed: (_archiving || _deleting)
+                                ? null
+                                : () async {
+                                    setState(() => _deleting = true);
+                                    try {
+                                      await widget.onDelete!.call();
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() => _deleting = false);
+                                      }
+                                    }
+                                  },
+                            child: _deleting
+                                ? SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: widget.scheme.error,
+                                    ),
+                                  )
+                                : Text(
+                                    'Delete',
+                                    style: widget.theme.textTheme.labelLarge?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: widget.scheme.error,
+                                    ),
+                                  ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
