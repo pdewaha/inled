@@ -13,7 +13,7 @@ The rail switches pillars (sections). Each has title, accent colors, and optiona
 
 Pillar	Role
 Home
-Short lead copy + dual-mode composer (talking point vs expectation) + recent thread-style list
+Dashboard (welcome + placeholder “waiting” card) + examples; dual-mode composer in Quick Capture (centered dialog from AppBar “Quick Capture” button or plain Q when not typing in a field; Ctrl/Alt/Meta+Q ignored).
 Add expectation
 Dedicated capture for expectations
 Add talking point
@@ -26,7 +26,7 @@ Talking points
 Tags / colleagues / meetings-style browsing
 Layout pattern
 Top: pillar header.
-Composer block (only on Home, Add expectation, Add talking point): wrapped in a Focus node with onKeyEvent for custom Tab / Enter behavior; ExcludeFocus on the thread ListView so Tab does not enter the feed during capture.
+Composer block (Add expectation, Add talking point, and Home Quick Capture dialog): wrapped in a Focus node with onKeyEvent for custom Tab / Enter behavior; ExcludeFocus on the thread ListView so Tab does not enter the feed during capture (when the save row is active).
 Bottom: Expanded ListView of “thread” cards (guides, expectations, people, tags content — depends on pillar).
 Composer and capture model
 CommandCaptureBar — Shared multiline TextField (TextEditingController + FocusNode), monospace styling, optional @/# suggestion strip under the field, CallbackShortcuts for Enter when inline picks are active.
@@ -34,7 +34,7 @@ Parsing — parseCaptureLine (capture_parser.dart) extracts rough signals (handl
 Persistence — _submitCapture (and helpers) builds Expectation rows, optimistic FeedEntry on Home, writes to Supabase, reloads lists; visibility (shadow = private/draft, echo = published) and type (topic vs expectation) drive behavior.
 Home vs dedicated capture pillars
 Home
-Two-step save: first row Save as Talking Point / Save as Expectation; second row Save privately / Save publicly (topics) or Save as Draft / Send immediately (expectations), with back control to re-pick type.
+Quick Capture dialog: two-step save (Save as Talking Point / Save as Expectation, then visibility row) with the same keyboard rules as before; main Home body no longer embeds the composer.
 State: _homePendingEntry, _composerMode, Listenable.merge on controller + revision notifier so the save row stays in sync after clear() / reset.
 After successful save: hard reset (block key + token + neutral state) so UI returns to the kind row; home-only refocus path (GlobalKey host + FocusScope.requestFocus + delayed retries) so the capture field gets focus again.
 Enter (hardware): resolves single valid mode and advances to visibility step; token picks delegate to the bar’s Enter handling.

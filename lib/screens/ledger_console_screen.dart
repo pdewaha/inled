@@ -20,7 +20,8 @@ import 'package:inled/widgets/responsive_centered_body.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-/// Single-column command thread with persistent pillar rail and pinned composer.
+/// Single-column command thread with persistent pillar rail; Home uses Quick Capture
+/// in a sheet, other capture pillars keep an inline composer.
 class LedgerConsoleScreen extends StatefulWidget {
   const LedgerConsoleScreen({
     super.key,
@@ -60,6 +61,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   int _homeCaptureRefocusToken = 0;
   /// Home-only: stable anchor under the capture bar for [FocusScope.requestFocus] after reset.
   final GlobalKey _homeComposerCaptureHostKey = GlobalKey();
+
+  /// True while the Home Quick Capture bottom sheet is open ([_composerHasSavePairButtonsPillar]).
+  bool _homeQuickCaptureSheetOpen = false;
 
   /// Persistent left rail (not a modal drawer — stays put when the canvas is used).
   bool _railExpanded = true;
@@ -499,6 +503,62 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
   }
 
+  /// Private talking-point row (Tags / colleagues): shadow → echo, same as outbox publish.
+  Future<void> _publishTalkingPointBrowse(Expectation expectation) async {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId == null || expectation.writerUserId != currentUserId) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only the author can publish this item.')),
+      );
+      return;
+    }
+    if (expectation.visibility != ExpectationVisibility.shadow) return;
+    final now = DateTime.now().toUtc();
+    try {
+      await Supabase.instance.client.from('expectations').update({
+        'expectation_visibility': ExpectationVisibility.echo.index,
+        'published_at': now.toIso8601String(),
+        'responsible_updated_at': now.toIso8601String(),
+      }).eq('id', expectation.id);
+      if (!mounted) return;
+      setState(() {
+        final i = _expectations.indexWhere((e) => e.id == expectation.id);
+        if (i >= 0) {
+          final e = _expectations[i];
+          _expectations[i] = Expectation(
+            id: e.id,
+            createdAt: e.createdAt,
+            writerUserId: e.writerUserId,
+            personId: e.personId,
+            summary: e.summary,
+            deadlineLabel: e.deadlineLabel,
+            deadlineAt: e.deadlineAt,
+            finishedAt: e.finishedAt,
+            responsibleUpdatedAt: now,
+            publishedAt: now,
+            seenAt: e.seenAt,
+            lastChattedSenderAt: e.lastChattedSenderAt,
+            lastChattedReceiverAt: e.lastChattedReceiverAt,
+            progress: e.progress,
+            health: e.health,
+            type: e.type,
+            status: e.status,
+            visibility: ExpectationVisibility.echo,
+          );
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Published.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to publish: $e')),
+      );
+    }
+  }
+
   /// DB + local list: status abandoned, [responsible_updated_at] updated. Returns false on failure.
   Future<bool> _persistExpectationAbandoned(Expectation expectation) async {
     final now = DateTime.now().toUtc();
@@ -553,6 +613,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   }
 
   void _goAddExpectationCapture() {
+    if (_homeQuickCaptureSheetOpen) {
+      Navigator.of(context).pop();
+    }
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.addExpectation;
@@ -563,6 +626,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   }
 
   void _goAddTopicCapture() {
+    if (_homeQuickCaptureSheetOpen) {
+      Navigator.of(context).pop();
+    }
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.addTopic;
@@ -608,7 +674,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _keyboardHookRegistered = true;
         HardwareKeyboard.instance.addHandler(_onHardwareKey);
       }
-      _captureFocus.requestFocus();
+      if (_pillar != LedgerPillar.home) {
+        _captureFocus.requestFocus();
+      }
     });
   }
 
@@ -958,6 +1026,25 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         pressed.contains(LogicalKeyboardKey.shiftRight);
   }
 
+  bool _quickCaptureModifierHeld() {
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    return pressed.contains(LogicalKeyboardKey.controlLeft) ||
+        pressed.contains(LogicalKeyboardKey.controlRight) ||
+        pressed.contains(LogicalKeyboardKey.metaLeft) ||
+        pressed.contains(LogicalKeyboardKey.metaRight) ||
+        pressed.contains(LogicalKeyboardKey.altLeft) ||
+        pressed.contains(LogicalKeyboardKey.altRight);
+  }
+
+  /// True when the user is typing in a text field (do not steal Q for Quick Capture).
+  bool _typingInEditableText() {
+    final node = FocusManager.instance.primaryFocus;
+    final ctx = node?.context;
+    if (ctx == null) return false;
+    if (ctx.widget is EditableText) return true;
+    return ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
   /// True when @/# autocomplete is showing and Enter should complete (not submit / newline).
   bool _composerHasActiveTokenPick() {
     return _uniqueMentionSuggestion != null ||
@@ -973,8 +1060,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   }
 
   bool _composerHasSavePairButtonsPillar() {
-    return _pillar == LedgerPillar.home ||
-        _pillar == LedgerPillar.addTopic ||
+    if (_pillar == LedgerPillar.home) return _homeQuickCaptureSheetOpen;
+    return _pillar == LedgerPillar.addTopic ||
         _pillar == LedgerPillar.addExpectation;
   }
 
@@ -1095,6 +1182,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   bool _onHardwareKey(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
+
+    if (event.logicalKey == LogicalKeyboardKey.keyQ &&
+        !_shiftDown() &&
+        !_quickCaptureModifierHeld()) {
+      if (_typingInEditableText()) return false;
+      if (_homeQuickCaptureSheetOpen) return true;
+      _openHomeQuickCaptureModal();
+      return true;
+    }
+
     if (!_composerHasSavePairButtonsPillar()) {
       if (!_captureFocus.hasFocus) return false;
     } else if (!_focusInComposerSaveCycleGroup()) {
@@ -1510,7 +1607,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     GlobalKey? homeCaptureHostKey,
   }) {
     final inner = Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: EdgeInsets.symmetric(
+        vertical: _pillar == LedgerPillar.home ? 12 : 8,
+      ),
       child: CommandCaptureBar(
         controller: _captureController,
         focusNode: _captureFocus,
@@ -1527,6 +1626,302 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       return KeyedSubtree(key: homeCaptureHostKey, child: inner);
     }
     return inner;
+  }
+
+  /// Home capture UI (same state as the screen; shown inside the Quick Capture sheet).
+  Widget _buildHomeQuickCaptureModalBody({
+    required ThemeData theme,
+    required ColorScheme scheme,
+  }) {
+    return Focus(
+      skipTraversal: true,
+      canRequestFocus: false,
+      descendantsAreFocusable: true,
+      onKeyEvent: _onComposerBlockKeyEvent,
+      child: Column(
+        key: ValueKey<int>(_homeComposerBlockKey),
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Quick Capture',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: scheme.onSurface,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Close',
+                onPressed: () => Navigator.of(context).maybePop(),
+                icon: const Icon(Icons.close_rounded),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _HomeComposerLeadBubble(theme: theme, scheme: scheme),
+          const SizedBox(height: 18),
+          _buildComposerCommandCaptureBar(
+            theme,
+            scheme,
+            homeCaptureHostKey: _homeComposerCaptureHostKey,
+          ),
+          const SizedBox(height: 16),
+          ListenableBuilder(
+            listenable: _homeComposerSaveRowListenable,
+            builder: (context, _) {
+              final value = _captureController.value;
+              final homePending = _homePendingEntry;
+              final canSaveExpectation =
+                  _composerCaptureTextIsSubmittable(value.text);
+              final canSaveTalkingPoint =
+                  _talkingPointPrivateSubmittable(value.text);
+              final hasPerson = _talkingPointLineHasPersonMention(value.text);
+              final busy = _submitInFlight;
+              final tpEnabled = canSaveTalkingPoint && !busy;
+              final expEnabled = canSaveExpectation && hasPerson && !busy;
+              final (enA, enB) = _composerSavePairButtonEnabledFlags();
+
+              if (homePending == null) {
+                return Row(
+                  children: [
+                    Expanded(
+                      child: _PairedSaveAction(
+                        focusNode: _composerSavePairFocusA,
+                        enabled: tpEnabled,
+                        onPressed: _submitHomeAsTalkingPoint,
+                        label: 'Save as Talking Point',
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _PairedSaveAction(
+                        focusNode: _composerSavePairFocusB,
+                        enabled: expEnabled,
+                        onPressed: _submitHomeAsExpectation,
+                        label: 'Save as Expectation',
+                      ),
+                    ),
+                  ],
+                );
+              }
+              if (homePending == _ComposerEntryMode.topic) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ExcludeFocus(
+                      child: IconButton(
+                        tooltip: 'Choose capture type again',
+                        onPressed: busy
+                            ? null
+                            : () {
+                                setState(() {
+                                  _homePendingEntry = null;
+                                  _composerMode = _composerDefaultMode;
+                                });
+                                _homeComposerUiRevision.value++;
+                              },
+                        icon: const Icon(Icons.arrow_back_rounded),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: _PairedSaveAction(
+                        focusNode: _homeVisSaveFocusA,
+                        enabled: enA,
+                        autofocus: true,
+                        onPressed: () => unawaited(
+                          _submitCapture(
+                            forcedTalkingPointVisibility:
+                                ExpectationVisibility.shadow,
+                          ),
+                        ),
+                        label: 'Save privately',
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _PairedSaveAction(
+                        focusNode: _homeVisSaveFocusB,
+                        enabled: enB,
+                        onPressed: () => unawaited(
+                          _submitCapture(
+                            forcedTalkingPointVisibility:
+                                ExpectationVisibility.echo,
+                          ),
+                        ),
+                        label: 'Save publicly',
+                      ),
+                    ),
+                  ],
+                );
+              }
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  ExcludeFocus(
+                    child: IconButton(
+                      tooltip: 'Choose capture type again',
+                      onPressed: busy
+                          ? null
+                          : () {
+                              setState(() {
+                                _homePendingEntry = null;
+                                _composerMode = _composerDefaultMode;
+                              });
+                              _homeComposerUiRevision.value++;
+                            },
+                      icon: const Icon(Icons.arrow_back_rounded),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: _PairedSaveAction(
+                      focusNode: _homeVisSaveFocusA,
+                      enabled: enA,
+                      autofocus: true,
+                      onPressed: () => unawaited(
+                        _submitCapture(
+                          forcedExpectationVisibility:
+                              ExpectationVisibility.shadow,
+                        ),
+                      ),
+                      label: 'Save as Draft',
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _PairedSaveAction(
+                      focusNode: _homeVisSaveFocusB,
+                      enabled: enB,
+                      onPressed: () => unawaited(
+                        _submitCapture(
+                          forcedExpectationVisibility:
+                              ExpectationVisibility.echo,
+                        ),
+                      ),
+                      label: 'Send immediately',
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          if (_composerToastMessage != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(top: 12, bottom: 4),
+              padding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
+              decoration: BoxDecoration(
+                color: scheme.errorContainer.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: scheme.error.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Text(
+                _composerToastMessage!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: scheme.onErrorContainer,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _openHomeQuickCaptureModal() {
+    if (!mounted) return;
+    if (_homeQuickCaptureSheetOpen) return;
+
+    final switchToHome = _pillar != LedgerPillar.home;
+    setState(() {
+      _homeQuickCaptureSheetOpen = true;
+      if (switchToHome) {
+        _homePendingEntry = null;
+        _pillar = LedgerPillar.home;
+      }
+    });
+
+    final theme = Theme.of(context);
+    final barrierLabel =
+        MaterialLocalizations.of(context).modalBarrierDismissLabel;
+
+    unawaited(
+      showGeneralDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        barrierLabel: barrierLabel,
+        barrierColor: theme.colorScheme.scrim.withValues(alpha: 0.45),
+        transitionDuration: const Duration(milliseconds: 90),
+        pageBuilder: (dialogContext, animation, secondaryAnimation) {
+          final mq = MediaQuery.of(dialogContext);
+          final dialogTheme = Theme.of(dialogContext);
+          return FadeTransition(
+            opacity: CurvedAnimation(
+              parent: animation,
+              curve: Curves.easeOut,
+            ),
+            child: Center(
+              child: Dialog(
+                backgroundColor:
+                    dialogTheme.colorScheme.surfaceContainerHigh,
+                insetPadding:
+                    const EdgeInsets.symmetric(horizontal: 28, vertical: 36),
+                clipBehavior: Clip.antiAlias,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: 560,
+                    maxHeight: mq.size.height * 0.88,
+                  ),
+                  child: ListenableBuilder(
+                    listenable: _homeComposerSaveRowListenable,
+                    builder: (context, _) {
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          bottom:
+                              MediaQuery.viewInsetsOf(dialogContext).bottom,
+                        ),
+                        child: SingleChildScrollView(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+                            child: _buildHomeQuickCaptureModalBody(
+                              theme: dialogTheme,
+                              scheme: dialogTheme.colorScheme,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ).whenComplete(() {
+        if (!mounted) return;
+        setState(() {
+          _homeQuickCaptureSheetOpen = false;
+        });
+      }),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _pillar != LedgerPillar.home) return;
+      _captureFocus.requestFocus();
+    });
   }
 
   String _composerCaptureHintForPillar() {
@@ -1550,9 +1945,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       if (_homePendingEntry == _ComposerEntryMode.expectation) {
         return 'Choose Save as Draft or Send immediately (back arrow to re-pick type).';
       }
-      return 'Pick Talking Point or Expectation, then choose visibility. '
-          'Talking points use # for public or @person for private notes; expectations need @someone and tags. '
-          'Enter skips to visibility when only one type applies.';
+      return 'Type your line. @ and # as needed; expectations need @someone. '
+          'Tab completes a pick; Enter inserts while picking, otherwise saves or moves on.';
     }
     return 'Use @people and #tags where helpful.';
   }
@@ -1760,6 +2154,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   void _releaseSubmitInFlight() {
     _submitInFlight = false;
+    _homeComposerUiRevision.value++;
     if (mounted) setState(() {});
   }
 
@@ -1882,6 +2277,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       return;
     }
     _submitInFlight = true;
+    _homeComposerUiRevision.value++;
     setState(() {});
     final handle = _extractMentionHandle(text);
     final ExpectationType entryType;
@@ -2386,9 +2782,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   void _showComposerToast(String message) {
     if (!mounted) return;
     _composerToastTimer?.cancel();
+    _homeComposerUiRevision.value++;
     setState(() => _composerToastMessage = message);
     _composerToastTimer = Timer(const Duration(seconds: 4), () {
       if (!mounted) return;
+      _homeComposerUiRevision.value++;
       setState(() => _composerToastMessage = null);
     });
   }
@@ -2799,6 +3197,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         ),
         title: const Text('ExLed'),
         actions: [
+          TextButton(
+            onPressed: _openHomeQuickCaptureModal,
+            child: const Text('Quick Capture'),
+          ),
           MenuAnchor(
             menuChildren: [
               for (final v in AppThemeVariant.values)
@@ -2867,6 +3269,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   await Supabase.instance.client.auth.signOut();
                 },
                 onSelect: (p) {
+                  if (_homeQuickCaptureSheetOpen) {
+                    Navigator.of(context).pop();
+                  }
                   setState(() {
                     _homePendingEntry = null;
                     _pillar = p;
@@ -2882,8 +3287,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       _composerMode = _ComposerEntryMode.topic;
                     }
                   });
-                  if (p == LedgerPillar.home ||
-                      p == LedgerPillar.addExpectation ||
+                  if (p == LedgerPillar.addExpectation ||
                       p == LedgerPillar.addTopic) {
                     _focusComposer();
                   } else {
@@ -2901,8 +3305,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
                 onTap: () {
-                  if (_pillar == LedgerPillar.home ||
-                      _pillar == LedgerPillar.addExpectation ||
+                  if (_pillar == LedgerPillar.addExpectation ||
                       _pillar == LedgerPillar.addTopic) {
                     _focusComposer();
                   }
@@ -2914,9 +3317,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       _PillarHeader(pillar: _pillar, theme: theme),
-                      const SizedBox(height: 12),
-                      if (_pillar == LedgerPillar.home ||
-                          _pillar == LedgerPillar.addExpectation ||
+                      SizedBox(
+                        height: _pillar == LedgerPillar.home ? 20 : 12,
+                      ),
+                      if (_pillar == LedgerPillar.addExpectation ||
                           _pillar == LedgerPillar.addTopic) ...[
                         Focus(
                           skipTraversal: true,
@@ -2924,179 +3328,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           descendantsAreFocusable: true,
                           onKeyEvent: _onComposerBlockKeyEvent,
                           child: Column(
-                            key: _pillar == LedgerPillar.home
-                                ? ValueKey<int>(_homeComposerBlockKey)
-                                : null,
                             mainAxisSize: MainAxisSize.min,
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                        if (_pillar == LedgerPillar.home) ...[
-                          _HomeComposerLeadBubble(theme: theme, scheme: scheme),
-                          const SizedBox(height: 10),
-                        ],
                         _buildComposerCommandCaptureBar(
                           theme,
                           scheme,
-                          homeCaptureHostKey: _pillar == LedgerPillar.home
-                              ? _homeComposerCaptureHostKey
-                              : null,
+                          homeCaptureHostKey: null,
                         ),
-                        if (_pillar == LedgerPillar.home) ...[
-                          const SizedBox(height: 6),
-                          ListenableBuilder(
-                            listenable: _homeComposerSaveRowListenable,
-                            builder: (context, _) {
-                              final value = _captureController.value;
-                              final homePending = _homePendingEntry;
-                              final canSaveExpectation =
-                                  _composerCaptureTextIsSubmittable(value.text);
-                              final canSaveTalkingPoint =
-                                  _talkingPointPrivateSubmittable(value.text);
-                              final hasPerson =
-                                  _talkingPointLineHasPersonMention(value.text);
-                              final busy = _submitInFlight;
-                              final tpEnabled = canSaveTalkingPoint && !busy;
-                              final expEnabled =
-                                  canSaveExpectation && hasPerson && !busy;
-                              final (enA, enB) =
-                                  _composerSavePairButtonEnabledFlags();
-
-                              if (homePending == null) {
-                                return Row(
-                                  children: [
-                                    Expanded(
-                                      child: _PairedSaveAction(
-                                        focusNode: _composerSavePairFocusA,
-                                        enabled: tpEnabled,
-                                        onPressed: _submitHomeAsTalkingPoint,
-                                        label: 'Save as Talking Point',
-                                      ),
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: _PairedSaveAction(
-                                        focusNode: _composerSavePairFocusB,
-                                        enabled: expEnabled,
-                                        onPressed: _submitHomeAsExpectation,
-                                        label: 'Save as Expectation',
-                                      ),
-                                    ),
-                                  ],
-                                );
-                              }
-                              if (homePending == _ComposerEntryMode.topic) {
-                                return Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    ExcludeFocus(
-                                      child: IconButton(
-                                        tooltip: 'Choose capture type again',
-                                        onPressed: busy
-                                            ? null
-                                            : () {
-                                                setState(() {
-                                                  _homePendingEntry = null;
-                                                  _composerMode =
-                                                      _composerDefaultMode;
-                                                });
-                                                _homeComposerUiRevision
-                                                    .value++;
-                                              },
-                                        icon: const Icon(
-                                          Icons.arrow_back_rounded,
-                                        ),
-                                        visualDensity: VisualDensity.compact,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Expanded(
-                                      child: _PairedSaveAction(
-                                        focusNode: _homeVisSaveFocusA,
-                                        enabled: enA,
-                                        autofocus: true,
-                                        onPressed: () => unawaited(
-                                          _submitCapture(
-                                            forcedTalkingPointVisibility:
-                                                ExpectationVisibility.shadow,
-                                          ),
-                                        ),
-                                        label: 'Save privately',
-                                      ),
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: _PairedSaveAction(
-                                        focusNode: _homeVisSaveFocusB,
-                                        enabled: enB,
-                                        onPressed: () => unawaited(
-                                          _submitCapture(
-                                            forcedTalkingPointVisibility:
-                                                ExpectationVisibility.echo,
-                                          ),
-                                        ),
-                                        label: 'Save publicly',
-                                      ),
-                                    ),
-                                  ],
-                                );
-                              }
-                              // _ComposerEntryMode.expectation
-                              return Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  ExcludeFocus(
-                                    child: IconButton(
-                                      tooltip: 'Choose capture type again',
-                                      onPressed: busy
-                                          ? null
-                                          : () {
-                                              setState(() {
-                                                _homePendingEntry = null;
-                                                _composerMode =
-                                                    _composerDefaultMode;
-                                              });
-                                              _homeComposerUiRevision.value++;
-                                            },
-                                      icon: const Icon(
-                                        Icons.arrow_back_rounded,
-                                      ),
-                                      visualDensity: VisualDensity.compact,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Expanded(
-                                    child: _PairedSaveAction(
-                                      focusNode: _homeVisSaveFocusA,
-                                      enabled: enA,
-                                      autofocus: true,
-                                      onPressed: () => unawaited(
-                                        _submitCapture(
-                                          forcedExpectationVisibility:
-                                              ExpectationVisibility.shadow,
-                                        ),
-                                      ),
-                                      label: 'Save as Draft',
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: _PairedSaveAction(
-                                      focusNode: _homeVisSaveFocusB,
-                                      enabled: enB,
-                                      onPressed: () => unawaited(
-                                        _submitCapture(
-                                          forcedExpectationVisibility:
-                                              ExpectationVisibility.echo,
-                                        ),
-                                      ),
-                                      label: 'Send immediately',
-                                    ),
-                                  ),
-                                ],
-                              );
-                            },
-                          ),
-                        ],
                         if (_talkingPointCaptureContext()) ...[
                           const SizedBox(height: 6),
                           ListenableBuilder(
@@ -3236,7 +3475,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           excluding: _composerHasSavePairButtonsPillar(),
                           child: ListView(
                             controller: _scrollController,
-                            padding: const EdgeInsets.only(right: 12, bottom: 16),
+                            padding: _pillar == LedgerPillar.home
+                                ? const EdgeInsets.fromLTRB(0, 4, 12, 32)
+                                : const EdgeInsets.only(right: 12, bottom: 16),
                             children: _threadChildren(
                               theme: theme,
                               scheme: scheme,
@@ -3279,6 +3520,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           })();
     switch (_pillar) {
       case LedgerPillar.home:
+        out.add(
+          _HomeDashboardPanel(
+            theme: theme,
+            scheme: scheme,
+            displayName: _profileName,
+            companyName: _companyName,
+          ),
+        );
+        out.add(const SizedBox(height: 28));
         out.add(_HomeUseCasesGuide(theme: theme, scheme: scheme));
         break;
 
@@ -3463,31 +3713,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
 
         if (_talkingPointsSubView == _TalkingPointsSubView.colleagues) {
-          out.add(
-            Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Private',
-                    style: theme.textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.w700,
-                      color: scheme.onSurface,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'People you @mention, private #hashtags, and talking-point prep—only you, not Public.',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: scheme.onSurfaceVariant,
-                      height: 1.4,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
           if (availablePrivateTags.isNotEmpty) {
             out.add(
               Padding(
@@ -3521,8 +3746,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               ),
             );
           }
-          if (true) {
-            final colleaguePersonIds = {
+          final colleaguePersonIds = {
               for (final c in colleagueCloudEntries) c.person.id,
             };
             final effectiveTalkingPointPerson =
@@ -3576,6 +3800,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 onToggleCollapsed: () {},
                 talkingPointsBrowseListing: true,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
+                onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
             );
             out.add(const SizedBox(height: 12));
@@ -3601,11 +3826,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 },
                 talkingPointsBrowseListing: true,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
+                onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
             );
-          } else {
-            // Unreachable: kept only to preserve previous brace structure.
-          }
           break;
         }
         // Public (#tags, echo, no @person)
@@ -3656,6 +3879,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onToggleCollapsed: () {},
               talkingPointsBrowseListing: true,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
+              onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
           );
           out.add(const SizedBox(height: 12));
@@ -3679,6 +3903,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               },
               talkingPointsBrowseListing: true,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
+              onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
           );
         }
@@ -5312,8 +5537,9 @@ class _PillarHeader extends StatelessWidget {
   }
 }
 
-/// Save row under the composer: muted until hover or keyboard focus. Tab order is
-/// driven manually in [_onHardwareKey]; [focusNode] targets this button in that cycle.
+/// Save row under the composer. Three idle tiers: disabled (gray), Enter-default
+/// (stronger light blue), secondary enabled (paler blue). Hover or Tab focus on this
+/// button uses full [ColorScheme.primary]. Tab order is driven in [_onHardwareKey].
 class _PairedSaveAction extends StatelessWidget {
   const _PairedSaveAction({
     required this.focusNode,
@@ -5321,7 +5547,8 @@ class _PairedSaveAction extends StatelessWidget {
     required this.onPressed,
     required this.label,
     this.autofocus = false,
-    /// Primary colors while the capture field is focused (Enter default) — does not move focus.
+    /// Stronger light-blue idle state while the capture field is focused (Enter default).
+    /// Does not move focus. Hover/Tab on this button still upgrades to [ColorScheme.primary].
     this.emphasizeAsKeyboardDefault = false,
   });
 
@@ -5342,37 +5569,135 @@ class _PairedSaveAction extends StatelessWidget {
       style: ButtonStyle(
         visualDensity: VisualDensity.compact,
         backgroundColor: WidgetStateProperty.resolveWith((states) {
+          // 1) Disabled — dark gray
           if (!enabled) {
             return scheme.surfaceContainerHighest.withValues(alpha: 0.45);
           }
-          if (states.contains(WidgetState.focused)) {
+          // 4) Hover or Tab on *this* button — strongest (clearly above Enter-default idle)
+          if (states.contains(WidgetState.focused) ||
+              states.contains(WidgetState.hovered)) {
             return scheme.primary;
           }
+          // 3) Enter-default idle (e.g. Save privately while field focused): mid blue —
+          // stronger than secondary enabled, softer than hover/focus
           if (emphasizeAsKeyboardDefault) {
-            return scheme.primary;
+            return Color.lerp(
+              scheme.primaryContainer,
+              scheme.primary,
+              0.30,
+            )!;
           }
-          if (states.contains(WidgetState.hovered)) {
-            return scheme.surfaceContainerHigh.withValues(alpha: 0.88);
-          }
-          return scheme.surfaceContainerHighest.withValues(alpha: 0.72);
+          // 2) Secondary enabled idle (e.g. Save publicly) — palest blue
+          return Color.lerp(
+            scheme.primaryContainer,
+            scheme.surface,
+            0.42,
+          )!;
         }),
         foregroundColor: WidgetStateProperty.resolveWith((states) {
           if (!enabled) {
             return scheme.onSurface.withValues(alpha: 0.38);
           }
-          if (states.contains(WidgetState.focused)) {
-            return scheme.onPrimary;
+          if (states.contains(WidgetState.focused) ||
+              states.contains(WidgetState.hovered)) {
+            return Colors.white;
           }
           if (emphasizeAsKeyboardDefault) {
-            return scheme.onPrimary;
+            return Color.lerp(
+              scheme.onPrimaryContainer,
+              scheme.onPrimary,
+              0.35,
+            )!;
           }
-          if (states.contains(WidgetState.hovered)) {
-            return scheme.onSurfaceVariant.withValues(alpha: 0.95);
-          }
-          return scheme.onSurfaceVariant.withValues(alpha: 0.9);
+          return scheme.onPrimaryContainer.withValues(alpha: 0.86);
         }),
       ),
       child: Text(label),
+    );
+  }
+}
+
+/// Home pillar: short intro and placeholder for “waiting” items (dashboard).
+class _HomeDashboardPanel extends StatelessWidget {
+  const _HomeDashboardPanel({
+    required this.theme,
+    required this.scheme,
+    required this.displayName,
+    this.companyName,
+  });
+
+  final ThemeData theme;
+  final ColorScheme scheme;
+  final String displayName;
+  final String? companyName;
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = scheme.onSurfaceVariant;
+    final company = companyName?.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Welcome back, $displayName',
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w700,
+            color: scheme.onSurface,
+          ),
+        ),
+        if (company != null && company.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            company,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: muted,
+              height: 1.35,
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        Text(
+          'Use Quick Capture for a talking point or expectation. This space '
+          'can surface priorities and waiting items later.',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: muted,
+            height: 1.45,
+          ),
+        ),
+        const SizedBox(height: 20),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHigh.withValues(alpha: 0.45),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: 0.45),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Waiting on you',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: scheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Nothing highlighted yet—check Inbox for expectations others '
+                'sent you, or Outbox for what you have open with the team.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: muted,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -5391,14 +5716,14 @@ class _HomeComposerLeadBubble extends StatelessWidget {
     final accent = LedgerPillar.home.captureAccent;
     final baseStyle = theme.textTheme.bodyMedium!.copyWith(
       color: scheme.onSurfaceVariant,
-      height: 1.45,
+      height: 1.5,
     );
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
       decoration: BoxDecoration(
         color: scheme.surfaceContainerHigh.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(color: accent.withValues(alpha: 0.28)),
       ),
       child: Text.rich(
@@ -5406,9 +5731,8 @@ class _HomeComposerLeadBubble extends StatelessWidget {
           style: baseStyle,
           children: [
             const TextSpan(
-              text:
-                  'Use the switch below for Talking point or Expectation, write '
-                  'one line, then press ',
+              text: 'Talking point = quick note; expectation = commitment to '
+                  'someone. Pick the mode below, one line, then ',
             ),
             TextSpan(
               text: 'Enter',
@@ -5418,11 +5742,7 @@ class _HomeComposerLeadBubble extends StatelessWidget {
                 fontFamily: 'monospace',
               ),
             ),
-            const TextSpan(
-              text:
-                  '. Add @people and #tags when they help—Talking point stays a '
-                  'light reminder; Expectation records a commitment.',
-            ),
+            const TextSpan(text: '.'),
           ],
         ),
       ),
@@ -5446,7 +5766,7 @@ class _HomeUseCasesGuide extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.only(bottom: 20),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -5457,9 +5777,9 @@ class _HomeUseCasesGuide extends StatelessWidget {
                   color: scheme.onSurface,
                 ),
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: 6),
               Text(
-                'Short patterns you can copy or riff on.',
+                'Three starter lines.',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: muted,
                   height: 1.35,
@@ -5474,7 +5794,7 @@ class _HomeUseCasesGuide extends StatelessWidget {
           accent: LedgerListingAccents.topic,
           icon: Icons.forum_outlined,
           title: 'Talking point',
-          body: 'Reminder or prep for a conversation—no tracking toward someone.',
+          body: 'Prep or reminder—not a tracked ask.',
           example: '@sam Points for #weeklymeeting: budget + hiring timeline.',
         ),
         _HomeGuideCard(
@@ -5483,7 +5803,7 @@ class _HomeUseCasesGuide extends StatelessWidget {
           accent: LedgerListingAccents.expectation,
           icon: Icons.flag_outlined,
           title: 'Expectation',
-          body: 'Commitment to someone (@me counts); shows in Inbox/Outbox.',
+          body: 'For someone (@me ok); shows in Inbox/Outbox.',
           example: '@alex Ship #billing fix to staging by Wed EOD.',
         ),
         _HomeGuideCard(
@@ -5492,7 +5812,7 @@ class _HomeUseCasesGuide extends StatelessWidget {
           accent: scheme.tertiary,
           icon: Icons.label_outline,
           title: 'Tags & drafts',
-          body: 'Use #tags to group (meetings, themes). Draft privately, publish when ready.',
+          body: '#tags group threads; draft, then publish when ready.',
           example: '@me #weeklymeeting follow-ups from last session.',
         ),
       ],
@@ -5522,17 +5842,17 @@ class _HomeGuideCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.only(bottom: 18),
       child: Container(
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(14),
           color: scheme.surfaceContainerHigh.withValues(alpha: 0.35),
           border: Border.all(
             color: accent.withValues(alpha: 0.3),
           ),
         ),
         child: ClipRRect(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(14),
           child: IntrinsicHeight(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -5543,7 +5863,7 @@ class _HomeGuideCard extends StatelessWidget {
                 ),
                 Expanded(
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+                    padding: const EdgeInsets.fromLTRB(14, 16, 14, 16),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -5563,25 +5883,25 @@ class _HomeGuideCard extends StatelessWidget {
                             ),
                           ],
                         ),
-                        const SizedBox(height: 6),
+                        const SizedBox(height: 10),
                         Text(
                           body,
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: scheme.onSurfaceVariant,
-                            height: 1.4,
+                            height: 1.45,
                           ),
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 12),
                         Container(
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
+                            horizontal: 12,
+                            vertical: 12,
                           ),
                           decoration: BoxDecoration(
                             color: scheme.surfaceContainerHighest
                                 .withValues(alpha: 0.5),
-                            borderRadius: BorderRadius.circular(8),
+                            borderRadius: BorderRadius.circular(10),
                             border: Border.all(
                               color: accent.withValues(alpha: 0.2),
                             ),
@@ -6110,6 +6430,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
     this.onArchiveInbox,
     this.talkingPointsBrowseListing = false,
     this.onArchiveTalkingPoint,
+    this.onPublishTalkingPoint,
   });
 
   final String title;
@@ -6141,6 +6462,8 @@ class _ExpectationsOthersSection extends StatelessWidget {
   /// Tags pillar (Private / Public lists): hover Archive + owner Delete.
   final bool talkingPointsBrowseListing;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
+  /// Private shadow talking points: hover Publish before Archive / Delete.
+  final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
 
   @override
   Widget build(BuildContext context) {
@@ -6226,6 +6549,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
                   onArchiveInbox: onArchiveInbox,
                   talkingPointsBrowseListing: talkingPointsBrowseListing,
                   onArchiveTalkingPoint: onArchiveTalkingPoint,
+                  onPublishTalkingPoint: onPublishTalkingPoint,
                 );
               },
             ),
@@ -6430,6 +6754,7 @@ class _ExpectationOthersTile extends StatefulWidget {
     this.composerRecentListing = false,
     this.talkingPointsBrowseListing = false,
     this.onArchiveTalkingPoint,
+    this.onPublishTalkingPoint,
   });
 
   final Expectation expectation;
@@ -6453,6 +6778,7 @@ class _ExpectationOthersTile extends StatefulWidget {
   /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
   final bool talkingPointsBrowseListing;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
+  final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
 
   @override
   State<_ExpectationOthersTile> createState() => _ExpectationOthersTileState();
@@ -6569,9 +6895,14 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         widget.onArchiveTalkingPoint != null &&
         isWriter &&
         !isTerminalTpBrowse;
+    final canTpBrowsePublish = widget.talkingPointsBrowseListing &&
+        widget.onPublishTalkingPoint != null &&
+        isWriter &&
+        !isTerminalTpBrowse &&
+        widget.expectation.visibility == ExpectationVisibility.shadow;
     final showTalkingPointsBrowseHoverBar = widget.talkingPointsBrowseListing &&
         _hoverTalkingPointsBrowseRow &&
-        (canTpBrowseArchive || canDelete);
+        (canTpBrowsePublish || canTpBrowseArchive || canDelete);
     final card = Material(
       color: rowBackground,
       borderRadius: BorderRadius.circular(10),
@@ -7225,9 +7556,42 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                       runSpacing: 0,
                       alignment: WrapAlignment.end,
                       children: [
+                        if (canTpBrowsePublish)
+                          TextButton(
+                            onPressed: (_publishing || _archiving || _deleting)
+                                ? null
+                                : () async {
+                                    setState(() => _publishing = true);
+                                    try {
+                                      await widget.onPublishTalkingPoint!(
+                                        widget.expectation,
+                                      );
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() => _publishing = false);
+                                      }
+                                    }
+                                  },
+                            child: _publishing
+                                ? SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: widget.scheme.primary,
+                                    ),
+                                  )
+                                : Text(
+                                    'Publish',
+                                    style: widget.theme.textTheme.labelLarge?.copyWith(
+                                      fontWeight: FontWeight.w700,
+                                      color: widget.scheme.primary,
+                                    ),
+                                  ),
+                          ),
                         if (canTpBrowseArchive)
                           TextButton(
-                            onPressed: (_archiving || _deleting)
+                            onPressed: (_publishing || _archiving || _deleting)
                                 ? null
                                 : () async {
                                     setState(() => _archiving = true);
@@ -7260,7 +7624,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                           ),
                         if (canDelete)
                           TextButton(
-                            onPressed: (_archiving || _deleting)
+                            onPressed: (_publishing || _archiving || _deleting)
                                 ? null
                                 : () async {
                                     setState(() => _deleting = true);
