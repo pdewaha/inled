@@ -49,3 +49,4 @@ Widgets: LedgerTagChip, ExpectationStatusBadge, VisibilityGlyph, ResponsiveCente
 Theme: theme.dart / AppThemeVariant.
 Security / ops note for GitHub
 main.dart embeds the Supabase URL and anon key. For a public repo, move secrets to --dart-define, CI secrets, or a non-committed config file and document how to run the app locally.
+Row-level security for ledger tables is defined in supabase-db/rls_policies.sql (run in the Supabase SQL editor after schema.sql). Storage bucket policies are separate and not covered in that file.

@@ -1,13 +1,18 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:inled/screens/auth_welcome_screen.dart';
 import 'package:inled/screens/company_onboarding_gate.dart';
 import 'package:inled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+/// Debug runs (e.g. Cursor / IDE F5) use the staging host; profile & release use production.
+String get _supabaseUrl =>
+    kDebugMode ? 'http://leam.tauworks.org/' : 'http://exled.tauworks.org/';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Supabase.initialize(
-    url: 'http://leam.tauworks.org/',
+    url: _supabaseUrl,
     anonKey:
         'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjEzMTQyMDcxLCJleHAiOjE5Mjg3MTMyNzF9.NC1GLG2-Ae8_vpynii0-Omd8qnQRlnZOd7ZWRsYoCE8',
   );
