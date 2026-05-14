@@ -1,4 +1,4 @@
-import 'package:inled/utils/capture_parser.dart';
+import 'package:exled/utils/capture_parser.dart';
 
 /// One row in the command thread (mock data or a user capture).
 class FeedEntry {

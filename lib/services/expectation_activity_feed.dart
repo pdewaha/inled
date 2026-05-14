@@ -1,7 +1,7 @@
-import 'package:inled/models/expectation.dart';
-import 'package:inled/models/expectation_type.dart';
-import 'package:inled/models/expectation_changelog_payload.dart';
-import 'package:inled/services/expectation_chat_changelog.dart';
+import 'package:exled/models/expectation.dart';
+import 'package:exled/models/expectation_type.dart';
+import 'package:exled/models/expectation_changelog_payload.dart';
+import 'package:exled/services/expectation_chat_changelog.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// One row for the activity feed (changelog messages across expectations).

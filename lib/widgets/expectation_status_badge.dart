@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:inled/models/expectation_status.dart';
+import 'package:exled/models/expectation_status.dart';
 
 class ExpectationStatusBadge extends StatelessWidget {
   const ExpectationStatusBadge({super.key, required this.status});

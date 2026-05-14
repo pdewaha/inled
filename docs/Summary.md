@@ -1,5 +1,5 @@
-inled — what it is
-inled is a Flutter client for a small team expectations / talking-points ledger. Users capture one-line entries with @people and #tags, store them as expectations (commitments) or talking points (lighter prep / threads), and browse inbox, outbox, people, and talking points views. Backend is Supabase (auth, people, companies, expectations, tags-related reads).
+exled — what it is
+exled is a Flutter client for a small team expectations / talking-points ledger. Users capture one-line entries with @people and #tags, store them as expectations (commitments) or talking points (lighter prep / threads), and browse inbox, outbox, people, and talking points views. Backend is Supabase (auth, people, companies, expectations, tags-related reads).
 
 App shell and navigation
 main.dart — Initializes Supabase, runs MaterialApp with theme variant (light/dark).

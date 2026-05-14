@@ -1,7 +1,7 @@
 import 'dart:convert';
 
-import 'package:inled/models/expectation_type.dart';
-import 'package:inled/services/expectation_chat_changelog.dart';
+import 'package:exled/models/expectation_type.dart';
+import 'package:exled/services/expectation_chat_changelog.dart';
 
 /// One row to insert after a successful expectation save (structured or plain).
 class ChangelogSaveEvent {

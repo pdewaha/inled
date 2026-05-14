@@ -1,4 +1,4 @@
-Ôªøimport 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' show min;
@@ -6,26 +6,26 @@ import 'dart:math' show min;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:inled/models/expectation.dart';
-import 'package:inled/models/expectation_changelog_payload.dart';
-import 'package:inled/models/expectation_health.dart';
-import 'package:inled/models/expectation_type.dart';
-import 'package:inled/models/feed_entry.dart';
-import 'package:inled/models/ledger_pillar.dart';
-import 'package:inled/models/person.dart';
-import 'package:inled/models/expectation_status.dart';
-import 'package:inled/models/expectation_visibility.dart';
-import 'package:inled/services/expectation_activity_feed.dart';
-import 'package:inled/services/expectation_chat_changelog.dart';
-import 'package:inled/supabase_config.dart';
-import 'package:inled/theme.dart';
-import 'package:inled/utils/capture_parser.dart';
-import 'package:inled/utils/display_date_format.dart';
-import 'package:inled/utils/person_display.dart';
-import 'package:inled/widgets/command_capture_bar.dart';
-import 'package:inled/widgets/expectation_changelog_message_body.dart';
-import 'package:inled/widgets/ledger_tag_chip.dart';
-import 'package:inled/widgets/responsive_centered_body.dart';
+import 'package:exled/models/expectation.dart';
+import 'package:exled/models/expectation_changelog_payload.dart';
+import 'package:exled/models/expectation_health.dart';
+import 'package:exled/models/expectation_type.dart';
+import 'package:exled/models/feed_entry.dart';
+import 'package:exled/models/ledger_pillar.dart';
+import 'package:exled/models/person.dart';
+import 'package:exled/models/expectation_status.dart';
+import 'package:exled/models/expectation_visibility.dart';
+import 'package:exled/services/expectation_activity_feed.dart';
+import 'package:exled/services/expectation_chat_changelog.dart';
+import 'package:exled/supabase_config.dart';
+import 'package:exled/theme.dart';
+import 'package:exled/utils/capture_parser.dart';
+import 'package:exled/utils/display_date_format.dart';
+import 'package:exled/utils/person_display.dart';
+import 'package:exled/widgets/command_capture_bar.dart';
+import 'package:exled/widgets/expectation_changelog_message_body.dart';
+import 'package:exled/widgets/ledger_tag_chip.dart';
+import 'package:exled/widgets/responsive_centered_body.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -47,10 +47,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   static const _composerDefaultMode = _ComposerEntryMode.topic;
   final _captureController = TextEditingController();
   final _captureFocus = FocusNode();
-  /// Save-action row (Home kind row / Add topic / Add expectation): Tab order field ‚Üí A ‚Üí B.
+  /// Save-action row (Home kind row / Add topic / Add expectation): Tab order field ? A ? B.
   final _composerSavePairFocusA = FocusNode(debugLabel: 'composerSaveA');
   final _composerSavePairFocusB = FocusNode(debugLabel: 'composerSaveB');
-  /// Home visibility step only ‚Äî must not reuse [_composerSavePairFocusA]/B or Flutter can
+  /// Home visibility step only ó must not reuse [_composerSavePairFocusA]/B or Flutter can
   /// keep the wrong [FilledButton] focused/visible after the kind row is shown again.
   final _homeVisSaveFocusA = FocusNode(debugLabel: 'homeVisSaveA');
   final _homeVisSaveFocusB = FocusNode(debugLabel: 'homeVisSaveB');
@@ -58,7 +58,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   Timer? _composerToastTimer;
   String? _composerToastMessage;
   /// Bumped with [_captureController] via [Listenable.merge] so the home save row rebuilds
-  /// when only [_homePendingEntry] changes ‚Äî [ValueListenableBuilder] alone can keep a stale
+  /// when only [_homePendingEntry] changes ó [ValueListenableBuilder] alone can keep a stale
   /// controller snapshot until the next text notification.
   final ValueNotifier<int> _homeComposerUiRevision = ValueNotifier<int>(0);
   late final Listenable _homeComposerSaveRowListenable;
@@ -74,7 +74,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// True while the Home Quick Capture bottom sheet is open ([_composerHasSavePairButtonsPillar]).
   bool _homeQuickCaptureSheetOpen = false;
 
-  /// Persistent left rail (not a modal drawer ‚Äî stays put when the canvas is used).
+  /// Persistent left rail (not a modal drawer ó stays put when the canvas is used).
   bool _railExpanded = true;
 
   /// Outbox: show published (echo) vs draft (shadow) expectations only.
@@ -126,7 +126,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   Person? _uniqueMentionSuggestion;
   /// Shown when @query matches several handles (or @ alone); not Tab-completable until unique.
   String? _mentionDisambiguationHint;
-  /// Multiple @ handle matches ‚Äî chips under the composer.
+  /// Multiple @ handle matches ó chips under the composer.
   List<Person> _mentionInlineCandidates = [];
   List<String> _tagInlineCandidates = [];
   /// Keyboard cycle index when [_mentionInlineCandidates] or [_tagInlineCandidates] has >1 item.
@@ -425,7 +425,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
   }
 
-  /// Outbox draft ‚Üí published (visible to receiver): echo visibility + published_at.
+  /// Outbox draft ? published (visible to receiver): echo visibility + published_at.
   Future<void> _publishOutboxDraft(Expectation expectation) async {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     if (currentUserId == null || expectation.writerUserId != currentUserId) {
@@ -475,7 +475,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Published ‚Äî now visible to your receiver.')),
+        const SnackBar(content: Text('Published ó now visible to your receiver.')),
       );
       await appendExpectationChangelogForSignedInUser(
         client: Supabase.instance.client,
@@ -580,7 +580,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
   }
 
-  /// Private talking-point row (Tags / colleagues): shadow ‚Üí echo only when there is
+  /// Private talking-point row (Tags / colleagues): shadow ? echo only when there is
   /// no addressee ([Expectation.personId] empty). @-linked prep stays private-only.
   Future<void> _publishTalkingPointBrowse(Expectation expectation) async {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
@@ -959,7 +959,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
       final companyId = meRows.first['company_id'] as String;
       // Public rail only: published talking points (echo + topic + no addressee),
-      // same constraints as [_mergedPublicRailTags] in-memory pool ‚Äî not shadow/private rows.
+      // same constraints as [_mergedPublicRailTags] in-memory pool ó not shadow/private rows.
       final rows = await client
           .from('expectations')
           .select('summary,created_at,target_person_id')
@@ -2158,7 +2158,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               Padding(
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
-                  'Tab to cycle selection ¬∑ Enter to insert ¬∑ Shift+Tab reverse ¬∑ '
+                  'Tab to cycle selection ∑ Enter to insert ∑ Shift+Tab reverse ∑ '
                   'or click a match',
                   style: hintStyle,
                 ),
@@ -2477,7 +2477,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
     late final ExpectationVisibility visibility;
     if (topicForSomeone) {
-      // Talking point @'d at a person: private note for the author only‚Äînever
+      // Talking point @'d at a person: private note for the author onlyónever
       // surfaced to the other person (no inbox / no public talking-points feed).
       visibility = ExpectationVisibility.shadow;
     } else if (forcedTalkingPointVisibility != null &&
@@ -2964,7 +2964,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final kindWord = type == ExpectationType.topic ? 'talking point' : 'expectation';
     final oneLine = text.trim().replaceAll(RegExp(r'\s+'), ' ');
     final clipped =
-        oneLine.length > 160 ? '${oneLine.substring(0, 160)}‚Ä¶' : oneLine;
+        oneLine.length > 160 ? '${oneLine.substring(0, 160)}Ö' : oneLine;
     try {
       await insertExpectationAppMessage(
         client: client,
@@ -3423,7 +3423,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'That item is not loaded ‚Äî pull Refresh or reopen the list.',
+            'That item is not loaded ó pull Refresh or reopen the list.',
           ),
         ),
       );
@@ -3442,18 +3442,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     await _openExpectationDetails(e: match, person: p);
   }
 
-  Future<void> _markActivityExpectationChangelogRead(String expectationId) async {
+  Future<bool> _markActivityExpectationChangelogRead(String expectationId) async {
     final client = Supabase.instance.client;
     final companyId = _ledgerCompanyId;
     final me = _myPersonId;
-    if (companyId == null || me == null) return;
+    if (companyId == null || me == null) return false;
     final synced = await syncExpectationChangelogReadWatermark(
       client: client,
       companyId: companyId,
       expectationId: expectationId,
       readerPersonId: me,
     );
-    if (!mounted) return;
+    if (!mounted) return false;
     if (synced) {
       setState(() {
         _changelogBellClearedIds.add(expectationId);
@@ -3464,26 +3464,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (mounted) {
       _scheduleChangelogUnreadSnapshotRefresh();
     }
-  }
-
-  Widget _activityFeedBubbleTile({
-    required ThemeData theme,
-    required ColorScheme scheme,
-    required ExpectationActivityFeedItem item,
-    required String myPersonId,
-  }) {
-    final mine = item.senderPersonId == myPersonId;
-    final atSender = _expectationBubbleAtSenderLabel(item.senderLabel);
-    final labelLine = 'Activity ¬∑ $atSender ¬∑ ${_chatRelativeLabel(item.createdAt)}';
-    return _ActivityFeedBubbleTile(
-      theme: theme,
-      scheme: scheme,
-      item: item,
-      mine: mine,
-      labelLine: labelLine,
-      onRowTap: () => _handleActivityFeedRowTap(item),
-      onMarkRead: () => _markActivityExpectationChangelogRead(item.expectationId),
-    );
+    return synced;
   }
 
   void _dismissActivityFeedOverlay() {
@@ -3601,7 +3582,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                         child: Text(
                           'Updates on expectations and talking points you are related to. '
-                          'Tap a row to open it, or tap the check icon on a row to mark that item‚Äôs changelog as seen.',
+                          'Tap a row to open it, or tap the check icon to mark that itemís changelog as seen '
+                          '(rows for that item then leave this list). '
+                          'Hover the check icon to see Mark as read.',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: scheme.onSurfaceVariant,
                           ),
@@ -3609,67 +3592,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       ),
                       const Divider(height: 1),
                       Expanded(
-                        child: FutureBuilder<List<ExpectationActivityFeedItem>>(
-                          future: loadChangelogActivityFeed(
-                            client: client,
-                            companyId: companyId,
-                            authUserId: uid,
-                            readerPersonId: me,
-                            partyExpectations: party,
-                            limit: 80,
-                          ),
-                          builder: (context, snapshot) {
-                            if (snapshot.connectionState == ConnectionState.waiting) {
-                              return const Center(
-                                child: Padding(
-                                  padding: EdgeInsets.all(24),
-                                  child: CircularProgressIndicator(),
-                                ),
-                              );
-                            }
-                            if (snapshot.hasError) {
-                              return Center(
-                                child: Padding(
-                                  padding: const EdgeInsets.all(16),
-                                  child: Text(
-                                    'Could not load activity.',
-                                    style: theme.textTheme.bodyMedium?.copyWith(
-                                      color: scheme.error,
-                                    ),
-                                  ),
-                                ),
-                              );
-                            }
-                            final items = snapshot.data ?? const [];
-                            if (items.isEmpty) {
-                              return Center(
-                                child: Text(
-                                  'No activity yet.',
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    color: scheme.onSurfaceVariant,
-                                  ),
-                                ),
-                              );
-                            }
-                            return ListView.builder(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-                              itemCount: items.length,
-                              itemBuilder: (context, i) {
-                                final item = items[i];
-                                return Padding(
-                                  padding: EdgeInsets.only(
-                                    bottom: i < items.length - 1 ? 10 : 0,
-                                  ),
-                                  child: _activityFeedBubbleTile(
-                                    theme: theme,
-                                    scheme: scheme,
-                                    item: item,
-                                    myPersonId: me,
-                                  ),
-                                );
-                              },
-                            );
-                          },
+                        child: _ChangelogActivityFeedList(
+                          theme: theme,
+                          scheme: scheme,
+                          client: client,
+                          companyId: companyId,
+                          authUserId: uid,
+                          readerPersonId: me,
+                          myPersonId: me,
+                          partyExpectations: party,
+                          onRowTap: _handleActivityFeedRowTap,
+                          onMarkExpectationRead: _markActivityExpectationChangelogRead,
                         ),
                       ),
                     ],
@@ -5192,7 +5125,7 @@ class _ColleagueAtNameCloud extends StatelessWidget {
           ),
         if (more)
           Text(
-            '‚Ä¶',
+            'Ö',
             style: theme.textTheme.labelSmall?.copyWith(
               color: scheme.onSurfaceVariant,
               fontWeight: FontWeight.w600,
@@ -5233,7 +5166,7 @@ class _PillarRail extends StatelessWidget {
 
   static const double _widthExpanded = 280;
   static const double _widthCollapsed = 72;
-  /// Aligns heading ‚Äú+‚Äù with [ListTile] trailing (see Talking points tile [contentPadding]).
+  /// Aligns heading ì+î with [ListTile] trailing (see Talking points tile [contentPadding]).
   static const double _railPlusRightInset = 16;
   static const double _railPlusDiameter = 32;
   /// Trailing Invite / Logout share this width so their right edges align.
@@ -5434,7 +5367,7 @@ class _PillarRail extends StatelessWidget {
                                   ),
                                 if (recentTagsHasMore)
                                   Text(
-                                    '‚Ä¶',
+                                    'Ö',
                                     style: theme.textTheme.labelSmall?.copyWith(
                                       color: scheme.onSurfaceVariant,
                                       fontWeight: FontWeight.w600,
@@ -5748,7 +5681,7 @@ class _PillarRail extends StatelessWidget {
     );
   }
 
-  /// Filled circle with ‚Äú+‚Äù; used for Expectations and Talking points headings.
+  /// Filled circle with ì+î; used for Expectations and Talking points headings.
   Widget _railHomeCaptureCircle(
     ColorScheme scheme,
     VoidCallback onPressed, {
@@ -6152,8 +6085,147 @@ class _ExpectationsErrorCard extends StatelessWidget {
   }
 }
 
+/// Bell overlay: loads changelog rows once, then **removes every row for an expectation** after a
+/// successful mark-read for that expectation (matches the per-expectation read watermark).
+class _ChangelogActivityFeedList extends StatefulWidget {
+  const _ChangelogActivityFeedList({
+    super.key,
+    required this.theme,
+    required this.scheme,
+    required this.client,
+    required this.companyId,
+    required this.authUserId,
+    required this.readerPersonId,
+    required this.myPersonId,
+    required this.partyExpectations,
+    required this.onRowTap,
+    required this.onMarkExpectationRead,
+  });
+
+  final ThemeData theme;
+  final ColorScheme scheme;
+  final SupabaseClient client;
+  final String companyId;
+  final String authUserId;
+  final String readerPersonId;
+  final String myPersonId;
+  final List<Expectation> partyExpectations;
+  final Future<void> Function(ExpectationActivityFeedItem item) onRowTap;
+  final Future<bool> Function(String expectationId) onMarkExpectationRead;
+
+  @override
+  State<_ChangelogActivityFeedList> createState() => _ChangelogActivityFeedListState();
+}
+
+class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> {
+  List<ExpectationActivityFeedItem>? _items;
+  bool _loading = true;
+  Object? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    try {
+      final list = await loadChangelogActivityFeed(
+        client: widget.client,
+        companyId: widget.companyId,
+        authUserId: widget.authUserId,
+        readerPersonId: widget.readerPersonId,
+        partyExpectations: widget.partyExpectations,
+        limit: 80,
+      );
+      if (!mounted) return;
+      setState(() {
+        _items = list;
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            'Could not load activity.',
+            style: widget.theme.textTheme.bodyMedium?.copyWith(
+              color: widget.scheme.error,
+            ),
+          ),
+        ),
+      );
+    }
+    final items = _items ?? const <ExpectationActivityFeedItem>[];
+    if (items.isEmpty) {
+      return Center(
+        child: Text(
+          'No activity yet.',
+          style: widget.theme.textTheme.bodyMedium?.copyWith(
+            color: widget.scheme.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      itemCount: items.length,
+      itemBuilder: (context, i) {
+        final item = items[i];
+        final mine = item.senderPersonId == widget.myPersonId;
+        final atSender = _expectationBubbleAtSenderLabel(item.senderLabel);
+        final labelLine =
+            'Activity ∑ $atSender ∑ ${_chatRelativeLabel(item.createdAt)}';
+        return Padding(
+          padding: EdgeInsets.only(
+            bottom: i < items.length - 1 ? 10 : 0,
+          ),
+          child: _ActivityFeedBubbleTile(
+            theme: widget.theme,
+            scheme: widget.scheme,
+            item: item,
+            mine: mine,
+            labelLine: labelLine,
+            onRowTap: () => widget.onRowTap(item),
+            onMarkRead: () async {
+              final ok = await widget.onMarkExpectationRead(item.expectationId);
+              if (ok && mounted) {
+                setState(() {
+                  _items!.removeWhere((e) => e.expectationId == item.expectationId);
+                });
+              }
+              return ok;
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// Activity feed row: tap the bubble to open the item; tap the **check** control to mark that
-/// expectation's changelog read (no menus or tooltips ‚Äî works inside the bell overlay).
+/// expectation's changelog read. Hover shows a local **Mark as read** label (not [Tooltip], so it
+/// stays aligned inside the bell overlay).
 class _ActivityFeedBubbleTile extends StatefulWidget {
   const _ActivityFeedBubbleTile({
     super.key,
@@ -6172,7 +6244,7 @@ class _ActivityFeedBubbleTile extends StatefulWidget {
   final bool mine;
   final String labelLine;
   final VoidCallback onRowTap;
-  final Future<void> Function() onMarkRead;
+  final Future<bool> Function() onMarkRead;
 
   @override
   State<_ActivityFeedBubbleTile> createState() => _ActivityFeedBubbleTileState();
@@ -6180,6 +6252,7 @@ class _ActivityFeedBubbleTile extends StatefulWidget {
 
 class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
   bool _markBusy = false;
+  bool _markReadHover = false;
 
   Future<void> _onMarkReadTap() async {
     if (_markBusy) return;
@@ -6216,7 +6289,7 @@ class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
           fontSize: (theme.textTheme.bodySmall?.fontSize ?? 12) - 0.5,
         );
     final displayBody = item.messageText.trim();
-    final contextPrefix = '${item.kindLabel} ¬∑ ';
+    final contextPrefix = '${item.kindLabel} ∑ ';
     const maxContextChars = 90;
     final snippetBudget =
         (maxContextChars - contextPrefix.length - 2).clamp(16, 120);
@@ -6336,39 +6409,80 @@ class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
                           top: 4,
                           right: mine ? 6 : null,
                           left: mine ? null : 6,
-                          child: Material(
-                            color: scheme.surface.withValues(alpha: 0.94),
-                            elevation: 2,
-                            shadowColor: Colors.black38,
-                            borderRadius: BorderRadius.circular(8),
-                            clipBehavior: Clip.antiAlias,
-                            child: InkWell(
-                              onTap: _markBusy ? null : _onMarkReadTap,
-                              borderRadius: BorderRadius.circular(8),
-                              child: Semantics(
-                                button: true,
-                                label: 'Mark read for this expectation',
-                                child: SizedBox(
-                                  width: 36,
-                                  height: 36,
-                                  child: Center(
-                                    child: _markBusy
-                                        ? SizedBox(
-                                            width: 18,
-                                            height: 18,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                              color: scheme.primary,
-                                            ),
-                                          )
-                                        : Icon(
-                                            Icons.mark_chat_read_outlined,
-                                            size: 22,
-                                            color: scheme.primary,
+                          child: MouseRegion(
+                            onEnter: (_) =>
+                                setState(() => _markReadHover = true),
+                            onExit: (_) =>
+                                setState(() => _markReadHover = false),
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              alignment: mine
+                                  ? Alignment.topRight
+                                  : Alignment.topLeft,
+                              children: [
+                                if (_markReadHover)
+                                  Positioned(
+                                    right: mine ? 0 : null,
+                                    left: mine ? null : 0,
+                                    bottom: 42,
+                                    child: Material(
+                                      elevation: 4,
+                                      borderRadius: BorderRadius.circular(8),
+                                      color: scheme.inverseSurface
+                                          .withValues(alpha: 0.92),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 5,
+                                        ),
+                                        child: Text(
+                                          'Mark as read',
+                                          style: theme.textTheme.labelSmall
+                                              ?.copyWith(
+                                            color: scheme.onInverseSurface,
+                                            fontWeight: FontWeight.w600,
                                           ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                Material(
+                                  color: scheme.surface
+                                      .withValues(alpha: 0.94),
+                                  elevation: 2,
+                                  shadowColor: Colors.black38,
+                                  borderRadius: BorderRadius.circular(8),
+                                  clipBehavior: Clip.antiAlias,
+                                  child: InkWell(
+                                    onTap: _markBusy ? null : _onMarkReadTap,
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Semantics(
+                                      button: true,
+                                      label: 'Mark as read for this expectation',
+                                      child: SizedBox(
+                                        width: 36,
+                                        height: 36,
+                                        child: Center(
+                                          child: _markBusy
+                                              ? SizedBox(
+                                                  width: 18,
+                                                  height: 18,
+                                                  child: CircularProgressIndicator(
+                                                    strokeWidth: 2,
+                                                    color: scheme.primary,
+                                                  ),
+                                                )
+                                              : Icon(
+                                                  Icons.mark_chat_read_outlined,
+                                                  size: 22,
+                                                  color: scheme.primary,
+                                                ),
+                                        ),
+                                      ),
+                                    ),
                                   ),
                                 ),
-                              ),
+                              ],
                             ),
                           ),
                         ),
@@ -6385,7 +6499,7 @@ class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
   }
 }
 
-/// Same paint as the main title ‚Äú|‚Äù bar ‚Äî keep tab highlights visually identical.
+/// Same paint as the main title ì|î bar ó keep tab highlights visually identical.
 Color _pillarAccentBarColor(LedgerPillar pillar, ThemeData theme) {
   var base = pillar.captureAccent;
   if (pillar == LedgerPillar.home && theme.brightness == Brightness.light) {
@@ -6479,18 +6593,18 @@ class _PairedSaveAction extends StatelessWidget {
       style: ButtonStyle(
         visualDensity: VisualDensity.compact,
         backgroundColor: WidgetStateProperty.resolveWith((states) {
-          // 1) Disabled ‚Äî visible but clearly inactive
+          // 1) Disabled ó visible but clearly inactive
           if (!enabled) {
             return isLight
                 ? scheme.surfaceContainer
                 : scheme.surfaceContainerHighest.withValues(alpha: 0.72);
           }
-          // 4) Hover or Tab on *this* button ‚Äî strongest (clearly above Enter-default idle)
+          // 4) Hover or Tab on *this* button ó strongest (clearly above Enter-default idle)
           if (states.contains(WidgetState.focused) ||
               states.contains(WidgetState.hovered)) {
             return scheme.primary;
           }
-          // 3) Enter-default idle (e.g. Save privately while field focused): mid blue ‚Äî
+          // 3) Enter-default idle (e.g. Save privately while field focused): mid blue ó
           // stronger than secondary enabled, softer than hover/focus
           if (emphasizeAsKeyboardDefault) {
             return Color.lerp(
@@ -6632,7 +6746,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                       WidgetSpan(
                         alignment: PlaceholderAlignment.middle,
                         child: Tooltip(
-                          message: 'Open People ‚Äî your colleagues',
+                          message: 'Open People ó your colleagues',
                           child: MouseRegion(
                             cursor: SystemMouseCursors.click,
                             child: InkWell(
@@ -6644,7 +6758,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                                   vertical: 1,
                                 ),
                                 child: Text(
-                                  ' ¬∑ $company',
+                                  ' ∑ $company',
                                   style: theme.textTheme.bodyMedium?.copyWith(
                                     color: scheme.primary,
                                     fontWeight: FontWeight.w600,
@@ -6779,7 +6893,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                         ),
                       ),
                       child: Text(
-                        'Nothing here yet ‚Äî capture from the bar, or open Inbox / Outbox.',
+                        'Nothing here yet ó capture from the bar, or open Inbox / Outbox.',
                         style: theme.textTheme.bodyMedium?.copyWith(
                           color: muted,
                           height: 1.4,
@@ -7378,7 +7492,7 @@ String _deadlineDistanceLabel(Expectation e) {
   final due = e.deadlineAt;
   if (due == null) {
     final label = e.deadlineLabel.trim();
-    if (label.isEmpty || label.toUpperCase() == 'TBD') return '‚àû';
+    if (label.isEmpty || label.toUpperCase() == 'TBD') return '8';
     return label;
   }
   final now = DateTime.now();
@@ -7566,7 +7680,7 @@ bool _homeUrgentUserIsWriterOrReceiver(
   return pid == mePerson.id;
 }
 
-/// You are the addressee (including self-addressed); urgency is on your side ‚Äî Inbox rail icon.
+/// You are the addressee (including self-addressed); urgency is on your side ó Inbox rail icon.
 bool _homeUrgentNeedsMyAction(
   Expectation e,
   String? currentUserId,
@@ -7578,7 +7692,7 @@ bool _homeUrgentNeedsMyAction(
   return pid == mePerson.id;
 }
 
-/// You sent this to someone else (or no receiver yet); waiting on them / your dispatch ‚Äî Outbox.
+/// You sent this to someone else (or no receiver yet); waiting on them / your dispatch ó Outbox.
 bool _homeUrgentWaitingOnCounterparty(
   Expectation e,
   String? currentUserId,
@@ -7617,10 +7731,10 @@ String _homeUrgentRoleTooltip(
   Person? mePerson,
 ) {
   if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
-    return 'On you (Inbox): you are the receiver ‚Äî progress, reply, or resolve.';
+    return 'On you (Inbox): you are the receiver ó progress, reply, or resolve.';
   }
   if (_homeUrgentWaitingOnCounterparty(e, currentUserId, mePerson)) {
-    return 'Waiting on them (Outbox): you are the sender ‚Äî follow up with the other party.';
+    return 'Waiting on them (Outbox): you are the sender ó follow up with the other party.';
   }
   return 'Urgent item';
 }
@@ -7648,7 +7762,7 @@ String _homeUrgentTrailingLabel(Expectation e, ColorScheme scheme) {
       parts.add(_healthMeta(e.health, scheme).$1);
     }
   }
-  return parts.join(' ¬∑ ');
+  return parts.join(' ∑ ');
 }
 
 void _sortHomeUrgentExpectations(List<Expectation> list) {
@@ -8246,7 +8360,7 @@ class _ExpectationOthersTile extends StatefulWidget {
   final bool inboxHoverIncludeDelete;
   final String? inboxReceiverPersonId;
   final Future<void> Function(Expectation expectation)? onArchiveInbox;
-  /// Add Expectation / Add talking point ‚Äî Recent: hover Delete (no under-avatar trash).
+  /// Add Expectation / Add talking point ó Recent: hover Delete (no under-avatar trash).
   final bool composerRecentListing;
   /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
   final bool talkingPointsBrowseListing;
@@ -9255,7 +9369,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
 
   /// Changelog bubbles compare [DateTime.isAfter] against this UTC instant:
   /// - On first load we seed from `expectation_changelog_reads.last_read_at` (your stored read
-  ///   cursor). A **brighter / wider** left stripe means that row was still ‚Äúunread‚Äù vs that
+  ///   cursor). A **brighter / wider** left stripe means that row was still ìunreadî vs that
   ///   cursor (same idea as the activity bell).
   /// - After a successful [syncExpectationChangelogReadWatermark], we advance this to the latest
   ///   changelog `created_at` in the loaded thread so **opening details counts as reading**
@@ -9693,7 +9807,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Update requested ‚Äî your counterparty was notified.'),
+          content: Text('Update requested ó your counterparty was notified.'),
         ),
       );
     } catch (e) {
@@ -9929,7 +10043,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
             }
           }
         } on PostgrestException {
-          // Reads table / policy not deployed ‚Äî keep epoch baseline.
+          // Reads table / policy not deployed ó keep epoch baseline.
         }
         _changelogVisitBaselineCaptured = true;
       }
@@ -9938,7 +10052,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
           .from('expectation_messages')
           .select(
             'id,sender_person_id,message_text,created_at,type,'
-            // Disambiguate vs expectation_message_reads ‚Üí people (reader).
+            // Disambiguate vs expectation_message_reads ? people (reader).
             'people!expectation_messages_sender_person_id_fkey(display_name,handle),'
             'expectation_message_attachments(file_name,file_url),'
             'expectation_message_reads(reader_person_id,read_at)',
@@ -10839,10 +10953,10 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                     m.attachments.isNotEmpty);
                             final atSender = _bubbleAtSenderLabel(m.senderLabel);
                             final labelLine = isChangelog
-                                ? 'Activity ¬∑ $atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}'
+                                ? 'Activity ∑ $atSender ∑ ${_chatRelativeLabel(m.createdAt)}'
                                 : isAttachmentChat
-                                    ? 'Attachment ¬∑ $atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}'
-                                    : '$atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}';
+                                    ? 'Attachment ∑ $atSender ∑ ${_chatRelativeLabel(m.createdAt)}'
+                                    : '$atSender ∑ ${_chatRelativeLabel(m.createdAt)}';
                             String bodyPreview() {
                               if (isChangelog) {
                                 return expectationChangelogActivityFeedLine(
@@ -10865,7 +10979,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
 
                             String clipBody(String s, int max) {
                               if (s.length <= max) return s;
-                              return '${s.substring(0, max)}‚Ä¶';
+                              return '${s.substring(0, max)}Ö';
                             }
 
                             var previewRaw = bodyPreview();
@@ -10876,7 +10990,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             }
                             final preview = clipBody(previewRaw, 280);
                             final meta =
-                                'R$i ¬∑ type ${m.messageType} ¬∑ ${m.messageText.length}c ¬∑ ${m.attachments.length} att';
+                                'R$i ∑ type ${m.messageType} ∑ ${m.messageText.length}c ∑ ${m.attachments.length} att';
                             final listingTypeAccent = _isDiscussionPoint(widget.expectation)
                                 ? LedgerListingAccents.topic
                                 : LedgerListingAccents.expectation;
@@ -11020,7 +11134,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                       Tooltip(
                                         message: m.readAtByCounterparty != null
                                             ? 'Seen ${formatDisplayDateTime(m.readAtByCounterparty!, locale)}'
-                                            : 'Delivered ‚Äî opens as read when the other person views this thread',
+                                            : 'Delivered ó opens as read when the other person views this thread',
                                         child: Icon(
                                           m.readAtByCounterparty != null
                                               ? Icons.done_all_rounded

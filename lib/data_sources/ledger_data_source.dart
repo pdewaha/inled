@@ -1,5 +1,5 @@
-import 'package:inled/models/expectation.dart';
-import 'package:inled/models/person.dart';
+import 'package:exled/models/expectation.dart';
+import 'package:exled/models/person.dart';
 
 /// Replace with Supabase-backed implementation later.
 abstract interface class LedgerDataSource {

@@ -1,7 +1,7 @@
-import 'package:inled/models/expectation_health.dart';
-import 'package:inled/models/expectation_status.dart';
-import 'package:inled/models/expectation_type.dart';
-import 'package:inled/models/expectation_visibility.dart';
+import 'package:exled/models/expectation_health.dart';
+import 'package:exled/models/expectation_status.dart';
+import 'package:exled/models/expectation_type.dart';
+import 'package:exled/models/expectation_visibility.dart';
 
 /// Specific handshake — the "How".
 class Expectation {

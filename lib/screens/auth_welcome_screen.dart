@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:inled/theme.dart';
+import 'package:exled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthWelcomeScreen extends StatelessWidget {
@@ -17,7 +17,7 @@ class AuthWelcomeScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('inled'),
+        title: const Text('exled'),
         actions: [
           MenuAnchor(
             menuChildren: [
@@ -59,14 +59,14 @@ class AuthWelcomeScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Welcome to inled',
+                      'Welcome to exled',
                       style: theme.textTheme.headlineSmall?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
                     ),
                     const SizedBox(height: 14),
                     Text(
-                      'inled helps teams turn day-to-day commitments into a visible, '
+                      'exled helps teams turn day-to-day commitments into a visible, '
                       'living expectations ledger. We capture promises, tag owners, '
                       'track progress, and keep accountability transparent across the '
                       'organization.',

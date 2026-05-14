@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:inled/screens/auth_welcome_screen.dart';
-import 'package:inled/screens/company_onboarding_gate.dart';
-import 'package:inled/supabase_config.dart';
-import 'package:inled/theme.dart';
+import 'package:exled/screens/auth_welcome_screen.dart';
+import 'package:exled/screens/company_onboarding_gate.dart';
+import 'package:exled/supabase_config.dart';
+import 'package:exled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 Future<void> main() async {
@@ -13,17 +13,17 @@ Future<void> main() async {
     anonKey:
         'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjEzMTQyMDcxLCJleHAiOjE5Mjg3MTMyNzF9.NC1GLG2-Ae8_vpynii0-Omd8qnQRlnZOd7ZWRsYoCE8',
   );
-  runApp(const InledApp());
+  runApp(const ExledApp());
 }
 
-class InledApp extends StatefulWidget {
-  const InledApp({super.key});
+class ExledApp extends StatefulWidget {
+  const ExledApp({super.key});
 
   @override
-  State<InledApp> createState() => _InledAppState();
+  State<ExledApp> createState() => _ExledAppState();
 }
 
-class _InledAppState extends State<InledApp> {
+class _ExledAppState extends State<ExledApp> {
   AppThemeVariant _variant = AppThemeVariant.dark;
 
   @override
@@ -31,7 +31,7 @@ class _InledAppState extends State<InledApp> {
     final auth = Supabase.instance.client.auth;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'inled',
+      title: 'exled',
       theme: _variant.themeData,
       localizationsDelegates: GlobalMaterialLocalizations.delegates,
       supportedLocales: const [

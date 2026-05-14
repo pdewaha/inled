@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:inled/models/expectation_visibility.dart';
+import 'package:exled/models/expectation_visibility.dart';
 
 class VisibilityGlyph extends StatelessWidget {
   const VisibilityGlyph({super.key, required this.visibility});

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:inled/screens/ledger_console_screen.dart';
-import 'package:inled/theme.dart';
+import 'package:exled/screens/ledger_console_screen.dart';
+import 'package:exled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class CompanyOnboardingGate extends StatefulWidget {

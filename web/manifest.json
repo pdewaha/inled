@@ -1,6 +1,6 @@
 {
-    "name": "inled",
-    "short_name": "inled",
+    "name": "exled",
+    "short_name": "exled",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

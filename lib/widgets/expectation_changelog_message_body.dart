@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:inled/models/expectation_type.dart';
-import 'package:inled/models/expectation_changelog_payload.dart';
-import 'package:inled/services/expectation_chat_changelog.dart';
-import 'package:inled/utils/display_date_format.dart';
+import 'package:exled/models/expectation_type.dart';
+import 'package:exled/models/expectation_changelog_payload.dart';
+import 'package:exled/services/expectation_chat_changelog.dart';
+import 'package:exled/utils/display_date_format.dart';
 
 /// Renders [expectation_messages.message_text] for changelog rows using [messageType] as the
 /// renderer key (plain vs structured JSON).
