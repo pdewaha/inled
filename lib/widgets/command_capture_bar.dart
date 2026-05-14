@@ -78,7 +78,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
 
   void _onFocusChange() => setState(() {});
 
-  Widget _buildTextField(ColorScheme scheme) {
+  Widget _buildTextField(ColorScheme scheme, {required bool isLight}) {
     // Always wrap with [CallbackShortcuts] so the tree shape does not flip when
     // [inlinePickActive] toggles (that swap used to drop TextField focus on the
     // first @/# character that opened multi-match mode).
@@ -100,7 +100,9 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
           isDense: true,
           hintText: widget.hintText,
           hintStyle: _mono.copyWith(
-            color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
+            color: scheme.onSurfaceVariant.withValues(
+              alpha: isLight ? 0.88 : 0.75,
+            ),
             height: 1.35,
           ),
           border: InputBorder.none,
@@ -113,20 +115,21 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final isLight = Theme.of(context).brightness == Brightness.light;
     final focused = widget.focusNode.hasFocus;
     final accent = widget.accentColor;
     final indicatorColor = focused
         ? accent.withValues(alpha: 0.95)
-        : scheme.onSurfaceVariant.withValues(alpha: 0.85);
+        : scheme.onSurfaceVariant.withValues(alpha: isLight ? 0.95 : 0.85);
     final glow = focused
         ? [
             BoxShadow(
-              color: accent.withValues(alpha: 0.26),
+              color: accent.withValues(alpha: isLight ? 0.18 : 0.26),
               blurRadius: 20,
               spreadRadius: 0,
             ),
             BoxShadow(
-              color: accent.withValues(alpha: 0.12),
+              color: accent.withValues(alpha: isLight ? 0.08 : 0.12),
               blurRadius: 40,
               spreadRadius: 2,
             ),
@@ -137,13 +140,17 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHigh.withValues(alpha: 0.45),
+        color: isLight
+            ? scheme.surface
+            : scheme.surfaceContainerHigh.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: focused
-              ? accent.withValues(alpha: 0.55)
-              : scheme.outline.withValues(alpha: 0.35),
-          width: focused ? 1.5 : 1,
+              ? accent.withValues(alpha: isLight ? 0.72 : 0.55)
+              : (isLight
+                  ? scheme.outline
+                  : scheme.outline.withValues(alpha: 0.35)),
+          width: focused ? 1.5 : (isLight ? 1.25 : 1),
         ),
         boxShadow: glow,
       ),
@@ -161,7 +168,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
                   child: Icon(Icons.chevron_right, color: indicatorColor, size: 22),
                 ),
                 Expanded(
-                  child: _buildTextField(scheme),
+                  child: _buildTextField(scheme, isLight: isLight),
                 ),
               ],
             ),
@@ -172,7 +179,9 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
             height: widget.suggestionsPanel != null ? 1 : 0,
             thickness: widget.suggestionsPanel != null ? 1 : 0,
             color: widget.suggestionsPanel != null
-                ? scheme.outline.withValues(alpha: 0.22)
+                ? scheme.outline.withValues(
+                    alpha: isLight ? 0.32 : 0.22,
+                  )
                 : Colors.transparent,
           ),
           ConstrainedBox(

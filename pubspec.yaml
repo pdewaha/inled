@@ -9,6 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: any
   supabase_flutter: ^2.12.4
   file_picker: ^8.1.6
   url_launcher: ^6.3.1

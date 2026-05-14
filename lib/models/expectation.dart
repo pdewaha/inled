@@ -19,6 +19,7 @@ class Expectation {
     this.seenAt,
     this.lastChattedSenderAt,
     this.lastChattedReceiverAt,
+    this.updateRequestedAt,
     this.progress,
     this.health = ExpectationHealth.unknown,
     this.type = ExpectationType.expectation,
@@ -39,6 +40,9 @@ class Expectation {
   final DateTime? seenAt;
   final DateTime? lastChattedSenderAt;
   final DateTime? lastChattedReceiverAt;
+  /// When non-null, the other party was asked for a substantive update; cleared on save when
+  /// summary or status/health/deadline/progress changes.
+  final DateTime? updateRequestedAt;
   /// 0..100, nullable when unknown.
   final int? progress;
   final ExpectationHealth health;

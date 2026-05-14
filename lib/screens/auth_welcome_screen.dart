@@ -131,6 +131,7 @@ class _LoginOtpDialog extends StatefulWidget {
 class _LoginOtpDialogState extends State<_LoginOtpDialog> {
   final _emailController = TextEditingController();
   final _otpController = TextEditingController();
+  final _otpFocusNode = FocusNode(debugLabel: 'loginOtp');
   final _emailRegex = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
 
   String? _emailError;
@@ -143,6 +144,7 @@ class _LoginOtpDialogState extends State<_LoginOtpDialog> {
   void dispose() {
     _emailController.dispose();
     _otpController.dispose();
+    _otpFocusNode.dispose();
     super.dispose();
   }
 
@@ -167,6 +169,10 @@ class _LoginOtpDialogState extends State<_LoginOtpDialog> {
       setState(() {
         _awaitingOtp = true;
         _email = email;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_awaitingOtp) return;
+        _otpFocusNode.requestFocus();
       });
     } catch (e) {
       if (!mounted) return;
@@ -307,7 +313,7 @@ class _LoginOtpDialogState extends State<_LoginOtpDialog> {
         const SizedBox(height: 12),
         TextField(
           controller: _otpController,
-          autofocus: true,
+          focusNode: _otpFocusNode,
           keyboardType: TextInputType.number,
           decoration: InputDecoration(
             labelText: 'OTP code',

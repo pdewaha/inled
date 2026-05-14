@@ -114,7 +114,8 @@ ALTER TABLE expectations
   ADD COLUMN IF NOT EXISTS last_chatted_sender_at timestamptz,
   ADD COLUMN IF NOT EXISTS last_chatted_receiver_at timestamptz,
   ADD COLUMN IF NOT EXISTS expectation_health integer NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS expectation_type integer NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS expectation_type integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS update_requested_at timestamptz;
 
 ALTER TABLE expectations
   ALTER COLUMN target_person_id DROP NOT NULL;
@@ -180,6 +181,9 @@ CREATE TABLE IF NOT EXISTS expectation_messages (
   company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   expectation_id uuid NOT NULL REFERENCES expectations(id) ON DELETE CASCADE,
   sender_person_id uuid NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
+  -- 0 = chat (plain text), 2 = chat with file attachment(s); non-zero otherwise = changelog / activity:
+  -- 1 = legacy plain text; 10–14 = structured JSON in message_text (see app expectation_changelog_payload.dart).
+  type smallint NOT NULL DEFAULT 0,
   message_text text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz
@@ -204,3 +208,32 @@ CREATE TABLE IF NOT EXISTS expectation_message_attachments (
 
 CREATE INDEX IF NOT EXISTS idx_expectation_message_attachments_message_id
   ON expectation_message_attachments (expectation_message_id);
+
+-- Per-message chat read receipts (counterparty opened thread).
+CREATE TABLE IF NOT EXISTS expectation_message_reads (
+  message_id uuid NOT NULL REFERENCES expectation_messages(id) ON DELETE CASCADE,
+  reader_person_id uuid NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  read_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (message_id, reader_person_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_message_reads_reader
+  ON expectation_message_reads (reader_person_id);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_message_reads_company
+  ON expectation_message_reads (company_id);
+
+-- Per-user "last seen" watermark for changelog rows on an expectation (app-updated only).
+CREATE TABLE IF NOT EXISTS expectation_changelog_reads (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  expectation_id uuid NOT NULL REFERENCES expectations(id) ON DELETE CASCADE,
+  reader_person_id uuid NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+  last_read_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (expectation_id, reader_person_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_expectation_changelog_reads_reader
+  ON expectation_changelog_reads (reader_person_id);

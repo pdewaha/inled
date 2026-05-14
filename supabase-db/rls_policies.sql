@@ -72,6 +72,8 @@ ALTER TABLE expectation_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger_captures ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expectation_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expectation_message_attachments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expectation_message_reads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expectation_changelog_reads ENABLE ROW LEVEL SECURITY;
 
 -- ---------------------------------------------------------------------------
 -- companies
@@ -121,17 +123,24 @@ CREATE POLICY inled_people_insert ON people
   FOR INSERT
   TO authenticated
   WITH CHECK (
-    auth_user_id = auth.uid()
-    AND (
-      company_id IN (SELECT public.inled_user_company_ids())
-      OR EXISTS (
-        SELECT 1
-        FROM companies c
-        WHERE c.id = company_id
-          AND c.domain IS NOT NULL
-          AND lower(c.domain) = public.inled_jwt_email_domain()
-          AND public.inled_jwt_email_domain() <> ''
+    (
+      auth_user_id = auth.uid()
+      AND (
+        company_id IN (SELECT public.inled_user_company_ids())
+        OR EXISTS (
+          SELECT 1
+          FROM companies c
+          WHERE c.id = company_id
+            AND c.domain IS NOT NULL
+            AND lower(c.domain) = public.inled_jwt_email_domain()
+            AND public.inled_jwt_email_domain() <> ''
+        )
       )
+    )
+    OR (
+      -- Placeholder person for @mentions / expectations before they sign up
+      auth_user_id IS NULL
+      AND company_id IN (SELECT public.inled_user_company_ids())
     )
   );
 
@@ -384,3 +393,96 @@ CREATE POLICY inled_expectation_message_attachments_delete
   FOR DELETE
   TO authenticated
   USING (company_id IN (SELECT public.inled_user_company_ids()));
+
+-- ---------------------------------------------------------------------------
+-- expectation_message_reads (chat read receipts; reader or message sender)
+-- ---------------------------------------------------------------------------
+
+DROP POLICY IF EXISTS inled_expectation_message_reads_select
+  ON expectation_message_reads;
+CREATE POLICY inled_expectation_message_reads_select
+  ON expectation_message_reads
+  FOR SELECT
+  TO authenticated
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND (
+      reader_person_id IN (SELECT public.inled_user_person_ids())
+      OR EXISTS (
+        SELECT 1
+        FROM expectation_messages em
+        WHERE em.id = expectation_message_reads.message_id
+          AND em.sender_person_id IN (SELECT public.inled_user_person_ids())
+      )
+    )
+  );
+
+DROP POLICY IF EXISTS inled_expectation_message_reads_insert
+  ON expectation_message_reads;
+CREATE POLICY inled_expectation_message_reads_insert
+  ON expectation_message_reads
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+    AND EXISTS (
+      SELECT 1
+      FROM expectation_messages em
+      WHERE em.id = expectation_message_reads.message_id
+        AND em.company_id = expectation_message_reads.company_id
+        AND em.sender_person_id <> expectation_message_reads.reader_person_id
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- expectation_changelog_reads (per-user changelog read watermark)
+-- ---------------------------------------------------------------------------
+
+DROP POLICY IF EXISTS inled_expectation_changelog_reads_select
+  ON expectation_changelog_reads;
+CREATE POLICY inled_expectation_changelog_reads_select
+  ON expectation_changelog_reads
+  FOR SELECT
+  TO authenticated
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+  );
+
+DROP POLICY IF EXISTS inled_expectation_changelog_reads_insert
+  ON expectation_changelog_reads;
+CREATE POLICY inled_expectation_changelog_reads_insert
+  ON expectation_changelog_reads
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+  );
+
+DROP POLICY IF EXISTS inled_expectation_changelog_reads_update
+  ON expectation_changelog_reads;
+CREATE POLICY inled_expectation_changelog_reads_update
+  ON expectation_changelog_reads
+  FOR UPDATE
+  TO authenticated
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+  )
+  WITH CHECK (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+  );
+
+DROP POLICY IF EXISTS inled_expectation_changelog_reads_delete
+  ON expectation_changelog_reads;
+CREATE POLICY inled_expectation_changelog_reads_delete
+  ON expectation_changelog_reads
+  FOR DELETE
+  TO authenticated
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND reader_person_id IN (SELECT public.inled_user_person_ids())
+  );

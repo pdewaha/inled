@@ -1,18 +1,15 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:inled/screens/auth_welcome_screen.dart';
 import 'package:inled/screens/company_onboarding_gate.dart';
+import 'package:inled/supabase_config.dart';
 import 'package:inled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
-/// Debug runs (e.g. Cursor / IDE F5) use the staging host; profile & release use production.
-String get _supabaseUrl =>
-    kDebugMode ? 'http://leam.tauworks.org/' : 'http://exled.tauworks.org/';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Supabase.initialize(
-    url: _supabaseUrl,
+    url: supabaseUrl,
     anonKey:
         'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjEzMTQyMDcxLCJleHAiOjE5Mjg3MTMyNzF9.NC1GLG2-Ae8_vpynii0-Omd8qnQRlnZOd7ZWRsYoCE8',
   );
@@ -36,6 +33,39 @@ class _InledAppState extends State<InledApp> {
       debugShowCheckedModeBanner: false,
       title: 'inled',
       theme: _variant.themeData,
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
+      supportedLocales: const [
+        Locale('en'),
+        Locale('en', 'GB'),
+        Locale('en', 'US'),
+        Locale('de'),
+        Locale('de', 'AT'),
+        Locale('de', 'CH'),
+        Locale('fr'),
+        Locale('fr', 'CH'),
+        Locale('nl'),
+        Locale('nl', 'BE'),
+        Locale('es'),
+        Locale('it'),
+        Locale('pt'),
+        Locale('pl'),
+        Locale('sv'),
+        Locale('da'),
+        Locale('nb', 'NO'),
+        Locale('fi'),
+        Locale('cs'),
+        Locale('sk'),
+        Locale('ro'),
+        Locale('hu'),
+        Locale('el'),
+        Locale('uk'),
+        Locale('ru'),
+        Locale('tr'),
+        Locale('ja'),
+        Locale('ko'),
+        Locale('zh'),
+        Locale('zh', 'TW'),
+      ],
       home: StreamBuilder<AuthState>(
         stream: auth.onAuthStateChange,
         initialData: AuthState(AuthChangeEvent.initialSession, auth.currentSession),

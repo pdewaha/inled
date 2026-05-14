@@ -1,10 +1,13 @@
-import 'dart:async';
+﻿import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show min;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:inled/models/expectation.dart';
+import 'package:inled/models/expectation_changelog_payload.dart';
 import 'package:inled/models/expectation_health.dart';
 import 'package:inled/models/expectation_type.dart';
 import 'package:inled/models/feed_entry.dart';
@@ -12,9 +15,15 @@ import 'package:inled/models/ledger_pillar.dart';
 import 'package:inled/models/person.dart';
 import 'package:inled/models/expectation_status.dart';
 import 'package:inled/models/expectation_visibility.dart';
+import 'package:inled/services/expectation_activity_feed.dart';
+import 'package:inled/services/expectation_chat_changelog.dart';
+import 'package:inled/supabase_config.dart';
 import 'package:inled/theme.dart';
 import 'package:inled/utils/capture_parser.dart';
+import 'package:inled/utils/display_date_format.dart';
+import 'package:inled/utils/person_display.dart';
 import 'package:inled/widgets/command_capture_bar.dart';
+import 'package:inled/widgets/expectation_changelog_message_body.dart';
 import 'package:inled/widgets/ledger_tag_chip.dart';
 import 'package:inled/widgets/responsive_centered_body.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -92,6 +101,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   String? _myPersonId;
   /// From `companies.name` when set; footer directory uses this instead of "People".
   String? _companyName;
+  /// Cached company id for the signed-in person (feed + read watermarks).
+  String? _ledgerCompanyId;
+  int _activityUnreadCount = 0;
+  /// Expectations with at least one changelog row unread for the current reader (listing bell).
+  final Set<String> _expectationIdsWithChangelogUnread = {};
+  /// Changelog marked seen in UI (details open / Mark read); hides listing bell while the
+  /// server snapshot still reports unread rows for that expectation (watermark can lag).
+  final Set<String> _changelogBellClearedIds = {};
+  final GlobalKey _activityBellAnchorKey = GlobalKey(debugLabel: 'activityBell');
+  OverlayEntry? _activityFeedOverlayEntry;
 
   bool _keyboardHookRegistered = false;
   bool _submitInFlight = false;
@@ -134,7 +153,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   String? _othersPersonFilter;
   ExpectationStatus? _inboxStatusFilter;
   String? _inboxTagFilter;
-  String? _inboxPersonFilter;
 
   bool _hasUnreadChat(Expectation e) {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
@@ -149,6 +167,47 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return senderAt != null && (receiverAt == null || senderAt.isAfter(receiverAt));
   }
 
+  /// Listing bell: unread chat for this user, or unread expectation changelog/activity.
+  bool _hasUnreadListingIndicator(Expectation e) {
+    if (_hasUnreadChat(e)) return true;
+    if (_changelogBellClearedIds.contains(e.id)) return false;
+    return _expectationIdsWithChangelogUnread.contains(e.id);
+  }
+
+  /// Updates in-memory timestamps so the listing bell drops before the next fetch.
+  void _optimisticallyMarkExpectationChatCaughtUp(
+    String expectationId,
+    String authUserId,
+  ) {
+    final idx = _expectations.indexWhere((x) => x.id == expectationId);
+    if (idx == -1) return;
+    final old = _expectations[idx];
+    final now = DateTime.now().toUtc();
+    final isWriter =
+        old.writerUserId != null && old.writerUserId == authUserId;
+    _expectations[idx] = Expectation(
+      id: old.id,
+      createdAt: old.createdAt,
+      writerUserId: old.writerUserId,
+      personId: old.personId,
+      summary: old.summary,
+      deadlineLabel: old.deadlineLabel,
+      deadlineAt: old.deadlineAt,
+      finishedAt: old.finishedAt,
+      responsibleUpdatedAt: old.responsibleUpdatedAt,
+      publishedAt: old.publishedAt,
+      seenAt: old.seenAt,
+      lastChattedSenderAt: isWriter ? now : old.lastChattedSenderAt,
+      lastChattedReceiverAt: isWriter ? old.lastChattedReceiverAt : now,
+      updateRequestedAt: old.updateRequestedAt,
+      progress: old.progress,
+      health: old.health,
+      type: old.type,
+      status: old.status,
+      visibility: old.visibility,
+    );
+  }
+
   void _openTagPillar(String tag) {
     setState(() {
       _homePendingEntry = null;
@@ -158,6 +217,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _colleagueFilterPersonId = null;
     });
     _captureFocus.unfocus();
+  }
+
+  /// Outbox only: filter the current list by #tag without leaving the pillar.
+  void _applyOutboxTagFilter(String tag) {
+    setState(() {
+      _othersTagFilter = tag.trim().toLowerCase();
+    });
   }
 
   /// Private (@-person) talking points (author, non-empty receiver), for cloud + filters.
@@ -396,6 +462,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             seenAt: e.seenAt,
             lastChattedSenderAt: e.lastChattedSenderAt,
             lastChattedReceiverAt: e.lastChattedReceiverAt,
+            updateRequestedAt: e.updateRequestedAt,
             progress: e.progress,
             health: e.health,
             type: e.type,
@@ -409,6 +476,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Published — now visible to your receiver.')),
+      );
+      await appendExpectationChangelogForSignedInUser(
+        client: Supabase.instance.client,
+        expectationId: expectation.id,
+        expectationWriterUserId: expectation.writerUserId,
+        messageBuilder: (_) {
+          final noun =
+              expectation.type == ExpectationType.topic ? 'talking point' : 'expectation';
+          return 'Published this $noun.';
+        },
       );
     } catch (e) {
       if (!mounted) return;
@@ -503,7 +580,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
   }
 
-  /// Private talking-point row (Tags / colleagues): shadow → echo, same as outbox publish.
+  /// Private talking-point row (Tags / colleagues): shadow → echo only when there is
+  /// no addressee ([Expectation.personId] empty). @-linked prep stays private-only.
   Future<void> _publishTalkingPointBrowse(Expectation expectation) async {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     if (currentUserId == null || expectation.writerUserId != currentUserId) {
@@ -514,6 +592,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       return;
     }
     if (expectation.visibility != ExpectationVisibility.shadow) return;
+    if (expectation.type != ExpectationType.topic) return;
+    if (expectation.personId.trim().isNotEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Talking points with an @person stay private. Remove the person to publish openly.',
+          ),
+        ),
+      );
+      return;
+    }
     final now = DateTime.now().toUtc();
     try {
       await Supabase.instance.client.from('expectations').update({
@@ -540,6 +630,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             seenAt: e.seenAt,
             lastChattedSenderAt: e.lastChattedSenderAt,
             lastChattedReceiverAt: e.lastChattedReceiverAt,
+            updateRequestedAt: e.updateRequestedAt,
             progress: e.progress,
             health: e.health,
             type: e.type,
@@ -550,6 +641,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Published.')),
+      );
+      await appendExpectationChangelogForSignedInUser(
+        client: Supabase.instance.client,
+        expectationId: expectation.id,
+        expectationWriterUserId: expectation.writerUserId,
+        messageBuilder: (_) {
+          final noun =
+              expectation.type == ExpectationType.topic ? 'talking point' : 'expectation';
+          return 'Published this $noun.';
+        },
       );
     } catch (e) {
       if (!mounted) return;
@@ -567,6 +668,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         'expectation_status': _statusToDb(ExpectationStatus.abandoned),
         'responsible_updated_at': now.toIso8601String(),
       }).eq('id', expectation.id);
+      await appendExpectationChangelogForSignedInUser(
+        client: Supabase.instance.client,
+        expectationId: expectation.id,
+        expectationWriterUserId: expectation.writerUserId,
+        messageBuilder: (_) {
+          final noun =
+              expectation.type == ExpectationType.topic ? 'talking point' : 'expectation';
+          return 'Archived this $noun.';
+        },
+      );
       if (!mounted) return false;
       setState(() {
         final i = _expectations.indexWhere((e) => e.id == expectation.id);
@@ -586,6 +697,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             seenAt: e.seenAt,
             lastChattedSenderAt: e.lastChattedSenderAt,
             lastChattedReceiverAt: e.lastChattedReceiverAt,
+            updateRequestedAt: e.updateRequestedAt,
             progress: e.progress,
             health: e.health,
             type: e.type,
@@ -691,6 +803,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _profileName = 'You';
         _profileTitle = null;
         _myPersonId = null;
+        _ledgerCompanyId = null;
         _companyName = null;
       });
       return;
@@ -708,6 +821,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           _peopleLoadError = 'No linked person/company found for this user.';
           _people.clear();
           _myPersonId = null;
+          _ledgerCompanyId = null;
           _companyName = null;
           _profileName = (user.email?.trim().isNotEmpty ?? false)
               ? user.email!.trim()
@@ -770,6 +884,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           ..clear()
           ..addAll(mapped);
         _myPersonId = meId;
+        _ledgerCompanyId = companyId;
         _peopleLoading = false;
         _peopleLoadError = null;
         _profileName = meDisplay.isNotEmpty
@@ -784,12 +899,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _profileTitle = meTitle.isEmpty ? null : meTitle;
         _companyName = loadedCompanyName;
       });
+      await _refreshActivityUnreadCount();
     } on PostgrestException catch (e) {
       if (!mounted) return;
       setState(() {
         _peopleLoading = false;
         _peopleLoadError = 'Failed to load people: ${e.message}';
         _myPersonId = null;
+        _ledgerCompanyId = null;
         _companyName = null;
         _profileName = (user.email?.trim().isNotEmpty ?? false)
             ? user.email!.trim()
@@ -802,6 +919,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _peopleLoading = false;
         _peopleLoadError = 'Failed to load people: $e';
         _myPersonId = null;
+        _ledgerCompanyId = null;
         _companyName = null;
         _profileName = (user.email?.trim().isNotEmpty ?? false)
             ? user.email!.trim()
@@ -928,7 +1046,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       final rows = await client
           .from('expectations')
           .select(
-            'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,progress,expectation_status,expectation_health,expectation_visibility,expectation_type',
+            'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,update_requested_at,progress,expectation_status,expectation_health,expectation_visibility,expectation_type',
           )
           .eq('company_id', companyId)
           .order('created_at', ascending: false);
@@ -969,6 +1087,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           lastChattedReceiverAt: DateTime.tryParse(
             (r['last_chatted_receiver_at'] as String?) ?? '',
           ),
+          updateRequestedAt: DateTime.tryParse(
+            (r['update_requested_at'] as String?) ?? '',
+          ),
           progress: (r['progress'] as num?)?.toInt(),
           health: health,
           type: type,
@@ -984,7 +1105,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           ..addAll(mapped);
         _expectationsLoading = false;
         _expectationsLoadError = null;
+        _ledgerCompanyId ??= companyId;
       });
+      await _refreshActivityUnreadCount();
     } on PostgrestException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1002,6 +1125,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   @override
   void dispose() {
+    _dismissActivityFeedOverlay();
     if (_keyboardHookRegistered) {
       HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     }
@@ -1497,11 +1621,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   }
 
   /// Chip label: icon already shows @ / #; strip a redundant prefix if present.
-  static String _composerChipHandleLabel(String handle) {
-    final t = handle.trim();
-    return t.startsWith('@') ? t.substring(1) : t;
-  }
-
   static String _composerChipTagLabel(String tag) {
     final t = tag.trim();
     return t.startsWith('#') ? t.substring(1) : t;
@@ -1515,6 +1634,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     int total,
   ) {
     final sel = index == (_composerPickIndex % total);
+    final label = ledgerAtMentionLine(
+      p.displayName.trim().isNotEmpty ? p.displayName : p.handle,
+    );
     return InkWell(
       borderRadius: BorderRadius.circular(20),
       onTap: () => _insertMention(p),
@@ -1532,22 +1654,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             width: sel ? 2 : 1,
           ),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.alternate_email,
-              size: 16,
-              color: sel ? scheme.onPrimaryContainer : scheme.onSurfaceVariant,
-            ),
-            const SizedBox(width: 5),
-            Text(
-              _composerChipHandleLabel(p.handle),
-              style: chipStyle?.copyWith(
-                color: sel ? scheme.onPrimaryContainer : scheme.onSurface,
-              ),
-            ),
-          ],
+        child: Text(
+          label,
+          style: chipStyle?.copyWith(
+            color: sel ? scheme.onPrimaryContainer : scheme.onSurface,
+          ),
         ),
       ),
     );
@@ -1874,12 +1985,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             child: Center(
               child: Dialog(
                 backgroundColor:
-                    dialogTheme.colorScheme.surfaceContainerHigh,
+                    dialogTheme.brightness == Brightness.light
+                        ? dialogTheme.colorScheme.surface
+                        : dialogTheme.colorScheme.surfaceContainerHigh,
                 insetPadding:
                     const EdgeInsets.symmetric(horizontal: 28, vertical: 36),
                 clipBehavior: Clip.antiAlias,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(20),
+                  side: dialogTheme.brightness == Brightness.light
+                      ? BorderSide(
+                          color: dialogTheme.colorScheme.outlineVariant,
+                        )
+                      : BorderSide.none,
                 ),
                 child: ConstrainedBox(
                   constraints: BoxConstraints(
@@ -1927,6 +2045,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   String _composerCaptureHintForPillar() {
     if (_pillar == LedgerPillar.addExpectation) {
       return 'Capture an expectation. Use @<name> (or @me) and #hashtags. '
+          'Optional deadline: end the line with +7d, +1w, or +14 days (stripped when saved). '
           'While completing @ or #, Tab completes or cycles matches; Enter inserts. '
           'Otherwise Tab moves between the field and the two save buttons (Shift+Tab reverse); '
           'Enter from the field matches the highlighted save (Save as Draft while you type, '
@@ -1934,6 +2053,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
     if (_pillar == LedgerPillar.addTopic) {
       return 'Talking-point line: use #hashtags for public threads, or @person for a private colleague note (no # required). '
+          'Optional deadline: +7d, +1w, or +14 days at the end (stripped when saved). '
           'While completing @ or #, Tab completes or cycles matches; Enter inserts. '
           'Otherwise Tab moves between the field, Save privately, and Save publicly; '
           'Enter from the field saves privately (same as Save privately).';
@@ -1946,6 +2066,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return 'Choose Save as Draft or Send immediately (back arrow to re-pick type).';
       }
       return 'Type your line. @ and # as needed; expectations need @someone. '
+          'Optional deadline: +7d, +1w, or +14 days at the end (stripped when saved). '
           'Tab completes a pick; Enter inserts while picking, otherwise saves or moves on.';
     }
     return 'Use @people and #tags where helpful.';
@@ -2305,9 +2426,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         person = _findPersonByHandle(handle);
       }
       if (person == null) {
-        final draftWithoutInvite = (entryType == ExpectationType.topic &&
+        // Shadow "Save privately" may skip inviting only for **#tag-only** talking points.
+        // If the line @-mentions someone, we must resolve/create their [people] row so
+        // [target_person_id] is set (Private cloud + receiver label).
+        final draftWithoutInvite =
+            (entryType == ExpectationType.topic &&
                 forcedTalkingPointVisibility ==
-                    ExpectationVisibility.shadow) ||
+                    ExpectationVisibility.shadow &&
+                _extractMentionHandle(text) == null) ||
             (entryType == ExpectationType.expectation &&
                 forcedExpectationVisibility == ExpectationVisibility.shadow);
         if (draftWithoutInvite) {
@@ -2315,10 +2441,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           shouldAskSubmitMode = false;
         } else {
           shouldAskSubmitMode = false;
-          final email = await _askOptionalEmailForHandle(handle);
-          if (email == _cancelToken) {
-            _releaseSubmitInFlight();
-            return;
+          // Talking points @'d at someone are always private notes; no email invite flow.
+          final skipInviteForTopicMention = entryType == ExpectationType.topic &&
+              _talkingPointLineHasPersonMention(text);
+          final String? email;
+          if (skipInviteForTopicMention) {
+            email = null;
+          } else {
+            email = await _askOptionalEmailForHandle(handle);
+            if (email == _cancelToken) {
+              _releaseSubmitInFlight();
+              return;
+            }
           }
           try {
             person = await _createPersonFromHandleInSupabase(
@@ -2333,8 +2467,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
       }
     }
-    final storedText = _normalizeExpectationTextForStorage(text);
-    final parse = parseCaptureLine(text);
+    final trimmedLine = text.trim();
+    final deadlineCmd = _stripCaptureDeadlineSuffix(trimmedLine);
+    final captureBody = deadlineCmd.text;
+    final storedText = _normalizeExpectationTextForStorage(captureBody);
+    final parse = parseCaptureLine(captureBody);
     final topicForSomeone =
         entryType == ExpectationType.topic && person != null;
 
@@ -2375,7 +2512,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _homeRecent.insert(0, FeedEntry(
         id: 'cap_${DateTime.now().millisecondsSinceEpoch}',
         createdAt: DateTime.now().toUtc(),
-        body: text,
+        body: captureBody,
         parse: parse,
         linkedExpectationId: person != null ? tempExpectationId : null,
         isUserCapture: true,
@@ -2389,8 +2526,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           writerUserId: Supabase.instance.client.auth.currentUser?.id,
           personId: target?.id ?? '',
           summary: storedText,
-          deadlineLabel: 'TBD',
-          deadlineAt: null,
+          deadlineLabel:
+              deadlineCmd.deadlineAt != null ? deadlineCmd.deadlineLabel : 'TBD',
+          deadlineAt: deadlineCmd.deadlineAt,
           finishedAt: null,
           responsibleUpdatedAt: DateTime.now().toUtc(),
           publishedAt: visibility == ExpectationVisibility.echo
@@ -2425,6 +2563,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         visibility: visibility,
         type: entryType,
         target: person,
+        deadlineAt: deadlineCmd.deadlineAt,
+        deadlineLabel: deadlineCmd.deadlineLabel,
       );
       if (mounted) {
         setState(() {
@@ -2670,9 +2810,46 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       final t = raw.trim();
       if (t.isEmpty) continue;
       if (t.startsWith('@') || t.startsWith('#')) continue;
+      if (_captureDeadlineTokenLooksLikeContent(t)) continue;
       if (_wordCharRegex.hasMatch(t)) return true;
     }
     return false;
+  }
+
+  /// Trailing ` +7d`, ` +1w`, ` +14 days` (case-insensitive) sets a relative deadline
+  /// from **today (UTC calendar)**; stripped from stored summary.
+  ({String text, DateTime? deadlineAt, String deadlineLabel})
+      _stripCaptureDeadlineSuffix(String trimmedInput) {
+    var s = trimmedInput.trim();
+    final re = RegExp(
+      r'\s+\+(\d+)\s*(w|weeks?|d|days?)\s*$',
+      caseSensitive: false,
+    );
+    final m = re.firstMatch(s);
+    if (m == null) {
+      return (text: s, deadlineAt: null, deadlineLabel: 'TBD');
+    }
+    final n = int.tryParse(m.group(1) ?? '') ?? 0;
+    if (n < 1 || n > 730) {
+      return (text: s, deadlineAt: null, deadlineLabel: 'TBD');
+    }
+    final unit = (m.group(2) ?? 'd').toLowerCase();
+    final calendarDays = unit.startsWith('w') ? n * 7 : n;
+    final now = DateTime.now().toUtc();
+    final base = DateTime.utc(now.year, now.month, now.day);
+    final at = base.add(Duration(days: calendarDays));
+    final label = formatDisplayDateOnly(
+      DateTime(at.year, at.month, at.day),
+      Localizations.localeOf(context),
+    );
+    final cleaned = s.substring(0, m.start).trimRight();
+    return (text: cleaned, deadlineAt: at, deadlineLabel: label);
+  }
+
+  /// True if [token] is only a deadline shorthand like `+3d` (not yet stripped).
+  bool _captureDeadlineTokenLooksLikeContent(String token) {
+    return RegExp(r'^\+\d+(w|weeks?|d|days?)$', caseSensitive: false)
+        .hasMatch(token);
   }
 
   String _normalizeExpectationTextForStorage(String input) {
@@ -2695,6 +2872,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     required ExpectationVisibility visibility,
     required ExpectationType type,
     required Person? target,
+    DateTime? deadlineAt,
+    String deadlineLabel = 'TBD',
   }) async {
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
@@ -2704,18 +2883,26 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
     final meRows = await client
         .from('people')
-        .select('id,company_id')
+        .select('id,company_id,display_name,handle')
         .eq('auth_user_id', user.id)
         .limit(1);
     if ((meRows as List).isEmpty) {
       throw Exception('No linked person/company for this user.');
     }
-    final companyId = meRows.first['company_id'] as String;
+    final meRow = meRows.first as Map<String, dynamic>;
+    final companyId = meRow['company_id'] as String;
+    final mePersonId = meRow['id'] as String;
 
     final targetPersonId = (target != null && _uuidRegex.hasMatch(target.id))
         ? target.id
         : null;
     final title = text.length > 80 ? '${text.substring(0, 80)}...' : text;
+
+    final labelTrimmed = deadlineLabel.trim();
+    final effectiveLabel =
+        labelTrimmed.isEmpty || labelTrimmed.toUpperCase() == 'TBD'
+            ? 'TBD'
+            : labelTrimmed;
 
     final inserted = await client.from('expectations').insert({
       'company_id': companyId,
@@ -2723,7 +2910,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       'target_person_id': targetPersonId,
       'title': title,
       'summary': text,
-      'deadline_label': 'TBD',
+      'deadline_label': effectiveLabel,
+      'deadline_at': deadlineAt?.toIso8601String(),
       'responsible_updated_at': DateTime.now().toUtc().toIso8601String(),
       'progress': 0,
       'expectation_status': _statusToDb(ExpectationStatus.pending),
@@ -2773,6 +2961,25 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         // Ignore duplicate link insert attempts for idempotency.
       }
     }
+    final kindWord = type == ExpectationType.topic ? 'talking point' : 'expectation';
+    final oneLine = text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    final clipped =
+        oneLine.length > 160 ? '${oneLine.substring(0, 160)}…' : oneLine;
+    try {
+      await insertExpectationAppMessage(
+        client: client,
+        companyId: companyId,
+        expectationId: expectationId,
+        senderPersonId: mePersonId,
+        messageText: 'Created a new $kindWord: $clipped',
+        type: kExpectationMessageTypeChangelog,
+      );
+      await touchExpectationChatActivityForAuthUser(
+        client: client,
+        expectationId: expectationId,
+        expectationWriterUserId: user.id,
+      );
+    } catch (_) {}
     if (mounted) {
       await _loadRecentTagsFromSupabase();
     }
@@ -3152,10 +3359,363 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return result;
   }
 
+  Future<void> _refreshActivityUnreadCount() async {
+    final client = Supabase.instance.client;
+    final uid = client.auth.currentUser?.id;
+    final companyId = _ledgerCompanyId;
+    final me = _myPersonId;
+    if (uid == null || companyId == null || me == null) {
+      if (!mounted) return;
+      setState(() {
+        _activityUnreadCount = 0;
+        _expectationIdsWithChangelogUnread.clear();
+        _changelogBellClearedIds.clear();
+      });
+      return;
+    }
+    final party = expectationsPartyForPerson(
+      expectations: _expectations,
+      authUserId: uid,
+      myPersonId: me,
+    );
+    try {
+      final snap = await computeChangelogUnreadPartySnapshot(
+        client: client,
+        companyId: companyId,
+        authUserId: uid,
+        readerPersonId: me,
+        partyExpectations: party,
+      );
+      if (!mounted) return;
+      setState(() {
+        _activityUnreadCount = snap.unreadMessageCount;
+        _expectationIdsWithChangelogUnread
+          ..clear()
+          ..addAll(snap.expectationIdsWithAnyUnread);
+        // Do not wipe optimistic clears: the snapshot can still list this
+        // expectation until the read watermark upsert is visible to RLS.
+        // Drop a cleared id only once the server agrees it has no unread rows.
+        _changelogBellClearedIds.removeWhere(
+          (id) => !snap.expectationIdsWithAnyUnread.contains(id),
+        );
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _activityUnreadCount = 0;
+        _expectationIdsWithChangelogUnread.clear();
+        _changelogBellClearedIds.clear();
+      });
+    }
+  }
+
+  Future<void> _handleActivityFeedRowTap(ExpectationActivityFeedItem item) async {
+    _dismissActivityFeedOverlay();
+    Expectation? match;
+    for (final x in _expectations) {
+      if (x.id == item.expectationId) {
+        match = x;
+        break;
+      }
+    }
+    if (match == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'That item is not loaded — pull Refresh or reopen the list.',
+          ),
+        ),
+      );
+      return;
+    }
+    Person? p;
+    final pid = match.personId.trim();
+    if (pid.isNotEmpty) {
+      for (final person in _people) {
+        if (person.id == pid) {
+          p = person;
+          break;
+        }
+      }
+    }
+    await _openExpectationDetails(e: match, person: p);
+  }
+
+  Future<void> _markActivityExpectationChangelogRead(String expectationId) async {
+    final client = Supabase.instance.client;
+    final companyId = _ledgerCompanyId;
+    final me = _myPersonId;
+    if (companyId == null || me == null) return;
+    final synced = await syncExpectationChangelogReadWatermark(
+      client: client,
+      companyId: companyId,
+      expectationId: expectationId,
+      readerPersonId: me,
+    );
+    if (!mounted) return;
+    if (synced) {
+      setState(() {
+        _changelogBellClearedIds.add(expectationId);
+        _expectationIdsWithChangelogUnread.remove(expectationId);
+      });
+    }
+    _activityFeedOverlayEntry?.markNeedsBuild();
+    if (mounted) {
+      _scheduleChangelogUnreadSnapshotRefresh();
+    }
+  }
+
+  Widget _activityFeedBubbleTile({
+    required ThemeData theme,
+    required ColorScheme scheme,
+    required ExpectationActivityFeedItem item,
+    required String myPersonId,
+  }) {
+    final mine = item.senderPersonId == myPersonId;
+    final atSender = _expectationBubbleAtSenderLabel(item.senderLabel);
+    final labelLine = 'Activity · $atSender · ${_chatRelativeLabel(item.createdAt)}';
+    return _ActivityFeedBubbleTile(
+      theme: theme,
+      scheme: scheme,
+      item: item,
+      mine: mine,
+      labelLine: labelLine,
+      onRowTap: () => _handleActivityFeedRowTap(item),
+      onMarkRead: () => _markActivityExpectationChangelogRead(item.expectationId),
+    );
+  }
+
+  void _dismissActivityFeedOverlay() {
+    if (_activityFeedOverlayEntry == null) return;
+    _activityFeedOverlayEntry!.remove();
+    _activityFeedOverlayEntry = null;
+    if (mounted) {
+      unawaited(_refreshActivityUnreadCount());
+    }
+  }
+
+  Future<void> _toggleActivityFeedPanel() async {
+    if (_activityFeedOverlayEntry != null) {
+      _dismissActivityFeedOverlay();
+      return;
+    }
+    final client = Supabase.instance.client;
+    final uid = client.auth.currentUser?.id;
+    final companyId = _ledgerCompanyId;
+    final me = _myPersonId;
+    if (uid == null || companyId == null || me == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sign in and link a profile to see activity.')),
+      );
+      return;
+    }
+    final party = expectationsPartyForPerson(
+      expectations: _expectations,
+      authUserId: uid,
+      myPersonId: me,
+    );
+    if (!mounted) return;
+    final anchorContext = _activityBellAnchorKey.currentContext;
+    final renderObject = anchorContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not position activity panel.')),
+      );
+      return;
+    }
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final box = renderObject;
+    final origin = box.localToGlobal(Offset.zero);
+    final bellSize = box.size;
+    final media = MediaQuery.of(context);
+    final screenW = media.size.width;
+    final screenH = media.size.height;
+    const margin = 8.0;
+    const gapBelowBell = 6.0;
+    final panelWidth = min(440.0, screenW - margin * 2);
+    final bellRight = origin.dx + bellSize.width;
+    var left = bellRight - panelWidth;
+    if (left < margin) left = margin;
+    if (left + panelWidth > screenW - margin) {
+      left = screenW - margin - panelWidth;
+    }
+    final top = origin.dy + bellSize.height + gapBelowBell;
+    final bottomSafe = media.padding.bottom + margin;
+    final maxPanelHeight = min(420.0, screenH - top - bottomSafe).clamp(160.0, 520.0);
+
+    _activityFeedOverlayEntry = OverlayEntry(
+      builder: (overlayContext) {
+        return Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _dismissActivityFeedOverlay,
+                child: const ColoredBox(color: Color(0x33000000)),
+              ),
+            ),
+            Positioned(
+              left: left,
+              top: top,
+              width: panelWidth,
+              child: Material(
+                elevation: 12,
+                shadowColor: Colors.black45,
+                color: scheme.surfaceContainerHigh,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: SizedBox(
+                  height: maxPanelHeight,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                'Activity',
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Close',
+                              visualDensity: VisualDensity.compact,
+                              onPressed: _dismissActivityFeedOverlay,
+                              icon: const Icon(Icons.close, size: 20),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(
+                          'Updates on expectations and talking points you are related to. '
+                          'Tap a row to open it, or tap the check icon on a row to mark that item’s changelog as seen.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Expanded(
+                        child: FutureBuilder<List<ExpectationActivityFeedItem>>(
+                          future: loadChangelogActivityFeed(
+                            client: client,
+                            companyId: companyId,
+                            authUserId: uid,
+                            readerPersonId: me,
+                            partyExpectations: party,
+                            limit: 80,
+                          ),
+                          builder: (context, snapshot) {
+                            if (snapshot.connectionState == ConnectionState.waiting) {
+                              return const Center(
+                                child: Padding(
+                                  padding: EdgeInsets.all(24),
+                                  child: CircularProgressIndicator(),
+                                ),
+                              );
+                            }
+                            if (snapshot.hasError) {
+                              return Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Text(
+                                    'Could not load activity.',
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: scheme.error,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
+                            final items = snapshot.data ?? const [];
+                            if (items.isEmpty) {
+                              return Center(
+                                child: Text(
+                                  'No activity yet.',
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              );
+                            }
+                            return ListView.builder(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                              itemCount: items.length,
+                              itemBuilder: (context, i) {
+                                final item = items[i];
+                                return Padding(
+                                  padding: EdgeInsets.only(
+                                    bottom: i < items.length - 1 ? 10 : 0,
+                                  ),
+                                  child: _activityFeedBubbleTile(
+                                    theme: theme,
+                                    scheme: scheme,
+                                    item: item,
+                                    myPersonId: me,
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+    if (!mounted) return;
+    Overlay.of(context).insert(_activityFeedOverlayEntry!);
+  }
+
+  /// Re-fetch changelog unread snapshot (debounced slightly so DB read follows upsert).
+  void _scheduleChangelogUnreadSnapshotRefresh() {
+    Future<void>.delayed(const Duration(milliseconds: 500), () {
+      if (mounted) unawaited(_refreshActivityUnreadCount());
+    });
+  }
+
   Future<void> _openExpectationDetails({
     required Expectation e,
     required Person? person,
   }) async {
+    final client = Supabase.instance.client;
+    final uid = client.auth.currentUser?.id;
+    if (mounted) {
+      setState(() {
+        _changelogBellClearedIds.add(e.id);
+        _expectationIdsWithChangelogUnread.remove(e.id);
+        if (uid != null) {
+          _optimisticallyMarkExpectationChatCaughtUp(e.id, uid);
+        }
+      });
+    }
+    if (uid != null) {
+      try {
+        await touchExpectationChatActivityForAuthUser(
+          client: client,
+          expectationId: e.id,
+          expectationWriterUserId: e.writerUserId,
+        );
+      } catch (_) {}
+    }
     await showDialog<bool>(
       context: context,
       builder: (context) {
@@ -3171,6 +3731,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               person: person,
               canEdit: true,
               onInvitePerson: (personId) => _openInviteFlow(personId: personId),
+              onChangelogReadSynced: _scheduleChangelogUnreadSnapshotRefresh,
+              onExpectationDataMutated: () {
+                unawaited(_loadExpectationsFromSupabase());
+                _scheduleChangelogUnreadSnapshotRefresh();
+              },
             ),
           ),
         );
@@ -3195,11 +3760,57 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           tooltip: _railExpanded ? 'Collapse sidebar' : 'Expand sidebar',
           onPressed: () => setState(() => _railExpanded = !_railExpanded),
         ),
-        title: const Text('ExLed'),
+        title: Text(supabaseIsLeamDevHost ? 'ExLed - dev' : 'ExLed'),
         actions: [
-          TextButton(
-            onPressed: _openHomeQuickCaptureModal,
-            child: const Text('Quick Capture'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+            child: FilledButton.tonalIcon(
+              onPressed: _openHomeQuickCaptureModal,
+              icon: const Icon(Icons.post_add_outlined, size: 20),
+              label: const Text('Quick Capture'),
+              style: FilledButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.only(right: 2),
+            key: _activityBellAnchorKey,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                IconButton(
+                  tooltip: 'Activity feed',
+                  onPressed: _toggleActivityFeedPanel,
+                  icon: const Icon(Icons.notifications_outlined),
+                ),
+                if (_activityUnreadCount > 0)
+                  Positioned(
+                    right: 4,
+                    top: 4,
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: scheme.error,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                        child: Text(
+                          _activityUnreadCount > 99 ? '99+' : '$_activityUnreadCount',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: scheme.onError,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 10,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
           MenuAnchor(
             menuChildren: [
@@ -3316,10 +3927,25 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _PillarHeader(pillar: _pillar, theme: theme),
-                      SizedBox(
-                        height: _pillar == LedgerPillar.home ? 20 : 12,
-                      ),
+                      if (_pillar != LedgerPillar.home) ...[
+                        Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal:
+                                (_pillar == LedgerPillar.expectationsMe ||
+                                        _pillar ==
+                                            LedgerPillar.expectationsOthers)
+                                    ? 24
+                                    : 0,
+                          ),
+                          child: _PillarHeader(pillar: _pillar, theme: theme),
+                        ),
+                        SizedBox(
+                          height: (_pillar == LedgerPillar.expectationsMe ||
+                                  _pillar == LedgerPillar.expectationsOthers)
+                              ? 16
+                              : 12,
+                        ),
+                      ],
                       if (_pillar == LedgerPillar.addExpectation ||
                           _pillar == LedgerPillar.addTopic) ...[
                         Focus(
@@ -3476,8 +4102,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           child: ListView(
                             controller: _scrollController,
                             padding: _pillar == LedgerPillar.home
-                                ? const EdgeInsets.fromLTRB(0, 4, 12, 32)
-                                : const EdgeInsets.only(right: 12, bottom: 16),
+                                ? const EdgeInsets.fromLTRB(28, 24, 28, 52)
+                                : (_pillar == LedgerPillar.expectationsMe ||
+                                        _pillar ==
+                                            LedgerPillar.expectationsOthers)
+                                    ? const EdgeInsets.fromLTRB(24, 4, 24, 32)
+                                    : const EdgeInsets.only(right: 12, bottom: 16),
                             children: _threadChildren(
                               theme: theme,
                               scheme: scheme,
@@ -3520,16 +4150,39 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           })();
     switch (_pillar) {
       case LedgerPillar.home:
+        if (_expectationsLoading) {
+          out.add(const _ExpectationsLoadingCard());
+          break;
+        }
+        if (_expectationsLoadError != null) {
+          out.add(
+            _ExpectationsErrorCard(
+              message: _expectationsLoadError!,
+              onRetry: _loadExpectationsFromSupabase,
+            ),
+          );
+          break;
+        }
         out.add(
           _HomeDashboardPanel(
             theme: theme,
             scheme: scheme,
             displayName: _profileName,
             companyName: _companyName,
+            expectations: expectations,
+            people: people,
+            mePerson: mePerson,
+            currentUserId: Supabase.instance.client.auth.currentUser?.id,
+            peopleById: peopleById,
+            hasUnreadChat: _hasUnreadListingIndicator,
+            activityUnreadCount: _activityUnreadCount,
+            onOpenActivityFeed: _toggleActivityFeedPanel,
+            onOpenItem: onOpenExpectationDetails,
+            onOpenColleaguesPage: () {
+              setState(() => _pillar = LedgerPillar.people);
+            },
           ),
         );
-        out.add(const SizedBox(height: 28));
-        out.add(_HomeUseCasesGuide(theme: theme, scheme: scheme));
         break;
 
       case LedgerPillar.addExpectation:
@@ -3567,7 +4220,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               person: peopleById[x.personId],
               theme: theme,
               scheme: scheme,
-              hasUnreadChat: _hasUnreadChat(x),
+              hasUnreadChat: _hasUnreadListingIndicator(x),
               onTagPressed: _openTagPillar,
               onDelete: () => _deleteExpectationFromList(x),
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
@@ -3658,8 +4311,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             .toSet()
             .toList()
           ..sort();
-        final effectiveMeetingsTag =
-            availableTags.contains(_tagsSelectedTag) ? _tagsSelectedTag : null;
+        final publicTagNeedle = _tagFilterNeedle(_tagsSelectedTag);
+        final publicTagDropdownValue =
+            _tagFilterDropdownValue(_tagsSelectedTag, availableTags);
+        final publicTagDropdownItems =
+            _tagFilterDropdownItems(availableTags, _tagsSelectedTag);
         final availablePrivateTags = expectations
             .where(
               (x) =>
@@ -3674,9 +4330,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             .toSet()
             .toList()
           ..sort();
-        final effectivePrivateTag = availablePrivateTags.contains(_tagsSelectedTag)
-            ? _tagsSelectedTag
-            : null;
+        final privateTagNeedle = _tagFilterNeedle(_tagsSelectedTag);
+        final privateTagDropdownValue =
+            _tagFilterDropdownValue(_tagsSelectedTag, availablePrivateTags);
+        final privateTagDropdownItems =
+            _tagFilterDropdownItems(availablePrivateTags, _tagsSelectedTag);
 
         if (_talkingPointsSubView == _TalkingPointsSubView.meetingsOrTags) {
           out.add(
@@ -3691,9 +4349,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     showTag: true,
                     showPerson: false,
                     selectedStatus: null,
-                    selectedTag: effectiveMeetingsTag,
+                    selectedTag: publicTagDropdownValue,
                     selectedPersonId: null,
-                    tags: availableTags,
+                    tags: publicTagDropdownItems,
                     people: const [],
                     tagFieldWidth: 240,
                     onStatusChanged: (_) {},
@@ -3726,9 +4384,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       showTag: true,
                       showPerson: false,
                       selectedStatus: null,
-                      selectedTag: effectivePrivateTag,
+                      selectedTag: privateTagDropdownValue,
                       selectedPersonId: null,
-                      tags: availablePrivateTags,
+                      tags: privateTagDropdownItems,
                       people: const [],
                       tagFieldWidth: 240,
                       onStatusChanged: (_) {},
@@ -3759,12 +4417,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 : colleagueTopics
                     .where((x) => x.personId == effectiveTalkingPointPerson)
                     .toList();
-            if (effectivePrivateTag != null) {
+            if (privateTagNeedle != null) {
               filtered = filtered
                   .where(
                     (x) => _extractInlineTags(x.summary)
                         .map((t) => t.toLowerCase())
-                        .contains(effectivePrivateTag),
+                        .contains(privateTagNeedle),
                   )
                   .toList();
             }
@@ -3793,7 +4451,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 theme: theme,
                 scheme: scheme,
                 collapsed: false,
-                hasUnreadChat: _hasUnreadChat,
+                hasUnreadChat: _hasUnreadListingIndicator,
                 onTagPressed: _openTagPillar,
                 onOpenDetails: (e, p) => onOpenExpectationDetails(e, p),
                 onDeleteExpectation: _deleteExpectationFromList,
@@ -3815,7 +4473,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 theme: theme,
                 scheme: scheme,
                 collapsed: _colleagueArchiveCollapsed,
-                hasUnreadChat: _hasUnreadChat,
+                hasUnreadChat: _hasUnreadListingIndicator,
                 onTagPressed: _openTagPillar,
                 onOpenDetails: (e, p) => onOpenExpectationDetails(e, p),
                 onDeleteExpectation: _deleteExpectationFromList,
@@ -3843,13 +4501,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           );
         } else {
           // Public is already implied by this subview; avoid an extra "Public" heading.
-          final activeTag = effectiveMeetingsTag;
-          final filtered = activeTag == null
+          final publicTagDisplay =
+              publicTagDropdownValue ?? publicTagNeedle;
+          final filtered = publicTagNeedle == null
               ? publicTagged
               : publicTagged.where((x) {
                   return _extractInlineTags(x.summary)
                       .map((t) => t.toLowerCase())
-                      .contains(activeTag);
+                      .contains(publicTagNeedle);
                 }).toList();
           final inflow = filtered
               .where((x) =>
@@ -3864,15 +4523,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
-              emptyText: activeTag == null
+              emptyText: publicTagNeedle == null
                   ? 'No published talking points yet.'
-                  : 'No active talking points for #$activeTag.',
+                  : 'No active talking points for #$publicTagDisplay.',
               items: inflow,
               peopleById: peopleById,
               theme: theme,
               scheme: scheme,
               collapsed: false,
-              hasUnreadChat: _hasUnreadChat,
+              hasUnreadChat: _hasUnreadListingIndicator,
               onTagPressed: _openTagPillar,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
@@ -3886,15 +4545,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           out.add(
             _ExpectationsOthersSection(
               title: 'Archive',
-              emptyText: activeTag == null
+              emptyText: publicTagNeedle == null
                   ? 'No archived published talking points.'
-                  : 'No archive for #$activeTag.',
+                  : 'No archive for #$publicTagDisplay.',
               items: archive,
               peopleById: peopleById,
               theme: theme,
               scheme: scheme,
               collapsed: _tagsArchiveCollapsed,
-              hasUnreadChat: _hasUnreadChat,
+              hasUnreadChat: _hasUnreadListingIndicator,
               onTagPressed: _openTagPillar,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
@@ -3940,43 +4599,31 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               .toSet()
               .toList()
             ..sort();
-          final writersInvolved = towardsMeForTab
-              .map((e) => _writerPersonForExpectation(e, people))
-              .whereType<Person>()
-              .toList();
-          final personOptions = {
-            for (final p in writersInvolved) p.id: p,
-          }.values.toList()
-            ..sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
-          final effectiveInboxTag = availableTags.contains(_inboxTagFilter)
-              ? _inboxTagFilter
-              : null;
-          final effectiveInboxPerson = personOptions.any((p) => p.id == _inboxPersonFilter)
-              ? _inboxPersonFilter
-              : null;
+          final inboxTagNeedle = _tagFilterNeedle(_inboxTagFilter);
+          final inboxTagDropdownValue =
+              _tagFilterDropdownValue(_inboxTagFilter, availableTags);
+          final inboxTagDropdownItems =
+              _tagFilterDropdownItems(availableTags, _inboxTagFilter);
           final filteredTowardsMe = towardsMeForTab.where((x) {
             final statusMatch =
                 _inboxStatusFilter == null || x.status == _inboxStatusFilter;
-            final tagMatch = effectiveInboxTag == null
+            final tagMatch = inboxTagNeedle == null
                 ? true
                 : _extractInlineTags(x.summary)
                       .map((t) => t.toLowerCase())
-                      .contains(effectiveInboxTag.toLowerCase());
-            final writer = _writerPersonForExpectation(x, people);
-            final personMatch = effectiveInboxPerson == null ||
-                writer?.id == effectiveInboxPerson;
-            return statusMatch && tagMatch && personMatch;
+                      .contains(inboxTagNeedle);
+            return statusMatch && tagMatch;
           }).toList();
           out.add(
             Padding(
-              padding: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.only(bottom: 12),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   SegmentedButton<_InboxListingTab>(
                     style: SegmentedButton.styleFrom(
                       visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
                       surfaceTintColor: Colors.transparent,
                       selectedBackgroundColor: _pillarAccentBarColor(
                         LedgerPillar.expectationsMe,
@@ -4008,22 +4655,30 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     selected: {_inboxListingTab},
                     onSelectionChanged: _onInboxListingTabChanged,
                   ),
-                  const Spacer(),
-                  _ExpectationsOthersFiltersBar(
-                    selectedStatus: _inboxStatusFilter,
-                    selectedTag: effectiveInboxTag,
-                    selectedPersonId: effectiveInboxPerson,
-                    tags: availableTags,
-                    people: personOptions,
-                    onStatusChanged: (v) {
-                      setState(() => _inboxStatusFilter = v);
-                    },
-                    onTagChanged: (v) {
-                      setState(() => _inboxTagFilter = v);
-                    },
-                    onPersonChanged: (v) {
-                      setState(() => _inboxPersonFilter = v);
-                    },
+                  Expanded(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        reverse: true,
+                        padding: const EdgeInsets.only(left: 8),
+                        child: _ExpectationsOthersFiltersBar(
+                          showPerson: false,
+                          selectedStatus: _inboxStatusFilter,
+                          selectedTag: inboxTagDropdownValue,
+                          selectedPersonId: null,
+                          tags: inboxTagDropdownItems,
+                          people: const [],
+                          onStatusChanged: (v) {
+                            setState(() => _inboxStatusFilter = v);
+                          },
+                          onTagChanged: (v) {
+                            setState(() => _inboxTagFilter = v);
+                          },
+                          onPersonChanged: (_) {},
+                        ),
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -4070,7 +4725,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _meOngoingCollapsed,
-              hasUnreadChat: _hasUnreadChat,
+              hasUnreadChat: _hasUnreadListingIndicator,
               onTagPressed: _openTagPillar,
               personForItem: (e) => _writerPersonForExpectation(e, people),
               onOpenDetails: (e, p) =>
@@ -4097,7 +4752,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 theme: theme,
                 scheme: scheme,
                 collapsed: _meFinishedCollapsed,
-                hasUnreadChat: _hasUnreadChat,
+                hasUnreadChat: _hasUnreadListingIndicator,
                 onTagPressed: _openTagPillar,
                 personForItem: (e) => _writerPersonForExpectation(e, people),
                 onOpenDetails: (e, p) =>
@@ -4124,7 +4779,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _meArchiveCollapsed,
-              hasUnreadChat: _hasUnreadChat,
+              hasUnreadChat: _hasUnreadListingIndicator,
               onTagPressed: _openTagPillar,
               personForItem: (e) => _writerPersonForExpectation(e, people),
               onOpenDetails: (e, p) =>
@@ -4173,34 +4828,36 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           for (final p in peopleInvolved) p.id: p,
         }.values.toList()
           ..sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
-        final effectiveTagFilter = availableTags.contains(_othersTagFilter)
-            ? _othersTagFilter
-            : null;
+        final othersTagNeedle = _tagFilterNeedle(_othersTagFilter);
+        final othersTagDropdownValue =
+            _tagFilterDropdownValue(_othersTagFilter, availableTags);
+        final othersTagDropdownItems =
+            _tagFilterDropdownItems(availableTags, _othersTagFilter);
         final effectivePersonFilter = personOptions.any((p) => p.id == _othersPersonFilter)
             ? _othersPersonFilter
             : null;
         final filteredTowardsOthers = towardsOthers.where((x) {
           final statusMatch =
               _othersStatusFilter == null || x.status == _othersStatusFilter;
-          final tagMatch = effectiveTagFilter == null
+          final tagMatch = othersTagNeedle == null
               ? true
               : _extractInlineTags(x.summary)
                     .map((t) => t.toLowerCase())
-                    .contains(effectiveTagFilter.toLowerCase());
+                    .contains(othersTagNeedle);
           final personMatch =
               effectivePersonFilter == null || x.personId == effectivePersonFilter;
           return statusMatch && tagMatch && personMatch;
         }).toList();
         out.add(
           Padding(
-            padding: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.only(bottom: 12),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 SegmentedButton<_OutboxListingTab>(
                   style: SegmentedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
                     surfaceTintColor: Colors.transparent,
                     selectedBackgroundColor: _pillarAccentBarColor(
                       LedgerPillar.expectationsOthers,
@@ -4232,22 +4889,31 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   selected: {_outboxListingTab},
                   onSelectionChanged: _onOutboxListingTabChanged,
                 ),
-                const Spacer(),
-                _ExpectationsOthersFiltersBar(
-                  selectedStatus: _othersStatusFilter,
-                  selectedTag: effectiveTagFilter,
-                  selectedPersonId: effectivePersonFilter,
-                  tags: availableTags,
-                  people: personOptions,
-                  onStatusChanged: (v) {
-                    setState(() => _othersStatusFilter = v);
-                  },
-                  onTagChanged: (v) {
-                    setState(() => _othersTagFilter = v);
-                  },
-                  onPersonChanged: (v) {
-                    setState(() => _othersPersonFilter = v);
-                  },
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      reverse: true,
+                      padding: const EdgeInsets.only(left: 8),
+                      child: _ExpectationsOthersFiltersBar(
+                        selectedStatus: _othersStatusFilter,
+                        selectedTag: othersTagDropdownValue,
+                        selectedPersonId: effectivePersonFilter,
+                        tags: othersTagDropdownItems,
+                        people: personOptions,
+                        onStatusChanged: (v) {
+                          setState(() => _othersStatusFilter = v);
+                        },
+                        onTagChanged: (v) {
+                          setState(() => _othersTagFilter = v);
+                        },
+                        onPersonChanged: (v) {
+                          setState(() => _othersPersonFilter = v);
+                        },
+                      ),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -4277,8 +4943,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _othersDraftsCollapsed,
-              hasUnreadChat: _hasUnreadChat,
-              onTagPressed: _openTagPillar,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _applyOutboxTagFilter,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {
@@ -4306,8 +4972,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _othersArchiveCollapsed,
-              hasUnreadChat: _hasUnreadChat,
-              onTagPressed: _openTagPillar,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _applyOutboxTagFilter,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {
@@ -4348,8 +5014,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _othersPublishedCollapsed,
-              hasUnreadChat: _hasUnreadChat,
-              onTagPressed: _openTagPillar,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _applyOutboxTagFilter,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {
@@ -4372,8 +5038,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 theme: theme,
                 scheme: scheme,
                 collapsed: _othersFinishedCollapsed,
-                hasUnreadChat: _hasUnreadChat,
-                onTagPressed: _openTagPillar,
+                hasUnreadChat: _hasUnreadListingIndicator,
+                onTagPressed: _applyOutboxTagFilter,
                 onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
                 onDeleteExpectation: _deleteExpectationFromList,
                 onToggleCollapsed: () {
@@ -4396,8 +5062,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               theme: theme,
               scheme: scheme,
               collapsed: _othersArchiveCollapsed,
-              hasUnreadChat: _hasUnreadChat,
-              onTagPressed: _openTagPillar,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _applyOutboxTagFilter,
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {
@@ -4634,7 +5300,7 @@ class _PillarRail extends StatelessWidget {
                   if (expanded) ...[
                     ListTile(
                       leading: const Icon(Icons.home_outlined),
-                      title: const Text('Home'),
+                      title: const Text('Welcome'),
                       selected: selected == LedgerPillar.home,
                       selectedTileColor: LedgerPillar.home.captureAccent
                           .withValues(alpha: 0.14),
@@ -5170,8 +5836,9 @@ class _PillarRail extends StatelessWidget {
       LedgerPillar.people => Icons.group_outlined,
       LedgerPillar.tags => Icons.tag_outlined,
     };
+    final desc = p.description.trim();
     return Tooltip(
-      message: '$tipTitle\n${p.description}',
+      message: desc.isEmpty ? tipTitle : '$tipTitle\n$desc',
       waitDuration: const Duration(milliseconds: 400),
       child: InkWell(
         onTap: () => onSelect(p),
@@ -5228,9 +5895,13 @@ class _PeopleGlassCard extends StatelessWidget {
                 radius: 18,
                 backgroundColor: scheme.onSurface.withValues(alpha: 0.12),
                 child: Text(
-                  person.displayName.isNotEmpty
-                      ? person.displayName[0].toUpperCase()
-                      : '?',
+                  ledgerPersonInitialLetter(
+                    ledgerAtMentionLine(
+                      person.displayName.trim().isNotEmpty
+                          ? person.displayName
+                          : person.handle,
+                    ),
+                  ),
                   style: TextStyle(color: scheme.onSurface),
                 ),
               ),
@@ -5240,7 +5911,11 @@ class _PeopleGlassCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      person.displayName,
+                      ledgerAtMentionLine(
+                        person.displayName.trim().isNotEmpty
+                            ? person.displayName
+                            : person.handle,
+                      ),
                       style: theme.textTheme.titleSmall?.copyWith(
                         fontWeight: FontWeight.w600,
                         color: scheme.onSurface,
@@ -5477,6 +6152,239 @@ class _ExpectationsErrorCard extends StatelessWidget {
   }
 }
 
+/// Activity feed row: tap the bubble to open the item; tap the **check** control to mark that
+/// expectation's changelog read (no menus or tooltips — works inside the bell overlay).
+class _ActivityFeedBubbleTile extends StatefulWidget {
+  const _ActivityFeedBubbleTile({
+    super.key,
+    required this.theme,
+    required this.scheme,
+    required this.item,
+    required this.mine,
+    required this.labelLine,
+    required this.onRowTap,
+    required this.onMarkRead,
+  });
+
+  final ThemeData theme;
+  final ColorScheme scheme;
+  final ExpectationActivityFeedItem item;
+  final bool mine;
+  final String labelLine;
+  final VoidCallback onRowTap;
+  final Future<void> Function() onMarkRead;
+
+  @override
+  State<_ActivityFeedBubbleTile> createState() => _ActivityFeedBubbleTileState();
+}
+
+class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
+  bool _markBusy = false;
+
+  Future<void> _onMarkReadTap() async {
+    if (_markBusy) return;
+    setState(() => _markBusy = true);
+    try {
+      await widget.onMarkRead();
+    } finally {
+      if (mounted) setState(() => _markBusy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = widget.theme;
+    final scheme = widget.scheme;
+    final item = widget.item;
+    final mine = widget.mine;
+    final labelStyle = theme.textTheme.labelSmall?.copyWith(
+      color: scheme.onSurfaceVariant,
+      fontWeight: FontWeight.w600,
+    );
+    final bodyStyle = theme.textTheme.bodySmall?.copyWith(
+      color: scheme.onSurface,
+      height: 1.35,
+    );
+    final contextBaseStyle = theme.textTheme.bodySmall?.copyWith(
+          color: scheme.onSurfaceVariant,
+          height: 1.25,
+          fontSize: (theme.textTheme.bodySmall?.fontSize ?? 12) - 0.5,
+        ) ??
+        TextStyle(
+          color: scheme.onSurfaceVariant,
+          height: 1.25,
+          fontSize: (theme.textTheme.bodySmall?.fontSize ?? 12) - 0.5,
+        );
+    final displayBody = item.messageText.trim();
+    final contextPrefix = '${item.kindLabel} · ';
+    const maxContextChars = 90;
+    final snippetBudget =
+        (maxContextChars - contextPrefix.length - 2).clamp(16, 120);
+    final quotedSnippet =
+        '"${activityFeedEllipsis(item.expectationSummarySnippet, snippetBudget)}"';
+    final bubbleMeFill = scheme.primary.withValues(alpha: 0.14);
+    final bubbleOtherFill = scheme.surfaceContainerHighest.withValues(alpha: 0.72);
+    final bubbleMeBorder = scheme.primary.withValues(alpha: 0.38);
+    final bubbleOtherBorder = scheme.outline.withValues(alpha: 0.45);
+
+    final bubble = Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        color: mine ? bubbleMeFill : bubbleOtherFill,
+        border: Border.all(
+          color: mine ? bubbleMeBorder : bubbleOtherBorder,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            widget.labelLine,
+            textAlign: mine ? TextAlign.left : TextAlign.right,
+            style: labelStyle,
+            softWrap: true,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            displayBody,
+            textAlign: mine ? TextAlign.left : TextAlign.right,
+            style: bodyStyle,
+            softWrap: true,
+            maxLines: 12,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(
+                  text: contextPrefix,
+                  style: contextBaseStyle,
+                ),
+                TextSpan(
+                  text: quotedSnippet,
+                  style: contextBaseStyle.copyWith(
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ],
+            ),
+            textAlign: mine ? TextAlign.left : TextAlign.right,
+            softWrap: true,
+            maxLines: 4,
+            overflow: TextOverflow.ellipsis,
+          ),
+          if (item.hashtags.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Theme(
+              data: theme.copyWith(
+                textTheme: theme.textTheme.copyWith(
+                  labelSmall: theme.textTheme.labelSmall?.copyWith(
+                    fontSize: 10,
+                    height: 1.15,
+                  ),
+                ),
+              ),
+              child: Wrap(
+                alignment:
+                    mine ? WrapAlignment.start : WrapAlignment.end,
+                spacing: 4,
+                runSpacing: 3,
+                children: [
+                  for (final tag in item.hashtags)
+                    LedgerTagChip(
+                      tag: tag,
+                      unselectedLabelColor:
+                          scheme.onSurfaceVariant.withValues(alpha: 0.88),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
+      child: Material(
+        color: Colors.transparent,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
+          child: Row(
+            mainAxisAlignment:
+                mine ? MainAxisAlignment.start : MainAxisAlignment.end,
+            children: [
+              Expanded(
+                child: Align(
+                  alignment:
+                      mine ? Alignment.centerLeft : Alignment.centerRight,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 520),
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        InkWell(
+                          onTap: widget.onRowTap,
+                          borderRadius: BorderRadius.circular(12),
+                          child: bubble,
+                        ),
+                        Positioned(
+                          top: 4,
+                          right: mine ? 6 : null,
+                          left: mine ? null : 6,
+                          child: Material(
+                            color: scheme.surface.withValues(alpha: 0.94),
+                            elevation: 2,
+                            shadowColor: Colors.black38,
+                            borderRadius: BorderRadius.circular(8),
+                            clipBehavior: Clip.antiAlias,
+                            child: InkWell(
+                              onTap: _markBusy ? null : _onMarkReadTap,
+                              borderRadius: BorderRadius.circular(8),
+                              child: Semantics(
+                                button: true,
+                                label: 'Mark read for this expectation',
+                                child: SizedBox(
+                                  width: 36,
+                                  height: 36,
+                                  child: Center(
+                                    child: _markBusy
+                                        ? SizedBox(
+                                            width: 18,
+                                            height: 18,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: scheme.primary,
+                                            ),
+                                          )
+                                        : Icon(
+                                            Icons.mark_chat_read_outlined,
+                                            size: 22,
+                                            color: scheme.primary,
+                                          ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Same paint as the main title “|” bar — keep tab highlights visually identical.
 Color _pillarAccentBarColor(LedgerPillar pillar, ThemeData theme) {
   var base = pillar.captureAccent;
@@ -5561,7 +6469,9 @@ class _PairedSaveAction extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     return FilledButton(
       focusNode: focusNode,
       autofocus: autofocus,
@@ -5569,9 +6479,11 @@ class _PairedSaveAction extends StatelessWidget {
       style: ButtonStyle(
         visualDensity: VisualDensity.compact,
         backgroundColor: WidgetStateProperty.resolveWith((states) {
-          // 1) Disabled — dark gray
+          // 1) Disabled — visible but clearly inactive
           if (!enabled) {
-            return scheme.surfaceContainerHighest.withValues(alpha: 0.45);
+            return isLight
+                ? scheme.surfaceContainer
+                : scheme.surfaceContainerHighest.withValues(alpha: 0.72);
           }
           // 4) Hover or Tab on *this* button — strongest (clearly above Enter-default idle)
           if (states.contains(WidgetState.focused) ||
@@ -5584,32 +6496,40 @@ class _PairedSaveAction extends StatelessWidget {
             return Color.lerp(
               scheme.primaryContainer,
               scheme.primary,
-              0.30,
+              isLight ? 0.42 : 0.36,
             )!;
           }
-          // 2) Secondary enabled idle (e.g. Save publicly) — palest blue
-          return Color.lerp(
-            scheme.primaryContainer,
-            scheme.surface,
-            0.42,
-          )!;
+          // 2) Secondary enabled idle (e.g. Save publicly)
+          return isLight
+              ? Color.lerp(
+                  scheme.primaryContainer,
+                  scheme.primary,
+                  0.32,
+                )!
+              : Color.lerp(
+                  scheme.primaryContainer,
+                  scheme.primary,
+                  0.24,
+                )!;
         }),
         foregroundColor: WidgetStateProperty.resolveWith((states) {
           if (!enabled) {
-            return scheme.onSurface.withValues(alpha: 0.38);
+            return scheme.onSurface.withValues(alpha: isLight ? 0.52 : 0.42);
           }
           if (states.contains(WidgetState.focused) ||
               states.contains(WidgetState.hovered)) {
-            return Colors.white;
+            return scheme.onPrimary;
           }
           if (emphasizeAsKeyboardDefault) {
             return Color.lerp(
               scheme.onPrimaryContainer,
               scheme.onPrimary,
-              0.35,
+              isLight ? 0.45 : 0.42,
             )!;
           }
-          return scheme.onPrimaryContainer.withValues(alpha: 0.86);
+          return isLight
+              ? scheme.onPrimaryContainer
+              : scheme.onPrimaryContainer.withValues(alpha: 0.92);
         }),
       ),
       child: Text(label),
@@ -5617,88 +6537,522 @@ class _PairedSaveAction extends StatelessWidget {
   }
 }
 
-/// Home pillar: short intro and placeholder for “waiting” items (dashboard).
+/// Home pillar: welcome, activity entry point, and a short recents list.
 class _HomeDashboardPanel extends StatelessWidget {
   const _HomeDashboardPanel({
     required this.theme,
     required this.scheme,
     required this.displayName,
     this.companyName,
+    required this.expectations,
+    required this.people,
+    required this.mePerson,
+    required this.currentUserId,
+    required this.peopleById,
+    required this.hasUnreadChat,
+    required this.activityUnreadCount,
+    required this.onOpenActivityFeed,
+    required this.onOpenItem,
+    required this.onOpenColleaguesPage,
   });
 
   final ThemeData theme;
   final ColorScheme scheme;
   final String displayName;
   final String? companyName;
+  final List<Expectation> expectations;
+  final List<Person> people;
+  final Person? mePerson;
+  final String? currentUserId;
+  final Map<String, Person> peopleById;
+  final bool Function(Expectation e) hasUnreadChat;
+  final int activityUnreadCount;
+  final VoidCallback onOpenActivityFeed;
+  final void Function(Expectation e, Person? person) onOpenItem;
+  /// Same destination as the sidebar People entry ("Your colleagues").
+  final VoidCallback onOpenColleaguesPage;
 
   @override
   Widget build(BuildContext context) {
     final muted = scheme.onSurfaceVariant;
     final company = companyName?.trim();
+    final involved = expectations
+        .where(
+          (e) =>
+              e.status != ExpectationStatus.abandoned &&
+              _ledgerUserInvolvedInExpectation(e, currentUserId, mePerson),
+        )
+        .toList()
+      ..sort(
+        (a, b) => _expectationActivityAt(b).compareTo(_expectationActivityAt(a)),
+      );
+    final recent = involved.take(5).toList();
+    final urgentPool = involved
+        .where(
+          (e) =>
+              _expectationQualifiesForHomeUrgent(e) &&
+              _homeUrgentUserIsWriterOrReceiver(e, currentUserId, mePerson),
+        )
+        .toList();
+    _sortHomeUrgentExpectations(urgentPool);
+    final urgent = urgentPool.take(5).toList();
+    final welcomeBase = theme.textTheme.headlineSmall?.copyWith(
+      fontWeight: FontWeight.w700,
+      color: scheme.onSurface,
+      height: 1.25,
+    );
+
+    final welcomeBarColor = _pillarAccentBarColor(LedgerPillar.home, theme);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Welcome back, $displayName',
-          style: theme.textTheme.titleMedium?.copyWith(
-            fontWeight: FontWeight.w700,
-            color: scheme.onSurface,
-          ),
-        ),
-        if (company != null && company.isNotEmpty) ...[
-          const SizedBox(height: 6),
-          Text(
-            company,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: muted,
-              height: 1.35,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Container(
+              width: 4,
+              height: 22,
+              decoration: BoxDecoration(
+                color: welcomeBarColor,
+                borderRadius: BorderRadius.circular(2),
+              ),
             ),
-          ),
-        ],
-        const SizedBox(height: 16),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(text: 'Welcome, ', style: welcomeBase),
+                    TextSpan(
+                      text: displayName,
+                      style: welcomeBase?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                    if (company != null && company.isNotEmpty)
+                      WidgetSpan(
+                        alignment: PlaceholderAlignment.middle,
+                        child: Tooltip(
+                          message: 'Open People — your colleagues',
+                          child: MouseRegion(
+                            cursor: SystemMouseCursors.click,
+                            child: InkWell(
+                              onTap: onOpenColleaguesPage,
+                              borderRadius: BorderRadius.circular(4),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 2,
+                                  vertical: 1,
+                                ),
+                                child: Text(
+                                  ' · $company',
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: scheme.primary,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.35,
+                                    decoration: TextDecoration.underline,
+                                    decorationColor:
+                                        scheme.primary.withValues(alpha: 0.75),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
         Text(
-          'Use Quick Capture for a talking point or expectation. This space '
-          'can surface priorities and waiting items later.',
+          'ExLed helps you track expectations with others and talking points for '
+          'later. Use Quick Capture in the app bar and start reliably managing '
+          'commitments and follow-ups.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: muted,
-            height: 1.45,
+            height: 1.35,
           ),
         ),
-        const SizedBox(height: 20),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHigh.withValues(alpha: 0.45),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: scheme.outlineVariant.withValues(alpha: 0.45),
+        const SizedBox(height: 28),
+        Material(
+          color: scheme.surfaceContainerHigh.withValues(alpha: 0.42),
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: onOpenActivityFeed,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Row(
+                children: [
+                  Badge(
+                    isLabelVisible: activityUnreadCount > 0,
+                    backgroundColor: scheme.error,
+                    label: Text(
+                      activityUnreadCount > 99 ? '99+' : '$activityUnreadCount',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: scheme.onError,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 10,
+                      ),
+                    ),
+                    child: Icon(
+                      Icons.notifications_outlined,
+                      color: scheme.primary,
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Activity',
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Changelog across items you send or receive',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: muted,
+                            height: 1.2,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Icon(Icons.chevron_right, color: muted, size: 22),
+                ],
+              ),
             ),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Waiting on you',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: scheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Nothing highlighted yet—check Inbox for expectations others '
-                'sent you, or Outbox for what you have open with the team.',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: muted,
-                  height: 1.4,
-                ),
-              ),
-            ],
-          ),
+        ),
+        const SizedBox(height: 32),
+        LayoutBuilder(
+          builder: (context, c) {
+            final narrow = c.maxWidth < 520;
+            final sectionTitleStyle = theme.textTheme.labelLarge?.copyWith(
+              fontWeight: FontWeight.w700,
+              color: scheme.onSurface,
+              letterSpacing: 0.15,
+            );
+            final sectionHintStyle = theme.textTheme.bodySmall?.copyWith(
+              color: muted,
+              height: 1.35,
+            );
+
+            Widget recentsColumn() {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.hourglass_top_outlined,
+                        size: 20,
+                        color: scheme.primary,
+                      ),
+                      const SizedBox(width: 8),
+                      Text('Recents', style: sectionTitleStyle),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Items related to you, ordered by newest updates.',
+                    style: sectionHintStyle,
+                  ),
+                  const SizedBox(height: 18),
+                  if (recent.isEmpty)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(18, 20, 18, 20),
+                      decoration: BoxDecoration(
+                        color: scheme.surfaceContainerHigh.withValues(alpha: 0.45),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: scheme.outlineVariant.withValues(alpha: 0.45),
+                        ),
+                      ),
+                      child: Text(
+                        'Nothing here yet — capture from the bar, or open Inbox / Outbox.',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: muted,
+                          height: 1.4,
+                        ),
+                      ),
+                    )
+                  else
+                    Column(
+                      children: [
+                        for (final e in recent)
+                          _HomeActivityRow(
+                            expectation: e,
+                            theme: theme,
+                            scheme: scheme,
+                            subline: _homeActivitySubline(
+                              e,
+                              currentUserId,
+                              mePerson,
+                              peopleById,
+                              people,
+                            ),
+                            trailingLabel: _activityRecencyShortLabel(
+                              _expectationActivityAt(e),
+                            ),
+                            trailingColor: null,
+                            unread: hasUnreadChat(e),
+                            onTap: () => onOpenItem(e, peopleById[e.personId]),
+                          ),
+                      ],
+                    ),
+                ],
+              );
+            }
+
+            Widget urgentColumn() {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        size: 20,
+                        color: scheme.error,
+                      ),
+                      const SizedBox(width: 8),
+                      Text('Attention needed', style: sectionTitleStyle),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Relevant, due to attention markers',                    
+                    style: sectionHintStyle,
+                  ),
+                  const SizedBox(height: 18),
+                  if (urgent.isEmpty)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(18, 20, 18, 20),
+                      decoration: BoxDecoration(
+                        color: scheme.surfaceContainerHigh.withValues(alpha: 0.45),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: scheme.outlineVariant.withValues(alpha: 0.45),
+                        ),
+                      ),
+                      child: Text(
+                        'Nothing urgent right now.',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: muted,
+                          height: 1.4,
+                        ),
+                      ),
+                    )
+                  else
+                    Column(
+                      children: [
+                        for (final e in urgent)
+                          _HomeActivityRow(
+                            expectation: e,
+                            theme: theme,
+                            scheme: scheme,
+                            subline: _homeActivitySubline(
+                              e,
+                              currentUserId,
+                              mePerson,
+                              peopleById,
+                              people,
+                            ),
+                            trailingLabel: _homeUrgentTrailingLabel(e, scheme),
+                            trailingColor: _homeUrgentTrailingColor(e, scheme),
+                            urgencyRoleIcon: _homeUrgentRoleIcon(
+                              e,
+                              currentUserId,
+                              mePerson,
+                            ),
+                            urgencyRoleTooltip: _homeUrgentRoleTooltip(
+                              e,
+                              currentUserId,
+                              mePerson,
+                            ),
+                            urgencyRoleIconColor: _homeUrgentRoleIconColor(
+                              e,
+                              currentUserId,
+                              mePerson,
+                            ),
+                            unread: hasUnreadChat(e),
+                            onTap: () => onOpenItem(e, peopleById[e.personId]),
+                          ),
+                      ],
+                    ),
+                ],
+              );
+            }
+
+            if (narrow) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  recentsColumn(),
+                  const SizedBox(height: 36),
+                  urgentColumn(),
+                ],
+              );
+            }
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: recentsColumn()),
+                const SizedBox(width: 32),
+                Expanded(child: urgentColumn()),
+              ],
+            );
+          },
         ),
       ],
     );
+  }
+}
+
+class _HomeActivityRow extends StatelessWidget {
+  const _HomeActivityRow({
+    required this.expectation,
+    required this.theme,
+    required this.scheme,
+    required this.subline,
+    required this.trailingLabel,
+    this.trailingColor,
+    this.urgencyRoleIcon,
+    this.urgencyRoleTooltip,
+    this.urgencyRoleIconColor,
+    required this.unread,
+    required this.onTap,
+  });
+
+  final Expectation expectation;
+  final ThemeData theme;
+  final ColorScheme scheme;
+  final String? subline;
+  final String trailingLabel;
+  final Color? trailingColor;
+  /// When set (home Urgent column), same glyphs as Inbox / Outbox rail: whose move it is.
+  final IconData? urgencyRoleIcon;
+  final String? urgencyRoleTooltip;
+  final Color? urgencyRoleIconColor;
+  final bool unread;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final sublineText = subline;
+    final isTopic = expectation.type == ExpectationType.topic;
+    final accent = isTopic
+        ? LedgerListingAccents.topic
+        : LedgerListingAccents.expectation;
+    final icon = isTopic ? Icons.forum_outlined : Icons.flag_outlined;
+    final readStripeAlpha = theme.brightness == Brightness.dark ? 0.30 : 0.48;
+    final stripeColor =
+        unread ? accent : accent.withValues(alpha: readStripeAlpha);
+    final stripeWidth = unread ? 5.0 : 3.0;
+    Widget row = Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Material(
+        color: scheme.surfaceContainerHigh.withValues(alpha: 0.48),
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onTap,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border(
+                left: BorderSide(width: stripeWidth, color: stripeColor),
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(icon, size: 20, color: accent),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        expectation.summary,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: scheme.onSurface,
+                          height: 1.35,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (sublineText != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          sublineText,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      trailingLabel,
+                      textAlign: TextAlign.end,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: trailingColor ?? scheme.onSurfaceVariant,
+                        fontWeight: trailingColor != null
+                            ? FontWeight.w600
+                            : FontWeight.normal,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                    if (urgencyRoleIcon != null) ...[
+                      const SizedBox(height: 6),
+                      Tooltip(
+                        message: urgencyRoleTooltip ?? '',
+                        child: Icon(
+                          urgencyRoleIcon,
+                          size: 20,
+                          color:
+                              urgencyRoleIconColor ?? scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
+            ),
+            ),
+          ),
+        ),
+      ),
+    );
+    if (unread) {
+      row = Tooltip(
+        message: 'Unread chat or activity',
+        child: row,
+      );
+    }
+    return row;
   }
 }
 
@@ -5714,25 +7068,34 @@ class _HomeComposerLeadBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final accent = LedgerPillar.home.captureAccent;
+    final isLight = theme.brightness == Brightness.light;
     final baseStyle = theme.textTheme.bodyMedium!.copyWith(
-      color: scheme.onSurfaceVariant,
+      color: isLight
+          ? theme.colorScheme.onSurface.withValues(alpha: 0.82)
+          : scheme.onSurfaceVariant,
       height: 1.5,
     );
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHigh.withValues(alpha: 0.5),
+        color: isLight
+            ? scheme.primaryContainer.withValues(alpha: 0.72)
+            : scheme.surfaceContainerHigh.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: accent.withValues(alpha: 0.28)),
+        border: Border.all(
+          color: isLight
+              ? scheme.primary.withValues(alpha: 0.38)
+              : accent.withValues(alpha: 0.28),
+          width: isLight ? 1.25 : 1,
+        ),
       ),
       child: Text.rich(
         TextSpan(
           style: baseStyle,
           children: [
             const TextSpan(
-              text: 'Talking point = quick note; expectation = commitment to '
-                  'someone. Pick the mode below, one line, then ',
+              text: 'Pick Talking point or Expectation below, type one line, then ',
             ),
             TextSpan(
               text: 'Enter',
@@ -5744,185 +7107,6 @@ class _HomeComposerLeadBubble extends StatelessWidget {
             ),
             const TextSpan(text: '.'),
           ],
-        ),
-      ),
-    );
-  }
-}
-
-class _HomeUseCasesGuide extends StatelessWidget {
-  const _HomeUseCasesGuide({
-    required this.theme,
-    required this.scheme,
-  });
-
-  final ThemeData theme;
-  final ColorScheme scheme;
-
-  @override
-  Widget build(BuildContext context) {
-    final muted = scheme.onSurfaceVariant;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(bottom: 20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Examples',
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: scheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                'Three starter lines.',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: muted,
-                  height: 1.35,
-                ),
-              ),
-            ],
-          ),
-        ),
-        _HomeGuideCard(
-          theme: theme,
-          scheme: scheme,
-          accent: LedgerListingAccents.topic,
-          icon: Icons.forum_outlined,
-          title: 'Talking point',
-          body: 'Prep or reminder—not a tracked ask.',
-          example: '@sam Points for #weeklymeeting: budget + hiring timeline.',
-        ),
-        _HomeGuideCard(
-          theme: theme,
-          scheme: scheme,
-          accent: LedgerListingAccents.expectation,
-          icon: Icons.flag_outlined,
-          title: 'Expectation',
-          body: 'For someone (@me ok); shows in Inbox/Outbox.',
-          example: '@alex Ship #billing fix to staging by Wed EOD.',
-        ),
-        _HomeGuideCard(
-          theme: theme,
-          scheme: scheme,
-          accent: scheme.tertiary,
-          icon: Icons.label_outline,
-          title: 'Tags & drafts',
-          body: '#tags group threads; draft, then publish when ready.',
-          example: '@me #weeklymeeting follow-ups from last session.',
-        ),
-      ],
-    );
-  }
-}
-
-class _HomeGuideCard extends StatelessWidget {
-  const _HomeGuideCard({
-    required this.theme,
-    required this.scheme,
-    required this.accent,
-    required this.icon,
-    required this.title,
-    required this.body,
-    required this.example,
-  });
-
-  final ThemeData theme;
-  final ColorScheme scheme;
-  final Color accent;
-  final IconData icon;
-  final String title;
-  final String body;
-  final String example;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          color: scheme.surfaceContainerHigh.withValues(alpha: 0.35),
-          border: Border.all(
-            color: accent.withValues(alpha: 0.3),
-          ),
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(14),
-          child: IntrinsicHeight(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Container(
-                  width: 4,
-                  color: accent.withValues(alpha: 0.85),
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(14, 16, 14, 16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
-                            Icon(icon, size: 18, color: accent),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                title,
-                                style: theme.textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w700,
-                                  color: scheme.onSurface,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 10),
-                        Text(
-                          body,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                            height: 1.45,
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: scheme.surfaceContainerHighest
-                                .withValues(alpha: 0.5),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: accent.withValues(alpha: 0.2),
-                            ),
-                          ),
-                          child: Text(
-                            example,
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 12,
-                              height: 1.4,
-                              color: scheme.onSurface.withValues(alpha: 0.9),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
         ),
       ),
     );
@@ -5985,10 +7169,12 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
     if (handle == null || handle.isEmpty) return 'General';
     for (final person in widget.people) {
       if (person.handle.toLowerCase() == handle.toLowerCase()) {
-        return person.displayName;
+        return person.displayName.trim().isNotEmpty
+            ? person.displayName
+            : person.handle;
       }
     }
-    return '@$handle';
+    return handle;
   }
 
   void _syncOverflowState({
@@ -6016,8 +7202,9 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
 
   @override
   Widget build(BuildContext context) {
-    final who = _targetLabel();
-    final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
+    final locale = Localizations.localeOf(context);
+    final who = ledgerAtMentionLine(_targetLabel());
+    final initials = ledgerPersonInitialLetter(who);
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
       height: 1.35,
@@ -6027,12 +7214,7 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
     final parse = widget.entry.parse;
     final showPersonalIndicator =
         widget.linkedExpectation?.visibility == ExpectationVisibility.shadow;
-    final rowSurface = widget.linkedExpectation == null
-        ? widget.scheme.surfaceContainerHighest.withValues(alpha: 0.32)
-        : _ledgerListingRowSurface(
-            expectation: widget.linkedExpectation!,
-            brightness: widget.theme.brightness,
-          );
+    final rowSurface = _ledgerListingRowSurface(scheme: widget.scheme);
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       child: Material(
@@ -6120,7 +7302,7 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
                     )
                   else
                     Tooltip(
-                      message: _timeLabel(widget.entry.createdAt),
+                      message: _timeLabel(widget.entry.createdAt, locale),
                       child: Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 7,
@@ -6132,7 +7314,7 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
                               .withValues(alpha: 0.65),
                         ),
                         child: Text(
-                          _timeLabel(widget.entry.createdAt),
+                          _timeLabel(widget.entry.createdAt, locale),
                           style: widget.theme.textTheme.labelSmall?.copyWith(
                             color: widget.scheme.onSurfaceVariant,
                             fontFamily: 'monospace',
@@ -6188,10 +7370,8 @@ class _MiniTag extends StatelessWidget {
   }
 }
 
-String _timeLabel(DateTime t) {
-  final l = t.toLocal();
-  return '${l.year}-${l.month.toString().padLeft(2, '0')}-${l.day.toString().padLeft(2, '0')} '
-      '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+String _timeLabel(DateTime t, Locale locale) {
+  return formatDisplayDateTime(t, locale);
 }
 
 String _deadlineDistanceLabel(Expectation e) {
@@ -6215,10 +7395,8 @@ String _deadlineDistanceLabel(Expectation e) {
   return '${days}d';
 }
 
-String _exactDateTimeLabel(DateTime dt) {
-  final l = dt.toLocal();
-  return '${l.year}-${l.month.toString().padLeft(2, '0')}-${l.day.toString().padLeft(2, '0')} '
-      '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+String _exactDateTimeLabel(DateTime dt, Locale locale) {
+  return formatDisplayDateTime(dt, locale);
 }
 
 /// Calendar-day based, for "Created" in detail view.
@@ -6251,9 +7429,271 @@ String _chatRelativeLabel(DateTime createdAt) {
   return '$weeks weeks ago';
 }
 
-String _deadlineTooltip(Expectation e) {
+/// @-style label for chat / activity bubble headers (single leading @).
+String _expectationBubbleAtSenderLabel(String raw) {
+  final t = raw.trim();
+  if (t.isEmpty) return '@unknown';
+  return t.startsWith('@') ? t : '@$t';
+}
+
+/// Latest meaningful timestamp on an expectation (for dashboard ordering).
+DateTime _expectationActivityAt(Expectation e) {
+  var latest = e.createdAt.toUtc();
+  void bump(DateTime? t) {
+    if (t == null) return;
+    final u = t.toUtc();
+    if (u.isAfter(latest)) latest = u;
+  }
+
+  bump(e.responsibleUpdatedAt);
+  bump(e.lastChattedSenderAt);
+  bump(e.lastChattedReceiverAt);
+  bump(e.publishedAt);
+  bump(e.seenAt);
+  bump(e.finishedAt);
+  return latest;
+}
+
+bool _ledgerUserInvolvedInExpectation(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  if (currentUserId != null && e.writerUserId == currentUserId) return true;
+  if (mePerson != null &&
+      e.personId.trim().isNotEmpty &&
+      e.personId == mePerson.id) {
+    return true;
+  }
+  return false;
+}
+
+Person? _ledgerWriterPerson(Expectation e, List<Person> people) {
+  final w = e.writerUserId;
+  if (w == null) return null;
+  for (final p in people) {
+    if (p.authUserId == w) return p;
+  }
+  return null;
+}
+
+/// One-line context for home activity rows (counterparty).
+String? _homeActivitySubline(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+  Map<String, Person> peopleById,
+  List<Person> people,
+) {
+  final uid = currentUserId;
+  final isWriter = uid != null && e.writerUserId == uid;
+  if (isWriter) {
+    final p = peopleById[e.personId];
+    if (p == null) return null;
+    return 'With ${ledgerAtMentionLine(p.displayName.trim().isNotEmpty ? p.displayName : p.handle)}';
+  }
+  if (mePerson != null && e.personId.trim() == mePerson.id) {
+    final w = _ledgerWriterPerson(e, people);
+    if (w == null) return 'From someone on the team';
+    return 'From ${ledgerAtMentionLine(w.displayName.trim().isNotEmpty ? w.displayName : w.handle)}';
+  }
+  return null;
+}
+
+String _activityRecencyShortLabel(DateTime at) {
+  final now = DateTime.now().toUtc();
+  var d = now.difference(at.toUtc());
+  if (d.isNegative) d = Duration.zero;
+  if (d.inMinutes < 1) return 'now';
+  if (d.inMinutes < 60) return '${d.inMinutes}m';
+  if (d.inHours < 48) return '${d.inHours}h';
+  if (d.inDays < 14) return '${d.inDays}d';
+  final w = d.inDays ~/ 7;
+  return '${w}w';
+}
+
+/// Calendar days from today (UTC) to [deadlineAt]'s date; negative = overdue.
+int? _calendarDaysUntilDeadlineUtc(Expectation e) {
+  final d = e.deadlineAt;
+  if (d == null) return null;
+  final now = DateTime.now().toUtc();
+  final deadlineDay = DateTime.utc(d.year, d.month, d.day);
+  final today = DateTime.utc(now.year, now.month, now.day);
+  return deadlineDay.difference(today).inDays;
+}
+
+bool _deadlineApproachingOrPast(Expectation e) {
+  final diff = _calendarDaysUntilDeadlineUtc(e);
+  if (diff == null) return false;
+  return diff <= 7;
+}
+
+bool _expectationHealthIsUnhealthy(Expectation e) {
+  return e.health == ExpectationHealth.atRisk ||
+      e.health == ExpectationHealth.offTrack;
+}
+
+/// Matches [_ExpectationOthersTile] `showWarningIndicator`: expectations with undefined health
+/// or pending status surface as warnings in Inbox/Outbox but were omitted from Home Urgent.
+bool _expectationHomeUrgentAttentionRisk(Expectation e) {
+  if (e.type == ExpectationType.topic) {
+    return _expectationHealthIsUnhealthy(e);
+  }
+  return _expectationHealthIsUnhealthy(e) ||
+      e.health == ExpectationHealth.unknown ||
+      e.status == ExpectationStatus.pending;
+}
+
+bool _expectationQualifiesForHomeUrgent(Expectation e) {
+  if (e.status == ExpectationStatus.finished ||
+      e.status == ExpectationStatus.abandoned) {
+    return false;
+  }
+  return _expectationHomeUrgentAttentionRisk(e) || _deadlineApproachingOrPast(e);
+}
+
+/// Home Urgent: only items where you are the author or the named receiver (Inbox / Outbox).
+bool _homeUrgentUserIsWriterOrReceiver(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  final uid = currentUserId;
+  if (uid != null && e.writerUserId == uid) return true;
+  if (mePerson == null) return false;
+  final pid = e.personId.trim();
+  if (pid.isEmpty) return false;
+  return pid == mePerson.id;
+}
+
+/// You are the addressee (including self-addressed); urgency is on your side — Inbox rail icon.
+bool _homeUrgentNeedsMyAction(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  if (mePerson == null) return false;
+  final pid = e.personId.trim();
+  if (pid.isEmpty) return false;
+  return pid == mePerson.id;
+}
+
+/// You sent this to someone else (or no receiver yet); waiting on them / your dispatch — Outbox.
+bool _homeUrgentWaitingOnCounterparty(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  final uid = currentUserId;
+  if (uid == null || e.writerUserId != uid) return false;
+  return !_homeUrgentNeedsMyAction(e, currentUserId, mePerson);
+}
+
+IconData _homeUrgentRoleIcon(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+    return Icons.south_west_outlined;
+  }
+  return Icons.north_east_outlined;
+}
+
+Color _homeUrgentRoleIconColor(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+    return LedgerPillar.expectationsMe.accent;
+  }
+  return LedgerPillar.expectationsOthers.accent;
+}
+
+String _homeUrgentRoleTooltip(
+  Expectation e,
+  String? currentUserId,
+  Person? mePerson,
+) {
+  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+    return 'On you (Inbox): you are the receiver — progress, reply, or resolve.';
+  }
+  if (_homeUrgentWaitingOnCounterparty(e, currentUserId, mePerson)) {
+    return 'Waiting on them (Outbox): you are the sender — follow up with the other party.';
+  }
+  return 'Urgent item';
+}
+
+String _homeUrgentTrailingLabel(Expectation e, ColorScheme scheme) {
+  final parts = <String>[];
+  final diff = _calendarDaysUntilDeadlineUtc(e);
+  if (diff != null && diff <= 7) {
+    if (diff < 0) {
+      parts.add('Overdue ${-diff}d');
+    } else if (diff == 0) {
+      parts.add('Due today');
+    } else if (diff == 1) {
+      parts.add('Due tomorrow');
+    } else {
+      parts.add('Due in ${diff}d');
+    }
+  }
+  if (_expectationHealthIsUnhealthy(e)) {
+    parts.add(_healthMeta(e.health, scheme).$1);
+  } else if (e.type == ExpectationType.expectation) {
+    if (e.status == ExpectationStatus.pending) {
+      parts.add(_statusMeta(e.status, scheme).$1);
+    } else if (e.health == ExpectationHealth.unknown) {
+      parts.add(_healthMeta(e.health, scheme).$1);
+    }
+  }
+  return parts.join(' · ');
+}
+
+void _sortHomeUrgentExpectations(List<Expectation> list) {
+  /// Lower = more urgent (aligned with [_expectationHomeUrgentAttentionRisk]).
+  int attentionRank(Expectation e) {
+    if (e.type == ExpectationType.topic) {
+      return switch (e.health) {
+        ExpectationHealth.offTrack => 0,
+        ExpectationHealth.atRisk => 1,
+        _ => 4,
+      };
+    }
+    if (e.health == ExpectationHealth.offTrack) return 0;
+    if (e.health == ExpectationHealth.atRisk) return 1;
+    if (e.status == ExpectationStatus.pending) return 2;
+    if (e.health == ExpectationHealth.unknown) return 3;
+    return 4;
+  }
+
+  list.sort((a, b) {
+    final da = _calendarDaysUntilDeadlineUtc(a);
+    final db = _calendarDaysUntilDeadlineUtc(b);
+    if (da != null && db != null && da != db) {
+      return da.compareTo(db);
+    }
+    if (da != null && db == null) return -1;
+    if (da == null && db != null) return 1;
+    final ha = attentionRank(a);
+    final hb = attentionRank(b);
+    if (ha != hb) return ha.compareTo(hb);
+    return _expectationActivityAt(b).compareTo(_expectationActivityAt(a));
+  });
+}
+
+Color _homeUrgentTrailingColor(Expectation e, ColorScheme scheme) {
+  final diff = _calendarDaysUntilDeadlineUtc(e);
+  if (diff != null && diff < 0) return scheme.error;
+  if (_expectationHomeUrgentAttentionRisk(e)) return scheme.error;
+  if (diff != null && diff <= 7) return scheme.tertiary;
+  return scheme.tertiary;
+}
+
+String _deadlineTooltip(Expectation e, Locale locale) {
   if (e.deadlineAt != null) {
-    return 'Due: ${_exactDateTimeLabel(e.deadlineAt!)}';
+    return 'Due: ${_exactDateTimeLabel(e.deadlineAt!, locale)}';
   }
   final label = e.deadlineLabel.trim();
   if (label.isEmpty || label.toUpperCase() == 'TBD') {
@@ -6317,21 +7757,21 @@ int _healthToDb(ExpectationHealth health) {
   };
 }
 
-(String, Color) _healthMeta(ExpectationHealth health) {
+(String, Color) _healthMeta(ExpectationHealth health, ColorScheme scheme) {
   return switch (health) {
-    ExpectationHealth.onTrack => ('On track', Colors.greenAccent.shade200),
-    ExpectationHealth.atRisk => ('At risk', Colors.redAccent.shade100),
-    ExpectationHealth.offTrack => ('Off track', Colors.orangeAccent.shade200),
-    ExpectationHealth.unknown => ('Undefined', Colors.blueGrey.shade400),
+    ExpectationHealth.onTrack => ('On track', scheme.primary),
+    ExpectationHealth.atRisk => ('At risk', scheme.error),
+    ExpectationHealth.offTrack => ('Off track', scheme.secondary),
+    ExpectationHealth.unknown => ('Undefined', scheme.outline),
   };
 }
 
-(String, Color) _statusMeta(ExpectationStatus status) {
+(String, Color) _statusMeta(ExpectationStatus status, ColorScheme scheme) {
   return switch (status) {
-    ExpectationStatus.pending => ('Pending', Colors.orangeAccent.shade200),
-    ExpectationStatus.accepted => ('Accepted', Colors.lightBlueAccent.shade200),
-    ExpectationStatus.finished => ('Finished', Colors.lightGreenAccent.shade200),
-    ExpectationStatus.abandoned => ('Abandoned', Colors.redAccent.shade100),
+    ExpectationStatus.pending => ('Pending', scheme.outline),
+    ExpectationStatus.accepted => ('Accepted', scheme.primary),
+    ExpectationStatus.finished => ('Finished', scheme.outline),
+    ExpectationStatus.abandoned => ('Abandoned', scheme.error),
   };
 }
 
@@ -6340,12 +7780,12 @@ IconData _seenIcon(Expectation e) {
   return Icons.visibility_off_outlined;
 }
 
-String _seenTooltip(Expectation e) {
+String _seenTooltip(Expectation e, Locale locale) {
   if (e.seenAt != null) {
-    return 'Seen: ${_exactDateTimeLabel(e.seenAt!)}';
+    return 'Seen: ${_exactDateTimeLabel(e.seenAt!, locale)}';
   }
   if (e.publishedAt != null) {
-    return 'Published: ${_exactDateTimeLabel(e.publishedAt!)}';
+    return 'Published: ${_exactDateTimeLabel(e.publishedAt!, locale)}';
   }
   return 'Personal';
 }
@@ -6367,6 +7807,33 @@ List<String> _extractInlineTags(String input) {
       .where((t) => t.isNotEmpty)
       .toSet()
       .toList();
+}
+
+/// Lowercase needle for matching summary #tags (null = no filter).
+String? _tagFilterNeedle(String? stored) {
+  if (stored == null) return null;
+  final t = stored.trim();
+  if (t.isEmpty) return null;
+  return t.toLowerCase();
+}
+
+/// Value for tag dropdown: casing from [available] when matched, else trimmed [stored] (orphan).
+String? _tagFilterDropdownValue(String? stored, List<String> available) {
+  final needle = _tagFilterNeedle(stored);
+  if (needle == null) return null;
+  for (final x in available) {
+    if (x.toLowerCase() == needle) return x;
+  }
+  return stored!.trim();
+}
+
+List<String> _tagFilterDropdownItems(List<String> available, String? stored) {
+  final merged = <String>{...available};
+  final v = _tagFilterDropdownValue(stored, available);
+  if (v != null) merged.add(v);
+  final list = merged.toList();
+  list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+  return list;
 }
 
 TextSpan _richPrivateTalkingSummarySpan({
@@ -6462,7 +7929,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
   /// Tags pillar (Private / Public lists): hover Archive + owner Delete.
   final bool talkingPointsBrowseListing;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
-  /// Private shadow talking points: hover Publish before Archive / Delete.
+  /// Private shadow talking points: hover Publish (no @-addressee only) before Archive / Delete.
   final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
 
   @override
@@ -6602,8 +8069,8 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
     }) {
       final activeBorder = OutlineInputBorder(
         borderSide: BorderSide(
-          color: scheme.primary.withValues(alpha: 0.85),
-          width: 1.4,
+          color: scheme.primary.withValues(alpha: 0.9),
+          width: 2,
         ),
       );
       return InputDecoration(
@@ -6612,7 +8079,7 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
         contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
         filled: true,
         fillColor: active
-            ? scheme.primaryContainer.withValues(alpha: 0.18)
+            ? scheme.primaryContainer.withValues(alpha: 0.45)
             : scheme.surfaceContainerHighest.withValues(alpha: 0.35),
         border: const OutlineInputBorder(),
         enabledBorder: active ? activeBorder : const OutlineInputBorder(),
@@ -6624,6 +8091,10 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
                   width: 1.2,
                 ),
               ),
+        labelStyle: theme.textTheme.labelMedium?.copyWith(
+          fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+          color: active ? scheme.primary : scheme.onSurfaceVariant,
+        ),
       );
     }
 
@@ -6661,7 +8132,7 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
                 ...ExpectationStatus.values.map(
                   (s) => DropdownMenuItem<ExpectationStatus?>(
                     value: s,
-                    child: Text(_statusMeta(s).$1),
+                    child: Text(_statusMeta(s, scheme).$1),
                   ),
                 ),
               ],
@@ -6718,9 +8189,11 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
                   (p) => DropdownMenuItem<String?>(
                     value: p.id,
                     child: Text(
-                      p.displayName.trim().isNotEmpty
-                          ? p.displayName.trim()
-                          : '@${p.handle}',
+                      ledgerAtMentionLine(
+                        p.displayName.trim().isNotEmpty
+                            ? p.displayName
+                            : p.handle,
+                      ),
                     ),
                   ),
                 ),
@@ -6778,6 +8251,7 @@ class _ExpectationOthersTile extends StatefulWidget {
   /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
   final bool talkingPointsBrowseListing;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
+  /// Shadow talking points only: publish to echo when [Expectation.personId] is empty (no @-addressee).
   final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
 
   @override
@@ -6797,10 +8271,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   bool _hoverTalkingPointsBrowseRow = false;
 
   Color _rowBackgroundColor() {
-    return _ledgerListingRowSurface(
-      expectation: widget.expectation,
-      brightness: widget.theme.brightness,
-    );
+    return _ledgerListingRowSurface(scheme: widget.scheme);
   }
 
   void _syncOverflowState({
@@ -6831,17 +8302,20 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
 
   @override
   Widget build(BuildContext context) {
-    final who = widget.person?.displayName ??
+    final locale = Localizations.localeOf(context);
+    final baseWho = widget.person?.displayName ??
         (widget.expectation.personId.trim().isEmpty
             ? 'General'
             : widget.expectation.personId);
-    final initials = who.trim().isNotEmpty ? who.trim()[0].toUpperCase() : '?';
+    final who = ledgerAtMentionLine(baseWho);
+    final initials = ledgerPersonInitialLetter(who);
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
       height: 1.35,
     );
     final tags = _extractInlineTags(widget.expectation.summary);
-    final (healthLabel, healthColor) = _healthMeta(widget.expectation.health);
+    final (healthLabel, healthColor) =
+        _healthMeta(widget.expectation.health, widget.scheme);
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
     final colorPrivateTalkingSummaryTokens = widget.talkingPointsBrowseListing &&
         isDiscussionPoint &&
@@ -6862,6 +8336,16 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         widget.expectation.writerUserId == currentUserId;
     final canDelete = widget.onDelete != null && isWriter;
     final rowBackground = _rowBackgroundColor();
+    final typeAccent = isDiscussionPoint
+        ? LedgerListingAccents.topic
+        : LedgerListingAccents.expectation;
+    /// Left edge always uses [typeAccent]; unread = full color + wider stripe.
+    final readStripeAlpha =
+        widget.theme.brightness == Brightness.dark ? 0.30 : 0.48;
+    final listingStripeColor = widget.hasUnreadChat
+        ? typeAccent
+        : typeAccent.withValues(alpha: readStripeAlpha);
+    final listingStripeWidth = widget.hasUnreadChat ? 5.0 : 3.0;
     final showOutboxDraftHoverBar = widget.outboxDraftsListing &&
         _hoverOutboxDraftRow &&
         canDelete &&
@@ -6899,19 +8383,29 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         widget.onPublishTalkingPoint != null &&
         isWriter &&
         !isTerminalTpBrowse &&
-        widget.expectation.visibility == ExpectationVisibility.shadow;
+        widget.expectation.visibility == ExpectationVisibility.shadow &&
+        isDiscussionPoint &&
+        widget.expectation.personId.trim().isEmpty;
     final showTalkingPointsBrowseHoverBar = widget.talkingPointsBrowseListing &&
         _hoverTalkingPointsBrowseRow &&
         (canTpBrowsePublish || canTpBrowseArchive || canDelete);
-    final card = Material(
+    Widget card = Material(
       color: rowBackground,
       borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
         onTap: widget.onOpenDetails,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-          child: Row(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border(
+              left: BorderSide(width: listingStripeWidth, color: listingStripeColor),
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
                   Column(
@@ -7045,12 +8539,12 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                     children: [
                       if (showUpperDeadlinePill)
                         Tooltip(
-                          message: _deadlineTooltip(widget.expectation),
+                          message: _deadlineTooltip(widget.expectation, locale),
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                             decoration: BoxDecoration(
                               borderRadius: BorderRadius.circular(999),
-                              color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.65),
+                              color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.42),
                             ),
                             child: Text(
                               _deadlineDistanceLabel(widget.expectation),
@@ -7069,14 +8563,14 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(10),
-                          color: widget.scheme.surfaceContainerHighest.withValues(alpha: 0.22),
+                          color: widget.scheme.surfaceContainerHigh.withValues(alpha: 0.42),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
                             if (draftDeadlineRail)
                               Tooltip(
-                                message: _deadlineTooltip(widget.expectation),
+                                message: _deadlineTooltip(widget.expectation, locale),
                                 child: Padding(
                                   padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
                                   child: Text(
@@ -7103,7 +8597,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                                     ? Icon(
                                         Icons.warning_amber_rounded,
                                         size: 16,
-                                        color: Colors.amberAccent.shade200,
+                                        color: widget.scheme.error,
                                       )
                                     : Container(
                                         width: 10,
@@ -7120,24 +8614,13 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                               const SizedBox(height: 8),
                             if (widget.expectation.visibility == ExpectationVisibility.shadow)
                               Tooltip(
-                                message: _seenTooltip(widget.expectation),
+                                message: _seenTooltip(widget.expectation, locale),
                                 child: Icon(
                                   Icons.visibility_off_outlined,
                                   size: 16,
                                   color: widget.scheme.onSurfaceVariant,
                                 ),
                               ),
-                            if (widget.hasUnreadChat) ...[
-                              const SizedBox(height: 8),
-                              Tooltip(
-                                message: 'New chat activity',
-                                child: Icon(
-                                  Icons.mark_chat_unread_outlined,
-                                  size: 16,
-                                  color: widget.scheme.primary,
-                                ),
-                              ),
-                            ],
                             if (widget.expectation.visibility == ExpectationVisibility.echo &&
                                 widget.expectation.progress != null &&
                                 !showWarningIndicator) ...[
@@ -7154,7 +8637,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                                           100.0,
                                       minHeight: 4,
                                       backgroundColor: widget.scheme.surfaceContainerHigh
-                                          .withValues(alpha: 0.65),
+                                          .withValues(alpha: 0.42),
                                     ),
                                   ),
                                 ),
@@ -7184,7 +8667,14 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
             ),
           ),
         ),
+      ),
     );
+    if (widget.hasUnreadChat) {
+      card = Tooltip(
+        message: 'Unread chat or activity',
+        child: card,
+      );
+    }
 
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -7665,46 +9155,10 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   }
 }
 
-String _listingStateKey(Expectation e) {
-  if (e.status == ExpectationStatus.finished) return 'finished';
-  if (e.status == ExpectationStatus.abandoned) return 'abandoned';
-  if (e.visibility == ExpectationVisibility.echo) return 'published';
-  return 'unpublished';
-}
-
 Color _ledgerListingRowSurface({
-  required Expectation expectation,
-  required Brightness brightness,
+  required ColorScheme scheme,
 }) {
-  final state = _listingStateKey(expectation);
-  final accent = expectation.type == ExpectationType.topic
-      ? LedgerListingAccents.topic
-      : LedgerListingAccents.expectation;
-  final base = brightness == Brightness.dark
-      ? const Color(0xFF13151A)
-      : const Color(0xFFF4F5F7);
-  final mix = switch (state) {
-    'unpublished' => 0.12,
-    'published' => 0.22,
-    'finished' => 0.32,
-    'abandoned' => 0.11,
-    _ => 0.12,
-  };
-  var color = Color.lerp(base, accent, mix)!;
-  if (state == 'abandoned') {
-    color = Color.lerp(
-      color,
-      const Color(0xFFE85D5D),
-      brightness == Brightness.dark ? 0.14 : 0.11,
-    )!;
-  } else if (state == 'finished') {
-    color = Color.lerp(
-      color,
-      const Color(0xFF52B788),
-      brightness == Brightness.dark ? 0.11 : 0.09,
-    )!;
-  }
-  return color;
+  return scheme.surfaceContainerHigh.withValues(alpha: 0.48);
 }
 
 class _PendingAttachment {
@@ -7725,6 +9179,8 @@ class _ExpectationMessageVm {
     required this.messageText,
     required this.createdAt,
     required this.attachments,
+    this.messageType = kExpectationMessageTypeChat,
+    this.readAtByCounterparty,
   });
 
   final String id;
@@ -7733,7 +9189,13 @@ class _ExpectationMessageVm {
   final String messageText;
   final DateTime createdAt;
   final List<_PendingAttachment> attachments;
+  final int messageType;
+
+  /// Latest `read_at` from a reader who is not [senderPersonId] (chat rows only).
+  final DateTime? readAtByCounterparty;
 }
+
+enum _UnsavedDetailsCloseChoice { keepEditing, discard, save }
 
 class _ExpectationDetailsPanel extends StatefulWidget {
   const _ExpectationDetailsPanel({
@@ -7741,12 +9203,16 @@ class _ExpectationDetailsPanel extends StatefulWidget {
     required this.person,
     required this.canEdit,
     this.onInvitePerson,
+    this.onChangelogReadSynced,
+    this.onExpectationDataMutated,
   });
 
   final Expectation expectation;
   final Person? person;
   final bool canEdit;
   final Future<void> Function(String? personId)? onInvitePerson;
+  final VoidCallback? onChangelogReadSynced;
+  final VoidCallback? onExpectationDataMutated;
 
   @override
   State<_ExpectationDetailsPanel> createState() => _ExpectationDetailsPanelState();
@@ -7754,8 +9220,6 @@ class _ExpectationDetailsPanel extends StatefulWidget {
 
 class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   static final RegExp _tagsRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
-  static const int _messageTypeChat = 0;
-  static const int _messageTypeChangeLog = 1;
   late final TextEditingController _descriptionController;
   late final TextEditingController _messageController;
   late ExpectationStatus _status;
@@ -7786,6 +9250,22 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   late String _savedDeadlineLabel;
   late ExpectationVisibility _savedVisibility;
   int? _savedProgress;
+  DateTime? _updateRequestedAt;
+  bool _requestingUpdate = false;
+
+  /// Changelog bubbles compare [DateTime.isAfter] against this UTC instant:
+  /// - On first load we seed from `expectation_changelog_reads.last_read_at` (your stored read
+  ///   cursor). A **brighter / wider** left stripe means that row was still “unread” vs that
+  ///   cursor (same idea as the activity bell).
+  /// - After a successful [syncExpectationChangelogReadWatermark], we advance this to the latest
+  ///   changelog `created_at` in the loaded thread so **opening details counts as reading**
+  ///   everything shown here.
+  DateTime _changelogVisitBaselineUtc =
+      DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+  bool _changelogVisitBaselineCaptured = false;
+
+  /// Bubble header: show sender as @name (one leading @).
+  String _bubbleAtSenderLabel(String raw) => _expectationBubbleAtSenderLabel(raw);
 
   @override
   void initState() {
@@ -7806,9 +9286,21 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     _savedDeadlineLabel = widget.expectation.deadlineLabel.trim();
     _savedVisibility = widget.expectation.visibility;
     _savedProgress = widget.expectation.progress;
+    _updateRequestedAt = widget.expectation.updateRequestedAt;
     _senderLabel = _initialSenderLabel();
     _loadSenderLabel();
     _loadConversation();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ExpectationDetailsPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.expectation.id != oldWidget.expectation.id) {
+      _updateRequestedAt = widget.expectation.updateRequestedAt;
+    } else if (widget.expectation.updateRequestedAt !=
+        oldWidget.expectation.updateRequestedAt) {
+      _updateRequestedAt = widget.expectation.updateRequestedAt;
+    }
   }
 
   void _onDescriptionChanged() {
@@ -7832,6 +9324,67 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       _deadlineLabel.trim() != _savedDeadlineLabel ||
       _visibility != _savedVisibility ||
       _progress != _savedProgress;
+
+  bool get _canPopDetailsWithoutPrompt =>
+      !_saving && !_deleting && (!widget.canEdit || !_dirty);
+
+  Future<void> _attemptCloseDetails() async {
+    if (!mounted) return;
+    if (_saving || _deleting) return;
+    if (_canPopDetailsWithoutPrompt) {
+      Navigator.of(context).pop(_hasSavedChanges);
+      return;
+    }
+    await _confirmUnsavedThenMaybeCloseDetails();
+  }
+
+  Future<void> _confirmUnsavedThenMaybeCloseDetails() async {
+    if (!mounted) return;
+    final noun = _isDiscussionPoint(widget.expectation)
+        ? 'talking point'
+        : 'expectation';
+    final choice = await showDialog<_UnsavedDetailsCloseChoice>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Save changes?'),
+          content: Text(
+            'You have unsaved changes to this $noun. Do you want to save before closing?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext)
+                  .pop(_UnsavedDetailsCloseChoice.keepEditing),
+              child: const Text('Keep editing'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext)
+                  .pop(_UnsavedDetailsCloseChoice.discard),
+              child: const Text("Don't save"),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext)
+                  .pop(_UnsavedDetailsCloseChoice.save),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    if (!mounted) return;
+    if (choice == null || choice == _UnsavedDetailsCloseChoice.keepEditing) {
+      return;
+    }
+    if (choice == _UnsavedDetailsCloseChoice.discard) {
+      Navigator.of(context).pop(_hasSavedChanges);
+      return;
+    }
+    await _save();
+    if (!mounted) return;
+    if (!_dirty) {
+      Navigator.of(context).pop(_hasSavedChanges);
+    }
+  }
 
   /// Private @-person talking point (never published to tag feed).
   bool get _isColleagueTalkingPoint =>
@@ -7864,76 +9417,116 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     required String text,
     required int type,
   }) async {
-    final client = Supabase.instance.client;
-    try {
-      final inserted = await client
-          .from('expectation_messages')
-          .insert({
-            'company_id': _companyId,
-            'expectation_id': widget.expectation.id,
-            'sender_person_id': _myPersonId,
-            'type': type,
-            'message_text': text,
-          })
-          .select('id')
-          .single();
-      return inserted['id'] as String;
-    } on PostgrestException catch (e) {
-      final msg = e.message.toLowerCase();
-      final typeColumnIssue = msg.contains('column') && msg.contains('type');
-      if (!typeColumnIssue) rethrow;
-      final inserted = await client
-          .from('expectation_messages')
-          .insert({
-            'company_id': _companyId,
-            'expectation_id': widget.expectation.id,
-            'sender_person_id': _myPersonId,
-            'message_text': text,
-          })
-          .select('id')
-          .single();
-      return inserted['id'] as String;
-    }
+    return insertExpectationAppMessage(
+      client: Supabase.instance.client,
+      companyId: _companyId!,
+      expectationId: widget.expectation.id,
+      senderPersonId: _myPersonId!,
+      messageText: text,
+      type: type,
+    );
   }
 
   Future<void> _touchChatActivity() async {
-    final client = Supabase.instance.client;
-    final nowIso = DateTime.now().toUtc().toIso8601String();
-    final currentUserId = client.auth.currentUser?.id;
-    final isWriter = currentUserId != null &&
-        widget.expectation.writerUserId != null &&
-        currentUserId == widget.expectation.writerUserId;
-    await client
-        .from('expectations')
-        .update({
-          if (isWriter) 'last_chatted_sender_at': nowIso,
-          if (!isWriter) 'last_chatted_receiver_at': nowIso,
-        })
-        .eq('id', widget.expectation.id);
+    await touchExpectationChatActivityForAuthUser(
+      client: Supabase.instance.client,
+      expectationId: widget.expectation.id,
+      expectationWriterUserId: widget.expectation.writerUserId,
+    );
   }
 
-  String? _buildCriticalChangeLogText() {
-    final changes = <String>[];
-    if (_status != _savedStatus) {
-      changes.add('status to ${_statusMeta(_status).$1}');
-    }
-    if (_health != _savedHealth) {
-      changes.add('health to ${_healthMeta(_health).$1}');
+  List<ChangelogSaveEvent> _collectSaveChangelogEvents(
+    ColorScheme scheme, {
+    required bool publish,
+  }) {
+    final isTopic = widget.expectation.type == ExpectationType.topic;
+    final nextVisibility = publish ? ExpectationVisibility.echo : _visibility;
+    final events = <ChangelogSaveEvent>[];
+    if (_descriptionController.text.trim() != _savedSummary) {
+      events.add(
+        ChangelogSaveEvent(
+          type: kExpectationMessageTypeChangelogDescription,
+          messageText: encodeChangelogPayloadDescription(isTopic: isTopic),
+        ),
+      );
     }
     if (_deadlineAt != _savedDeadlineAt ||
         _deadlineLabel.trim() != _savedDeadlineLabel) {
       final deadlineText = _deadlineAt == null
           ? (_deadlineLabel.trim().isEmpty ? 'no deadline' : _deadlineLabel.trim())
           : _dateOnlyLabel(_deadlineAt!);
-      changes.add('deadline to $deadlineText');
+      events.add(
+        ChangelogSaveEvent(
+          type: kExpectationMessageTypeChangelogDeadline,
+          messageText: encodeChangelogPayloadDeadline(
+            deadlineAt: _deadlineAt,
+            label: deadlineText,
+          ),
+        ),
+      );
     }
-    if (changes.isEmpty) return null;
-    return 'Update: ${changes.join(', ')}.';
+    String? statusLabel;
+    String? healthLabel;
+    int? progressPct;
+    if (_status != _savedStatus) {
+      statusLabel = _statusMeta(_status, scheme).$1;
+    }
+    if (_health != _savedHealth) {
+      healthLabel = _healthMeta(_health, scheme).$1;
+    }
+    if (_progress != _savedProgress) {
+      progressPct = _progress ?? 0;
+    }
+    if (statusLabel != null || healthLabel != null || progressPct != null) {
+      final onlyProgress =
+          progressPct != null && statusLabel == null && healthLabel == null;
+      if (onlyProgress) {
+        events.add(
+          ChangelogSaveEvent(
+            type: kExpectationMessageTypeChangelogFields,
+            messageText: encodeChangelogPayloadProgress(
+              isTopic: isTopic,
+              pct: progressPct!,
+            ),
+          ),
+        );
+      } else {
+        events.add(
+          ChangelogSaveEvent(
+            type: kExpectationMessageTypeChangelogFields,
+            messageText: encodeChangelogPayloadFields(
+              isTopic: isTopic,
+              statusLabel: statusLabel,
+              healthLabel: healthLabel,
+              progressPct: progressPct,
+            ),
+          ),
+        );
+      }
+    }
+    if (publish && _savedVisibility == ExpectationVisibility.shadow) {
+      events.add(
+        ChangelogSaveEvent(
+          type: kExpectationMessageTypeChangelogPublished,
+          messageText: encodeChangelogPayloadPublished(isTopic: isTopic),
+        ),
+      );
+    } else if (nextVisibility != _savedVisibility) {
+      events.add(
+        ChangelogSaveEvent(
+          type: kExpectationMessageTypeChangelogVisibility,
+          messageText: encodeChangelogPayloadVisibility(
+            isTopic: isTopic,
+            echo: nextVisibility == ExpectationVisibility.echo,
+          ),
+        ),
+      );
+    }
+    return events;
   }
 
   String _dateOnlyLabel(DateTime dt) {
-    final local = dt.toLocal();
-    return '${local.year}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
+    return formatDisplayDateOnly(dt, Localizations.localeOf(context));
   }
 
   String _initialSenderLabel() {
@@ -8019,10 +9612,13 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       lastDate: DateTime(2100),
     );
     if (picked == null) return;
+    final loc = Localizations.localeOf(context);
     setState(() {
       _deadlineAt = DateTime(picked.year, picked.month, picked.day).toUtc();
-      _deadlineLabel =
-          '${picked.year}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+      _deadlineLabel = formatDisplayDateOnly(
+        DateTime(picked.year, picked.month, picked.day),
+        loc,
+      );
     });
   }
 
@@ -8030,6 +9626,83 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     if (_saving || !widget.canEdit) return;
     setState(() => _status = ExpectationStatus.finished);
     await _save();
+  }
+
+  bool get _canRequestUpdate {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    final writerId = widget.expectation.writerUserId;
+    if (uid == null || writerId == null || writerId != uid) return false;
+    return widget.canEdit &&
+        !_editingDescription &&
+        widget.expectation.visibility == ExpectationVisibility.echo &&
+        _status != ExpectationStatus.finished &&
+        _status != ExpectationStatus.abandoned &&
+        widget.expectation.personId.trim().isNotEmpty;
+  }
+
+  Future<void> _requestUpdate() async {
+    if (_requestingUpdate || !_canRequestUpdate) return;
+    setState(() => _requestingUpdate = true);
+    await _ensureActorContext();
+    if (_myPersonId == null || _companyId == null) {
+      if (mounted) {
+        setState(() => _requestingUpdate = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not resolve your profile.')),
+        );
+      }
+      return;
+    }
+    final client = Supabase.instance.client;
+    final uid = client.auth.currentUser?.id;
+    final now = DateTime.now().toUtc();
+    const eventType = 'update_requested';
+    const note =
+        'Update requested: consider updating progress, deadline, or status.';
+    try {
+      await client.from('expectations').update({
+        'update_requested_at': now.toIso8601String(),
+        'expectation_health': _healthToDb(ExpectationHealth.atRisk),
+        'responsible_updated_at': now.toIso8601String(),
+      }).eq('id', widget.expectation.id);
+
+      await client.from('expectation_events').insert({
+        'company_id': _companyId,
+        'expectation_id': widget.expectation.id,
+        'event_type': eventType,
+        'note': note,
+        if (uid != null) 'actor_user_id': uid,
+      });
+
+      await _insertExpectationMessage(
+        text: encodeChangelogPayloadUpdateRequested(
+          isTopic: widget.expectation.type == ExpectationType.topic,
+        ),
+        type: kExpectationMessageTypeChangelogUpdateRequested,
+      );
+      await _touchChatActivity();
+
+      if (!mounted) return;
+      setState(() {
+        _requestingUpdate = false;
+        _updateRequestedAt = now;
+        _health = ExpectationHealth.atRisk;
+        _savedHealth = ExpectationHealth.atRisk;
+      });
+      widget.onExpectationDataMutated?.call();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Update requested — your counterparty was notified.'),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _requestingUpdate = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Request failed: $e')),
+      );
+    }
   }
 
   Future<void> _save({bool publish = false}) async {
@@ -8052,6 +9725,9 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         _deadlineAt != _savedDeadlineAt ||
         _deadlineLabel.trim() != _savedDeadlineLabel ||
         _progress != _savedProgress;
+    final summaryChanged = summary.trim() != _savedSummary;
+    final clearUpdateRequest = _updateRequestedAt != null &&
+        (summaryChanged || responsibleFieldsChanged);
     final updates = <String, dynamic>{
       'summary': summary,
       'title': summary.length > 80 ? '${summary.substring(0, 80)}...' : summary,
@@ -8068,23 +9744,26 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     if (publish && widget.expectation.publishedAt == null) {
       updates['published_at'] = DateTime.now().toUtc().toIso8601String();
     }
-    final changeLogText = _buildCriticalChangeLogText();
+    if (clearUpdateRequest) {
+      updates['update_requested_at'] = null;
+    }
+    final scheme = Theme.of(context).colorScheme;
+    final changeLogEvents = _collectSaveChangelogEvents(scheme, publish: publish);
     try {
       await client.from('expectations').update(updates).eq('id', widget.expectation.id);
-      if (changeLogText != null) {
-        var actorReady = await _ensureActorContext();
-        if (!actorReady) {
-          // Fallback path: conversation load also initializes actor context.
-          await _loadConversation();
-          actorReady = _myPersonId != null && _companyId != null;
-        }
-        if (actorReady) {
+      var actorReady = await _ensureActorContext();
+      if (!actorReady) {
+        await _loadConversation();
+        actorReady = _myPersonId != null && _companyId != null;
+      }
+      if (actorReady && changeLogEvents.isNotEmpty) {
+        for (final ev in changeLogEvents) {
           await _insertExpectationMessage(
-            text: changeLogText,
-            type: _messageTypeChangeLog,
+            text: ev.messageText,
+            type: ev.type,
           );
-          await _touchChatActivity();
         }
+        await _touchChatActivity();
       }
       if (!mounted) return;
       setState(() {
@@ -8100,8 +9779,12 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
             _deadlineLabel.trim().isEmpty ? 'TBD' : _deadlineLabel.trim();
         _savedVisibility = _visibility;
         _savedProgress = _progress;
+        if (clearUpdateRequest) {
+          _updateRequestedAt = null;
+        }
       });
       await _loadConversation();
+      widget.onExpectationDataMutated?.call();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Expectation saved.')),
       );
@@ -8174,6 +9857,28 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     }
   }
 
+  void _maybeMarkPeerChatReadsOnce(List<_ExpectationMessageVm> mapped) {
+    if (_myPersonId == null || _companyId == null) return;
+    final peerIds = mapped
+        .where(
+          (m) =>
+              expectationMessageTypeIsChatRow(m.messageType) &&
+              m.senderPersonId.trim().isNotEmpty &&
+              m.senderPersonId != _myPersonId,
+        )
+        .map((m) => m.id)
+        .toList();
+    if (peerIds.isEmpty) return;
+    unawaited(
+      markExpectationPeerChatMessagesRead(
+        client: Supabase.instance.client,
+        companyId: _companyId!,
+        viewerPersonId: _myPersonId!,
+        peerMessageIds: peerIds,
+      ),
+    );
+  }
+
   Future<void> _loadConversation() async {
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
@@ -8207,23 +9912,72 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
           ? meDisplay
           : (meHandle.isNotEmpty ? '@$meHandle' : null);
 
+      if (!_changelogVisitBaselineCaptured) {
+        try {
+          final readRows = await client
+              .from('expectation_changelog_reads')
+              .select('last_read_at')
+              .eq('expectation_id', widget.expectation.id)
+              .eq('reader_person_id', _myPersonId!)
+              .eq('company_id', _companyId!)
+              .limit(1);
+          if ((readRows as List).isNotEmpty) {
+            final raw = (readRows.first as Map<String, dynamic>)['last_read_at'] as String?;
+            final parsed = raw != null ? DateTime.tryParse(raw)?.toUtc() : null;
+            if (parsed != null) {
+              _changelogVisitBaselineUtc = parsed;
+            }
+          }
+        } on PostgrestException {
+          // Reads table / policy not deployed — keep epoch baseline.
+        }
+        _changelogVisitBaselineCaptured = true;
+      }
+
       final rows = await client
           .from('expectation_messages')
           .select(
-            'id,sender_person_id,message_text,created_at,'
-            'people!inner(display_name,handle),'
-            'expectation_message_attachments(file_name,file_url)',
+            'id,sender_person_id,message_text,created_at,type,'
+            // Disambiguate vs expectation_message_reads → people (reader).
+            'people!expectation_messages_sender_person_id_fkey(display_name,handle),'
+            'expectation_message_attachments(file_name,file_url),'
+            'expectation_message_reads(reader_person_id,read_at)',
           )
           .eq('expectation_id', widget.expectation.id)
-          .order('created_at', ascending: true);
+          .order('created_at', ascending: false);
+
+      String normalizeLoadedMessageText(dynamic raw) {
+        if (raw == null) return '';
+        final String s;
+        if (raw is String) {
+          s = raw;
+        } else if (raw is Map) {
+          s = jsonEncode(Map<String, dynamic>.from(raw as Map));
+        } else {
+          s = '$raw';
+        }
+        return s.replaceAll(RegExp(r'[\u200B-\u200D\uFEFF]'), '').trim();
+      }
+
+      Map<String, dynamic>? personRowFrom(dynamic personObj) {
+        if (personObj is Map<String, dynamic>) return personObj;
+        if (personObj is Map) return Map<String, dynamic>.from(personObj as Map);
+        if (personObj is List && personObj.isNotEmpty) {
+          final first = personObj.first;
+          if (first is Map<String, dynamic>) return first;
+          if (first is Map) return Map<String, dynamic>.from(first as Map);
+        }
+        return null;
+      }
 
       final mapped = (rows as List).map((r) {
-        final personObj = r['people'];
-        final senderLabel = personObj is Map
-            ? ((personObj['display_name'] as String?)?.trim().isNotEmpty == true
-                ? (personObj['display_name'] as String).trim()
-                : '@${(personObj['handle'] as String?) ?? 'unknown'}')
-            : (r['sender_person_id'] as String);
+        final personMap = personRowFrom(r['people']);
+        final senderLabel = personMap != null
+            ? ((personMap['display_name'] as String?)?.trim().isNotEmpty == true
+                ? (personMap['display_name'] as String).trim()
+                : '@${(personMap['handle'] as String?) ?? 'unknown'}')
+            : '@unknown';
+        final senderId = (r['sender_person_id'] as String?)?.trim() ?? '';
         final attachmentRows = (r['expectation_message_attachments'] as List?) ?? const [];
         final attachments = attachmentRows
             .map(
@@ -8236,14 +9990,34 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
             )
             .where((a) => a.fileUrl.isNotEmpty)
             .toList();
+        final rawType = r['type'];
+        final messageType = rawType is int
+            ? rawType
+            : (rawType is num ? rawType.toInt() : int.tryParse('$rawType') ?? 0);
+        DateTime? readAtByCounterparty;
+        final readRaw = r['expectation_message_reads'];
+        final readList = readRaw is List ? readRaw : const <dynamic>[];
+        for (final raw in readList) {
+          if (raw is! Map) continue;
+          final rid = ((raw)['reader_person_id'] as String?)?.trim() ?? '';
+          if (rid.isEmpty || rid == senderId) continue;
+          final readStr = raw['read_at'] as String?;
+          final parsed = readStr != null ? DateTime.tryParse(readStr)?.toUtc() : null;
+          if (parsed == null) continue;
+          if (readAtByCounterparty == null || parsed.isAfter(readAtByCounterparty!)) {
+            readAtByCounterparty = parsed;
+          }
+        }
         return _ExpectationMessageVm(
           id: r['id'] as String,
-          senderPersonId: r['sender_person_id'] as String,
+          senderPersonId: senderId.isNotEmpty ? senderId : (r['sender_person_id'] as String? ?? ''),
           senderLabel: senderLabel,
-          messageText: ((r['message_text'] as String?) ?? '').trim(),
+          messageText: normalizeLoadedMessageText(r['message_text']),
           createdAt: DateTime.tryParse((r['created_at'] as String?) ?? '') ??
               DateTime.now().toUtc(),
           attachments: attachments,
+          messageType: messageType,
+          readAtByCounterparty: readAtByCounterparty,
         );
       }).toList();
 
@@ -8255,6 +10029,30 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         _messagesLoading = false;
         _messagesError = null;
       });
+      _maybeMarkPeerChatReadsOnce(mapped);
+      final synced = await syncExpectationChangelogReadWatermark(
+        client: client,
+        companyId: _companyId!,
+        expectationId: widget.expectation.id,
+        readerPersonId: _myPersonId!,
+      );
+      if (synced && mounted) {
+        var maxChangelogUtc =
+            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+        var anyChangelog = false;
+        for (final m in _messages) {
+          if (!expectationMessageTypeIsChangelog(m.messageType)) continue;
+          anyChangelog = true;
+          final u = m.createdAt.toUtc();
+          if (u.isAfter(maxChangelogUtc)) maxChangelogUtc = u;
+        }
+        setState(() {
+          _changelogVisitBaselineUtc = anyChangelog
+              ? maxChangelogUtc
+              : DateTime.now().toUtc();
+        });
+        widget.onChangelogReadSynced?.call();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -8322,9 +10120,13 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     setState(() => _sendingMessage = true);
     final client = Supabase.instance.client;
     try {
+      final hasFiles = _pendingAttachments.isNotEmpty;
+      final messageType = hasFiles
+          ? kExpectationMessageTypeChatWithAttachment
+          : kExpectationMessageTypeChat;
       final messageId = await _insertExpectationMessage(
-        text: text.isEmpty ? '[Attachment]' : text,
-        type: _messageTypeChat,
+        text: text,
+        type: messageType,
       );
       for (final a in _pendingAttachments) {
         await client.from('expectation_message_attachments').insert({
@@ -8396,13 +10198,15 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final locale = Localizations.localeOf(context);
     final handle = widget.person?.handle;
-    final (statusLabel, statusColor) = _statusMeta(_status);
-    final (healthLabel, healthColor) = _healthMeta(_health);
+    final (statusLabel, statusColor) = _statusMeta(_status, scheme);
+    final (healthLabel, healthColor) = _healthMeta(_health, scheme);
     final canEdit = widget.canEdit;
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-    final canSendMessage =
-        !_sendingMessage && _messageController.text.trim().isNotEmpty;
+    final canSendMessage = !_sendingMessage &&
+        (_messageController.text.trim().isNotEmpty ||
+            _pendingAttachments.isNotEmpty);
     final canDelete = canEdit &&
         widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
@@ -8427,6 +10231,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       seenAt: widget.expectation.seenAt,
       lastChattedSenderAt: widget.expectation.lastChattedSenderAt,
       lastChattedReceiverAt: widget.expectation.lastChattedReceiverAt,
+      updateRequestedAt: _updateRequestedAt,
       progress: _progress,
       health: _health,
       type: widget.expectation.type,
@@ -8440,54 +10245,68 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         .toSet()
         .toList();
 
-    return Container(
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerLow.withValues(alpha: 0.92),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.35)),
-      ),
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 10, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Row(
-                    children: [
-                      Flexible(
-                        child: Text(
-                          isDiscussionPoint
-                              ? (_visibility == ExpectationVisibility.shadow
-                                    ? 'Talking point - PERSONAL'
-                                    : 'Talking point')
-                              : (_visibility == ExpectationVisibility.shadow
-                                    ? 'Expectation Details - PERSONAL'
-                                    : 'Expectation Details'),
-                          style: theme.textTheme.titleLarge?.copyWith(
-                            fontWeight: FontWeight.w700,
+    return PopScope(
+      canPop: _canPopDetailsWithoutPrompt,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        if (_saving || _deleting) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Please wait for the current action to finish.'),
+            ),
+          );
+          return;
+        }
+        unawaited(_confirmUnsavedThenMaybeCloseDetails());
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerLow.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.35)),
+        ),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 10, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            isDiscussionPoint
+                                ? (_visibility == ExpectationVisibility.shadow
+                                      ? 'Talking point - PERSONAL'
+                                      : 'Talking point')
+                                : (_visibility == ExpectationVisibility.shadow
+                                      ? 'Expectation Details - PERSONAL'
+                                      : 'Expectation Details'),
+                            style: theme.textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
-                      ),
-                      if (_visibility == ExpectationVisibility.shadow) ...[
-                        const SizedBox(width: 8),
-                        Icon(
-                          Icons.visibility_off_outlined,
-                          size: 18,
-                          color: scheme.onSurfaceVariant,
-                        ),
+                        if (_visibility == ExpectationVisibility.shadow) ...[
+                          const SizedBox(width: 8),
+                          Icon(
+                            Icons.visibility_off_outlined,
+                            size: 18,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Close',
-                  onPressed: () => Navigator.of(context).pop(_hasSavedChanges),
-                  icon: const Icon(Icons.close),
-                ),
-              ],
+                  IconButton(
+                    tooltip: 'Close',
+                    onPressed: (_saving || _deleting) ? null : _attemptCloseDetails,
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
             ),
-          ),
           const Divider(height: 1),
           Expanded(
             child: ListView(
@@ -8550,7 +10369,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                               fontWeight: FontWeight.w600,
                             ),
                           ),
-                          hint: _exactDateTimeLabel(widget.expectation.seenAt!),
+                          hint: _exactDateTimeLabel(widget.expectation.seenAt!, locale),
                         )
                       else if (widget.expectation.publishedAt != null)
                         _DetailRow(
@@ -8562,7 +10381,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                               fontWeight: FontWeight.w600,
                             ),
                           ),
-                          hint: _exactDateTimeLabel(widget.expectation.publishedAt!),
+                          hint: _exactDateTimeLabel(widget.expectation.publishedAt!, locale),
                         )
                       else if (working.responsibleUpdatedAt != null)
                         _DetailRow(
@@ -8574,7 +10393,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                               fontWeight: FontWeight.w600,
                             ),
                           ),
-                          hint: _exactDateTimeLabel(working.responsibleUpdatedAt!),
+                          hint: _exactDateTimeLabel(working.responsibleUpdatedAt!, locale),
                         )
                       else
                         _DetailRow(
@@ -8586,7 +10405,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                               fontWeight: FontWeight.w600,
                             ),
                           ),
-                          hint: _exactDateTimeLabel(widget.expectation.createdAt),
+                          hint: _exactDateTimeLabel(widget.expectation.createdAt, locale),
                         ),
                       if (tags.isNotEmpty)
                         _DetailRow(
@@ -8738,7 +10557,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             ],
                           ],
                         ),
-                        hint: _deadlineTooltip(working),
+                        hint: _deadlineTooltip(working, locale),
                         alignTop: true,
                       ),
                       if (_visibility == ExpectationVisibility.echo)
@@ -8934,6 +10753,25 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                         ),
                       ),
                     const Spacer(),
+                    if (_canRequestUpdate) ...[
+                      Tooltip(
+                        message:
+                            'Requests an update from the receiver regarding health, deadline, or status.',
+                        child: OutlinedButton(
+                          onPressed: (_saving || _deleting || _requestingUpdate)
+                              ? null
+                              : _requestUpdate,
+                          child: _requestingUpdate
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Text('Request'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
                     FilledButton(
                       onPressed: (_saving || _deleting || !_dirty || !canEdit)
                           ? null
@@ -8969,7 +10807,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                   constraints: BoxConstraints(
                     minHeight: _messagesLoading || _messagesError != null
                         ? 80
-                        : (_messages.isNotEmpty ? 210 : 24),
+                        : (_messages.isNotEmpty ? 0 : 24),
                   ),
                   child: _messagesLoading
                       ? const Padding(
@@ -8985,72 +10823,286 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                           ),
                         )
                       : _messages.isNotEmpty
-                      ? Column(
-                          children: [
-                            for (var i = 0; i < _messages.length; i++) ...[
-                              if (i > 0) const SizedBox(height: 14),
-                              (() {
-                                final m = _messages[i];
-                                final mine = m.senderPersonId == _myPersonId;
-                                return Align(
-                                  alignment:
-                                      mine ? Alignment.centerRight : Alignment.centerLeft,
+                      ? ListView.separated(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemCount: _messages.length,
+                          separatorBuilder: (_, __) => const SizedBox(height: 14),
+                          itemBuilder: (context, i) {
+                            final m = _messages[i];
+                            final mine = m.senderPersonId == _myPersonId;
+                            final isChangelog =
+                                expectationMessageTypeIsChangelog(m.messageType);
+                            final isAttachmentChat = !isChangelog &&
+                                (m.messageType ==
+                                        kExpectationMessageTypeChatWithAttachment ||
+                                    m.attachments.isNotEmpty);
+                            final atSender = _bubbleAtSenderLabel(m.senderLabel);
+                            final labelLine = isChangelog
+                                ? 'Activity · $atSender · ${_chatRelativeLabel(m.createdAt)}'
+                                : isAttachmentChat
+                                    ? 'Attachment · $atSender · ${_chatRelativeLabel(m.createdAt)}'
+                                    : '$atSender · ${_chatRelativeLabel(m.createdAt)}';
+                            String bodyPreview() {
+                              if (isChangelog) {
+                                return expectationChangelogActivityFeedLine(
+                                  messageType: m.messageType,
+                                  messageText: m.messageText,
+                                  expectationType: widget.expectation.type,
+                                );
+                              }
+                              final t = m.messageText.trim();
+                              if (t.isEmpty) {
+                                if (m.attachments.isEmpty) {
+                                  return '(no message)';
+                                }
+                                return m.attachments.length == 1
+                                    ? 'Attachment: ${m.attachments.first.fileName}'
+                                    : '${m.attachments.length} attachments';
+                              }
+                              return t;
+                            }
+
+                            String clipBody(String s, int max) {
+                              if (s.length <= max) return s;
+                              return '${s.substring(0, max)}…';
+                            }
+
+                            var previewRaw = bodyPreview();
+                            if (previewRaw.trim().isEmpty) {
+                              previewRaw = isChangelog
+                                  ? '(empty changelog body)'
+                                  : '(empty message body)';
+                            }
+                            final preview = clipBody(previewRaw, 280);
+                            final meta =
+                                'R$i · type ${m.messageType} · ${m.messageText.length}c · ${m.attachments.length} att';
+                            final listingTypeAccent = _isDiscussionPoint(widget.expectation)
+                                ? LedgerListingAccents.topic
+                                : LedgerListingAccents.expectation;
+                            final isChangelogNewSinceVisit = isChangelog &&
+                                m.createdAt.isAfter(_changelogVisitBaselineUtc);
+                            final readStripeAlpha =
+                                theme.brightness == Brightness.dark ? 0.30 : 0.48;
+                            final bubbleFill = mine
+                                ? (isChangelog
+                                    ? scheme.primary.withValues(alpha: 0.14)
+                                    : isAttachmentChat
+                                        ? scheme.primary.withValues(alpha: 0.12)
+                                        : scheme.primary.withValues(alpha: 0.2))
+                                : (isChangelog
+                                    ? scheme.surfaceContainerHighest.withValues(alpha: 0.72)
+                                    : isAttachmentChat
+                                        ? scheme.surfaceContainerHigh.withValues(alpha: 0.55)
+                                        : scheme.tertiaryContainer.withValues(alpha: 0.88));
+                            final bubbleMeBorder = scheme.primary.withValues(alpha: 0.45);
+                            final bubbleOtherBorder =
+                                scheme.onTertiaryContainer.withValues(alpha: 0.35);
+                            final singleAttachmentOnly = !isChangelog &&
+                                m.messageText.trim().isEmpty &&
+                                m.attachments.length == 1;
+
+                            Widget bodyNode() {
+                              if (singleAttachmentOnly) {
+                                final a = m.attachments.first;
+                                return InkWell(
+                                  onTap: () => _openAttachmentUrl(a.fileUrl),
+                                  borderRadius: BorderRadius.circular(6),
                                   child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                                    child: Container(
-                                      constraints: const BoxConstraints(maxWidth: 520),
-                                      padding: const EdgeInsets.all(12),
-                                      decoration: BoxDecoration(
-                                        borderRadius: BorderRadius.circular(10),
-                                        color: mine
-                                            ? scheme.primaryContainer.withValues(alpha: 0.55)
-                                            : scheme.surfaceContainerHigh.withValues(alpha: 0.45),
-                                      ),
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                    padding: const EdgeInsets.symmetric(vertical: 2),
+                                    child: ConstrainedBox(
+                                      constraints: const BoxConstraints(maxWidth: 460),
+                                      child: Row(
                                         children: [
-                                          Text(
-                                            '${m.senderLabel} · ${_chatRelativeLabel(m.createdAt)}',
-                                            style: theme.textTheme.labelSmall?.copyWith(
-                                              color: scheme.onSurfaceVariant,
-                                            ),
+                                          Icon(
+                                            Icons.attach_file_rounded,
+                                            size: 20,
+                                            color: scheme.primary,
                                           ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            m.messageText,
-                                            style: theme.textTheme.bodyMedium,
-                                          ),
-                                          for (final a in m.attachments) ...[
-                                            const SizedBox(height: 4),
-                                            InkWell(
-                                              onTap: () => _openAttachmentUrl(a.fileUrl),
-                                              borderRadius: BorderRadius.circular(6),
-                                              child: MouseRegion(
-                                                cursor: SystemMouseCursors.click,
-                                                child: Padding(
-                                                  padding: const EdgeInsets.symmetric(
-                                                    horizontal: 2,
-                                                    vertical: 2,
-                                                  ),
-                                                  child: Text(
-                                                    a.fileName,
-                                                    style: theme.textTheme.bodySmall?.copyWith(
-                                                      color: scheme.primary,
-                                                      decoration: TextDecoration.underline,
-                                                    ),
-                                                  ),
-                                                ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              a.fileName,
+                                              textAlign: mine
+                                                  ? TextAlign.left
+                                                  : TextAlign.right,
+                                              style: theme.textTheme.bodyMedium?.copyWith(
+                                                color: scheme.primary,
+                                                decoration: TextDecoration.underline,
+                                                height: 1.35,
+                                                fontWeight: FontWeight.w500,
                                               ),
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
                                             ),
-                                          ],
+                                          ),
                                         ],
                                       ),
                                     ),
                                   ),
                                 );
-                              })(),
-                            ],
-                          ],
+                              }
+                              if (isChangelog) {
+                                return ExpectationChangelogMessageBody(
+                                  messageType: m.messageType,
+                                  messageText: m.messageText,
+                                  expectationType: widget.expectation.type,
+                                  theme: theme,
+                                  scheme: scheme,
+                                  textAlign: mine ? TextAlign.left : TextAlign.right,
+                                  compact: true,
+                                );
+                              }
+                              return SelectableText(
+                                preview,
+                                textAlign: mine ? TextAlign.left : TextAlign.right,
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: scheme.onSurface,
+                                  height: 1.35,
+                                ),
+                              );
+                            }
+
+                            final changelogStripeW =
+                                isChangelogNewSinceVisit ? 4.0 : 2.5;
+                            final conversationBubblePadding = isChangelog
+                                ? EdgeInsets.fromLTRB(
+                                    changelogStripeW + 8,
+                                    8,
+                                    8,
+                                    8,
+                                  )
+                                : const EdgeInsets.all(12);
+                            final conversationBubbleBody = Padding(
+                              padding: conversationBubblePadding,
+                              child: SizedBox(
+                                width: double.infinity,
+                                child: Column(
+                                  crossAxisAlignment: mine
+                                      ? CrossAxisAlignment.start
+                                      : CrossAxisAlignment.end,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      labelLine,
+                                      textAlign: mine
+                                          ? TextAlign.left
+                                          : TextAlign.right,
+                                      style: theme.textTheme.labelSmall?.copyWith(
+                                        color: scheme.onSurfaceVariant,
+                                        fontWeight:
+                                            isChangelog ? FontWeight.w500 : FontWeight.w600,
+                                        fontSize: isChangelog ? 11 : null,
+                                        height: isChangelog ? 1.2 : null,
+                                      ),
+                                    ),
+                                    SizedBox(height: isChangelog ? 5 : 8),
+                                    bodyNode(),
+                                    SizedBox(height: isChangelog ? 5 : 8),
+                                    Text(
+                                      meta,
+                                      textAlign: mine
+                                          ? TextAlign.left
+                                          : TextAlign.right,
+                                      style: TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: isChangelog ? 10 : 10.5,
+                                        height: 1.25,
+                                        color: scheme.onSurfaceVariant.withValues(
+                                          alpha: isChangelog ? 0.85 : 1,
+                                        ),
+                                      ),
+                                    ),
+                                    if (mine &&
+                                        expectationMessageTypeIsChatRow(
+                                            m.messageType)) ...[
+                                      const SizedBox(height: 3),
+                                      Tooltip(
+                                        message: m.readAtByCounterparty != null
+                                            ? 'Seen ${formatDisplayDateTime(m.readAtByCounterparty!, locale)}'
+                                            : 'Delivered — opens as read when the other person views this thread',
+                                        child: Icon(
+                                          m.readAtByCounterparty != null
+                                              ? Icons.done_all_rounded
+                                              : Icons.done_rounded,
+                                          size: 15,
+                                          color: m.readAtByCounterparty != null
+                                              ? scheme.primary
+                                              : scheme.onSurfaceVariant
+                                                  .withValues(alpha: 0.72),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            );
+
+                            return Padding(
+                              key: ValueKey<String>('conv-msg-${m.id}'),
+                              padding: const EdgeInsets.symmetric(horizontal: 10),
+                              child: Align(
+                                alignment: mine
+                                    ? Alignment.centerLeft
+                                    : Alignment.centerRight,
+                                child: ConstrainedBox(
+                                  constraints: BoxConstraints(
+                                    minWidth: isChangelog ? 196 : 220,
+                                    maxWidth: 520,
+                                  ),
+                                  child: isChangelog
+                                      ? ClipRRect(
+                                          borderRadius: BorderRadius.circular(10),
+                                          child: Stack(
+                                            clipBehavior: Clip.hardEdge,
+                                            children: [
+                                              Positioned.fill(
+                                                child: DecoratedBox(
+                                                  decoration: BoxDecoration(
+                                                    color: bubbleFill,
+                                                    border: Border.all(
+                                                      color: mine
+                                                          ? bubbleMeBorder
+                                                          : bubbleOtherBorder,
+                                                      width: 1.2,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                              Positioned(
+                                                left: 0,
+                                                top: 0,
+                                                bottom: 0,
+                                                width: changelogStripeW,
+                                                child: ColoredBox(
+                                                  color: isChangelogNewSinceVisit
+                                                      ? listingTypeAccent
+                                                      : listingTypeAccent.withValues(
+                                                          alpha: readStripeAlpha,
+                                                        ),
+                                                ),
+                                              ),
+                                              conversationBubbleBody,
+                                            ],
+                                          ),
+                                        )
+                                      : DecoratedBox(
+                                          decoration: BoxDecoration(
+                                            color: bubbleFill,
+                                            borderRadius: BorderRadius.circular(10),
+                                            border: Border.all(
+                                              color: mine
+                                                  ? bubbleMeBorder
+                                                  : bubbleOtherBorder,
+                                              width: 1.2,
+                                            ),
+                                          ),
+                                          child: conversationBubbleBody,
+                                        ),
+                                ),
+                              ),
+                            );
+                          },
                         )
                       : const SizedBox.shrink(),
                 ),
@@ -9075,7 +11127,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                         maxLines: 5,
                         style: theme.textTheme.bodySmall,
                         decoration: InputDecoration(
-                          hintText: 'Write a message...',
+                          hintText: 'Message (optional when attaching a file)...',
                           hintStyle: theme.textTheme.bodySmall?.copyWith(
                             color: scheme.onSurfaceVariant.withValues(alpha: 0.78),
                           ),
@@ -9134,6 +11186,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
           ),
         ],
       ),
+    ),
     );
   }
 }
