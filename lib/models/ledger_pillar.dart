@@ -38,10 +38,12 @@ extension LedgerPillarX on LedgerPillar {
         // Home uses [_HomeDashboardPanel] as the only intro; no duplicate header copy.
         LedgerPillar.home => '',
         LedgerPillar.addExpectation =>
-          'Capture an expectation. Use @mentions and #hashtags. Hit Enter to save it.',
+          'Write what you want someone to do. You must @mention who it is for '
+          '(e.g. @name or @me). Optional #tags classify it. Save as draft or send when ready.',
         LedgerPillar.addTopic =>
-          'Jot something to raise with someone later, or prep for a tagged '
-          'thread (e.g. #weeklymeeting). #hashtags and @mentions help you find it.',
+          'Note something for later. Save privately with @ for a colleague-only note, '
+          'or save publicly with # (you can @mention people in the text; they get '
+          'notified but are not the receiver).',
         LedgerPillar.expectationsMe =>
           'Expectations received from others',
         LedgerPillar.expectationsOthers =>

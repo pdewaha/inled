@@ -486,3 +486,44 @@ CREATE POLICY inled_expectation_changelog_reads_delete
     company_id IN (SELECT public.inled_user_company_ids())
     AND reader_person_id IN (SELECT public.inled_user_person_ids())
   );
+
+-- ---------------------------------------------------------------------------
+-- expectation_mentions (@people on talking points; not expectations.target_person_id)
+-- ---------------------------------------------------------------------------
+
+DROP POLICY IF EXISTS inled_expectation_mentions_select ON expectation_mentions;
+CREATE POLICY inled_expectation_mentions_select ON expectation_mentions
+  FOR SELECT
+  TO authenticated
+  USING (company_id IN (SELECT public.inled_user_company_ids()));
+
+DROP POLICY IF EXISTS inled_expectation_mentions_insert ON expectation_mentions;
+CREATE POLICY inled_expectation_mentions_insert ON expectation_mentions
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND EXISTS (
+      SELECT 1
+      FROM expectations e
+      WHERE e.id = expectation_id
+        AND e.company_id = company_id
+        AND e.writer_user_id = auth.uid()
+        AND e.expectation_type = 1
+        AND e.expectation_visibility IN (0, 1)
+    )
+  );
+
+DROP POLICY IF EXISTS inled_expectation_mentions_delete ON expectation_mentions;
+CREATE POLICY inled_expectation_mentions_delete ON expectation_mentions
+  FOR DELETE
+  TO authenticated
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    AND EXISTS (
+      SELECT 1
+      FROM expectations e
+      WHERE e.id = expectation_id
+        AND e.writer_user_id = auth.uid()
+    )
+  );

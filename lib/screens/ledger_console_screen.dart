@@ -17,6 +17,7 @@ import 'package:exled/models/expectation_status.dart';
 import 'package:exled/models/expectation_visibility.dart';
 import 'package:exled/services/expectation_activity_feed.dart';
 import 'package:exled/services/expectation_chat_changelog.dart';
+import 'package:exled/services/expectation_mentions.dart';
 import 'package:exled/supabase_config.dart';
 import 'package:exled/theme.dart';
 import 'package:exled/utils/capture_parser.dart';
@@ -50,7 +51,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// Save-action row (Home kind row / Add topic / Add expectation): Tab order field ? A ? B.
   final _composerSavePairFocusA = FocusNode(debugLabel: 'composerSaveA');
   final _composerSavePairFocusB = FocusNode(debugLabel: 'composerSaveB');
-  /// Home visibility step only ù must not reuse [_composerSavePairFocusA]/B or Flutter can
+  /// Home visibility step only ‚Äî must not reuse [_composerSavePairFocusA]/B or Flutter can
   /// keep the wrong [FilledButton] focused/visible after the kind row is shown again.
   final _homeVisSaveFocusA = FocusNode(debugLabel: 'homeVisSaveA');
   final _homeVisSaveFocusB = FocusNode(debugLabel: 'homeVisSaveB');
@@ -58,7 +59,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   Timer? _composerToastTimer;
   String? _composerToastMessage;
   /// Bumped with [_captureController] via [Listenable.merge] so the home save row rebuilds
-  /// when only [_homePendingEntry] changes ù [ValueListenableBuilder] alone can keep a stale
+  /// when only [_homePendingEntry] changes ‚Äî [ValueListenableBuilder] alone can keep a stale
   /// controller snapshot until the next text notification.
   final ValueNotifier<int> _homeComposerUiRevision = ValueNotifier<int>(0);
   late final Listenable _homeComposerSaveRowListenable;
@@ -74,7 +75,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// True while the Home Quick Capture bottom sheet is open ([_composerHasSavePairButtonsPillar]).
   bool _homeQuickCaptureSheetOpen = false;
 
-  /// Persistent left rail (not a modal drawer ù stays put when the canvas is used).
+  /// Persistent left rail (not a modal drawer ‚Äî stays put when the canvas is used).
   bool _railExpanded = true;
 
   /// Outbox: show published (echo) vs draft (shadow) expectations only.
@@ -110,6 +111,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// server snapshot still reports unread rows for that expectation (watermark can lag).
   final Set<String> _changelogBellClearedIds = {};
   final GlobalKey _activityBellAnchorKey = GlobalKey(debugLabel: 'activityBell');
+  final GlobalKey<_ExpectationDetailsPanelState> _expectationDetailsPanelKey =
+      GlobalKey(debugLabel: 'expectationDetailsPanel');
   OverlayEntry? _activityFeedOverlayEntry;
 
   bool _keyboardHookRegistered = false;
@@ -126,7 +129,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   Person? _uniqueMentionSuggestion;
   /// Shown when @query matches several handles (or @ alone); not Tab-completable until unique.
   String? _mentionDisambiguationHint;
-  /// Multiple @ handle matches ù chips under the composer.
+  /// Multiple @ handle matches ‚Äî chips under the composer.
   List<Person> _mentionInlineCandidates = [];
   List<String> _tagInlineCandidates = [];
   /// Keyboard cycle index when [_mentionInlineCandidates] or [_tagInlineCandidates] has >1 item.
@@ -145,14 +148,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   bool _tagsArchiveCollapsed = true;
   bool _colleagueArchiveCollapsed = true;
   String? _tagsSelectedTag;
+  /// Public talking-points list: filter by @handle in summary (not [Expectation.personId]).
+  String? _publicMentionFilterHandle;
   _TalkingPointsSubView _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
-  /// Private view: filter talking points @'d at this person (author-only).
-  String? _colleagueFilterPersonId;
+  /// Private view: filter talking points that @mention this handle (author-only).
+  String? _colleagueMentionFilterHandle;
   ExpectationStatus? _othersStatusFilter;
   String? _othersTagFilter;
   String? _othersPersonFilter;
   ExpectationStatus? _inboxStatusFilter;
   String? _inboxTagFilter;
+  /// @handles from [expectation_mentions] (includes leading @ stripped from summary).
+  Map<String, List<String>> _talkingPointMentionHandlesByExpectationId = {};
 
   bool _hasUnreadChat(Expectation e) {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
@@ -214,9 +221,64 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _pillar = LedgerPillar.tags;
       _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
       _tagsSelectedTag = tag.trim().toLowerCase();
-      _colleagueFilterPersonId = null;
+      _publicMentionFilterHandle = null;
+      _colleagueMentionFilterHandle = null;
     });
     _captureFocus.unfocus();
+  }
+
+  void _openPublicMentionPillar(String handle) {
+    setState(() {
+      _homePendingEntry = null;
+      _pillar = LedgerPillar.tags;
+      _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
+      _publicMentionFilterHandle = handle.trim().toLowerCase();
+      _tagsSelectedTag = null;
+      _colleagueMentionFilterHandle = null;
+    });
+    _captureFocus.unfocus();
+  }
+
+  /// Rail @ chip: open Private filtered to talking points that mention this handle.
+  void _openPrivateMentionColleagues(String handle) {
+    final needle = handle.trim().toLowerCase();
+    if (needle.isEmpty) return;
+    setState(() {
+      _homePendingEntry = null;
+      _pillar = LedgerPillar.tags;
+      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
+      _colleagueMentionFilterHandle = needle;
+      _tagsSelectedTag = null;
+      _publicMentionFilterHandle = null;
+    });
+    _captureFocus.unfocus();
+  }
+
+  /// Published (echo) talking points.
+  Iterable<Expectation> _publicEchoTalkingPoints() {
+    return _expectations.where(
+      (x) =>
+          x.type == ExpectationType.topic &&
+          x.visibility == ExpectationVisibility.echo,
+    );
+  }
+
+  bool _summaryMentionsHandle(String summary, String handleLower) {
+    if (handleLower.isEmpty) return false;
+    return extractMentionHandlesFromText(summary)
+        .map((h) => h.toLowerCase())
+        .contains(handleLower);
+  }
+
+  List<String> _talkingPointPersistedMentions(Expectation e) {
+    return _talkingPointMentionHandlesByExpectationId[e.id] ?? const [];
+  }
+
+  bool _talkingPointMentionsHandle(Expectation e, String handleLower) {
+    if (handleLower.isEmpty) return false;
+    if (_summaryMentionsHandle(e.summary, handleLower)) return true;
+    return _talkingPointPersistedMentions(e)
+        .any((h) => h.toLowerCase() == handleLower);
   }
 
   /// Outbox only: filter the current list by #tag without leaving the pillar.
@@ -226,32 +288,31 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     });
   }
 
-  /// Private (@-person) talking points (author, non-empty receiver), for cloud + filters.
-  List<_ColleagueCloudEntry> _colleagueTalkingPointCloudEntries() {
-    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-    if (currentUserId == null) return [];
-    final byPersonId = <String, int>{};
-    for (final x in _expectations) {
-      if (x.type != ExpectationType.topic) continue;
-      if (x.writerUserId != currentUserId) continue;
-      final pid = x.personId.trim();
-      if (pid.isEmpty) continue;
-      byPersonId[pid] = (byPersonId[pid] ?? 0) + 1;
+  /// @handles on your shadow talking points (Private), from summary text (all mentions).
+  List<String> _privateRailMentionHandlesFromExpectations({int max = 20}) {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return [];
+    final seen = <String>{};
+    final out = <String>[];
+    final pool = _expectations
+        .where(
+          (x) =>
+              x.type == ExpectationType.topic &&
+              x.writerUserId == uid &&
+              x.visibility == ExpectationVisibility.shadow,
+        )
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    for (final e in pool) {
+      for (final handle in talkingPointMentionHandleList(
+        summary: e.summary,
+        persistedMentionHandles: _talkingPointPersistedMentions(e),
+      )) {
+        final k = handle.toLowerCase();
+        if (seen.add(k)) out.add(handle);
+        if (out.length >= max) return out;
+      }
     }
-    final peopleById = {for (final p in _people) p.id: p};
-    final out = <_ColleagueCloudEntry>[];
-    for (final e in byPersonId.entries) {
-      final person = peopleById[e.key];
-      if (person == null) continue;
-      out.add(_ColleagueCloudEntry(person: person, count: e.value));
-    }
-    out.sort((a, b) {
-      final byCount = b.count.compareTo(a.count);
-      if (byCount != 0) return byCount;
-      return a.person.displayName
-          .toLowerCase()
-          .compareTo(b.person.displayName.toLowerCase());
-    });
     return out;
   }
 
@@ -281,9 +342,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return out;
   }
 
+  /// @handles cited on public talking points (not [target_person_id]).
+  List<String> _publicRailMentionHandlesFromExpectations({int max = 20}) {
+    final seen = <String>{};
+    final out = <String>[];
+    final pool = _publicEchoTalkingPoints().toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    for (final e in pool) {
+      for (final handle in talkingPointMentionHandleList(
+        summary: e.summary,
+        persistedMentionHandles: _talkingPointPersistedMentions(e),
+      )) {
+        final k = handle.toLowerCase();
+        if (seen.add(k)) out.add(handle);
+        if (out.length >= max) return out;
+      }
+    }
+    return out;
+  }
+
   /// #tags on echo talking points (Public), merged with [\_recentTags].
-  /// [_recentTags] is loaded from Supabase as **echo topic** rows only (see
-  /// [_loadRecentTagsFromSupabase]) so this cloud stays separate from [\_privateRailTagsFromExpectations].
+  /// [_loadRecentTagsFromSupabase]) loads echo rows without a receiver for #tags only.
   List<String> _mergedPublicRailTags({int max = 20}) {
     final seen = <String>{};
     final out = <String>[];
@@ -291,15 +370,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       final k = tag.toLowerCase();
       if (seen.add(k)) out.add(tag);
     }
-    final pool = _expectations
-        .where(
-          (x) =>
-              x.type == ExpectationType.topic &&
-              x.visibility == ExpectationVisibility.echo &&
-              x.personId.trim().isEmpty &&
-              _extractInlineTags(x.summary).isNotEmpty,
-        )
-        .toList()
+    final pool = _publicEchoTalkingPoints().toList()
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
     for (final e in pool) {
       for (final tag in _extractInlineTags(e.summary)) {
@@ -338,7 +409,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _pillar = LedgerPillar.tags;
       _talkingPointsSubView = _TalkingPointsSubView.colleagues;
       _tagsSelectedTag = tag.trim().toLowerCase();
-      _colleagueFilterPersonId = null;
+      _publicMentionFilterHandle = null;
+      _colleagueMentionFilterHandle = null;
     });
   }
 
@@ -349,21 +421,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _talkingPointsSubView = view;
       if (view == _TalkingPointsSubView.colleagues) {
         _tagsSelectedTag = null;
+        _publicMentionFilterHandle = null;
       } else {
-        _colleagueFilterPersonId = null;
+        _colleagueMentionFilterHandle = null;
+        _publicMentionFilterHandle = null;
       }
-    });
-    _captureFocus.unfocus();
-  }
-
-  /// Rail @ chip: open Private with this person selected (main page uses dropdown).
-  void _openColleaguesFilteredToPerson(String personId) {
-    setState(() {
-      _homePendingEntry = null;
-      _pillar = LedgerPillar.tags;
-      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
-      _colleagueFilterPersonId = personId;
-      _tagsSelectedTag = null;
     });
     _captureFocus.unfocus();
   }
@@ -475,7 +537,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Published ù now visible to your receiver.')),
+        const SnackBar(content: Text('Published ‚Äî now visible to your receiver.')),
       );
       await appendExpectationChangelogForSignedInUser(
         client: Supabase.instance.client,
@@ -580,8 +642,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
   }
 
-  /// Private talking-point row (Tags / colleagues): shadow ? echo only when there is
-  /// no addressee ([Expectation.personId] empty). @-linked prep stays private-only.
+  /// Private talking-point row: shadow ‚Üí echo; @mentions sync to [expectation_mentions].
   Future<void> _publishTalkingPointBrowse(Expectation expectation) async {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     if (currentUserId == null || expectation.writerUserId != currentUserId) {
@@ -593,21 +654,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
     if (expectation.visibility != ExpectationVisibility.shadow) return;
     if (expectation.type != ExpectationType.topic) return;
-    if (expectation.personId.trim().isNotEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Talking points with an @person stay private. Remove the person to publish openly.',
-          ),
-        ),
-      );
-      return;
-    }
     final now = DateTime.now().toUtc();
     try {
       await Supabase.instance.client.from('expectations').update({
         'expectation_visibility': ExpectationVisibility.echo.index,
+        'target_person_id': null,
         'published_at': now.toIso8601String(),
         'responsible_updated_at': now.toIso8601String(),
       }).eq('id', expectation.id);
@@ -620,7 +671,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             id: e.id,
             createdAt: e.createdAt,
             writerUserId: e.writerUserId,
-            personId: e.personId,
+            personId: '',
             summary: e.summary,
             deadlineLabel: e.deadlineLabel,
             deadlineAt: e.deadlineAt,
@@ -639,6 +690,44 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           );
         }
       });
+      final client = Supabase.instance.client;
+      final user = client.auth.currentUser;
+      if (user != null) {
+        final meRows = await client
+            .from('people')
+            .select('id,company_id,display_name,handle')
+            .eq('auth_user_id', user.id)
+            .limit(1);
+        if ((meRows as List).isNotEmpty) {
+          final meRow = meRows.first as Map<String, dynamic>;
+          final mentionLine = [
+            ...(_talkingPointMentionHandlesByExpectationId[expectation.id] ??
+                    const [])
+                .map((h) => '@$h'),
+            expectation.summary,
+          ].join(' ');
+          await syncTalkingPointMentions(
+            client: client,
+            companyId: meRow['company_id'] as String,
+            expectationId: expectation.id,
+            summary: mentionLine,
+            authorPersonId: meRow['id'] as String,
+            people: _people,
+            resolveMe: (_) async {
+              return Person(
+                id: meRow['id'] as String,
+                createdAt: DateTime.now().toUtc(),
+                displayName: (meRow['display_name'] as String?) ?? '',
+                handle: (meRow['handle'] as String?) ?? 'me',
+                authUserId: user.id,
+              );
+            },
+            createPlaceholder: (handle) =>
+                _createPersonFromHandleInSupabase(handle),
+          );
+        }
+      }
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Published.')),
       );
@@ -958,11 +1047,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
 
       final companyId = meRows.first['company_id'] as String;
-      // Public rail only: published talking points (echo + topic + no addressee),
-      // same constraints as [_mergedPublicRailTags] in-memory pool ù not shadow/private rows.
+      // Public rail only: published talking points (echo + topic), not shadow/private rows.
       final rows = await client
           .from('expectations')
-          .select('summary,created_at,target_person_id')
+          .select('summary,created_at')
           .eq('company_id', companyId)
           .eq('expectation_type', ExpectationType.topic.index)
           .eq('expectation_visibility', ExpectationVisibility.echo.index)
@@ -972,11 +1060,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       final seen = <String>{};
       final tags = <String>[];
       for (final row in (rows as List)) {
-        final rawTarget = row['target_person_id'];
-        final personKey = rawTarget == null
-            ? ''
-            : (rawTarget as String).trim();
-        if (personKey.isNotEmpty) continue;
         final summary = ((row['summary'] as String?) ?? '').trim();
         if (summary.isEmpty) continue;
         for (final tag in _extractInlineTags(summary)) {
@@ -1051,58 +1134,53 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           .eq('company_id', companyId)
           .order('created_at', ascending: false);
 
-      final mapped = (rows as List).map((r) {
-        final statusIdx = (r['expectation_status'] as num?)?.toInt() ?? 0;
-        final healthIdx = (r['expectation_health'] as num?)?.toInt() ?? 0;
-        final visIdx = (r['expectation_visibility'] as num?)?.toInt() ?? 0;
-        final typeIdx = (r['expectation_type'] as num?)?.toInt() ?? 0;
-        final status = _statusFromDb(statusIdx);
-        final health = _healthFromDb(healthIdx);
-        final type = _typeFromDb(typeIdx);
-        final visibility =
-            (visIdx >= 0 && visIdx < ExpectationVisibility.values.length)
-            ? ExpectationVisibility.values[visIdx]
-            : ExpectationVisibility.shadow;
-        return Expectation(
-          id: r['id'] as String,
-          createdAt: DateTime.tryParse(r['created_at'] as String? ?? '') ??
-              DateTime.now().toUtc(),
-          writerUserId: r['writer_user_id'] as String?,
-          personId: (r['target_person_id'] as String?) ?? '',
-          summary: ((r['summary'] as String?) ?? '').trim(),
-          deadlineLabel: ((r['deadline_label'] as String?) ?? 'TBD').trim(),
-          deadlineAt: DateTime.tryParse((r['deadline_at'] as String?) ?? ''),
-          finishedAt: DateTime.tryParse((r['finished_at'] as String?) ?? ''),
-          responsibleUpdatedAt: DateTime.tryParse(
-            (r['responsible_updated_at'] as String?) ?? '',
-          ),
-          publishedAt: DateTime.tryParse((r['published_at'] as String?) ?? '') ??
-              (visIdx == ExpectationVisibility.echo.index
-                  ? DateTime.tryParse(r['created_at'] as String? ?? '')
-                  : null),
-          seenAt: DateTime.tryParse((r['seen_at'] as String?) ?? ''),
-          lastChattedSenderAt: DateTime.tryParse(
-            (r['last_chatted_sender_at'] as String?) ?? '',
-          ),
-          lastChattedReceiverAt: DateTime.tryParse(
-            (r['last_chatted_receiver_at'] as String?) ?? '',
-          ),
-          updateRequestedAt: DateTime.tryParse(
-            (r['update_requested_at'] as String?) ?? '',
-          ),
-          progress: (r['progress'] as num?)?.toInt(),
-          health: health,
-          type: type,
-          status: status,
-          visibility: visibility,
+      final mapped = <Expectation>[];
+      for (final raw in rows as List) {
+        if (raw is! Map<String, dynamic>) continue;
+        final id = _dbString(raw['id']);
+        if (id.isEmpty) continue;
+        mapped.add(_mapSupabaseExpectationRow(raw));
+      }
+      final mePersonId = _dbString(meRows.first['id']);
+      List<Expectation> mentioned = const [];
+      if (mePersonId.isNotEmpty) {
+        try {
+          mentioned = await fetchExpectationsMentioningPerson(
+            client: client,
+            companyId: companyId,
+            myPersonId: mePersonId,
+            mapRow: _mapSupabaseExpectationRow,
+          );
+        } catch (_) {
+          mentioned = const [];
+        }
+      }
+      final combined = mergePartyExpectationsWithMentions(
+        party: mapped,
+        mentioned: mentioned,
+      );
+
+      final peopleById = {for (final p in _people) p.id: p};
+      Map<String, List<String>> mentionHandles = {};
+      try {
+        mentionHandles = await loadMentionHandlesByExpectationId(
+          client: client,
+          companyId: companyId,
+          expectationIds: combined
+              .where((e) => e.type == ExpectationType.topic)
+              .map((e) => e.id),
+          peopleById: peopleById,
         );
-      }).toList();
+      } catch (_) {
+        mentionHandles = {};
+      }
 
       if (!mounted) return;
       setState(() {
         _expectations
           ..clear()
-          ..addAll(mapped);
+          ..addAll(combined);
+        _talkingPointMentionHandlesByExpectationId = mentionHandles;
         _expectationsLoading = false;
         _expectationsLoadError = null;
         _ledgerCompanyId ??= companyId;
@@ -1212,16 +1290,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           return (priv, pub);
         }
         if (_homePendingEntry == _ComposerEntryMode.expectation) {
-          final e = _composerCaptureTextIsSubmittable(t) &&
-              _talkingPointLineHasPersonMention(t) &&
-              !busy;
+          final e = _expectationCaptureTextIsSubmittable(t) && !busy;
           return (e, e);
         }
         return (
           _talkingPointPrivateSubmittable(t) && !busy,
-          _composerCaptureTextIsSubmittable(t) &&
-              _talkingPointLineHasPersonMention(t) &&
-              !busy,
+          _expectationCaptureTextIsSubmittable(t) && !busy,
         );
       case LedgerPillar.addTopic:
         return (
@@ -1229,7 +1303,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           _talkingPointPublicSubmittable(t) && !busy,
         );
       case LedgerPillar.addExpectation:
-        final e = _composerCaptureTextIsSubmittable(t) && !busy;
+        final e = _expectationCaptureTextIsSubmittable(t) && !busy;
         return (e, e);
       default:
         return (false, false);
@@ -1312,6 +1386,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         !_quickCaptureModifierHeld()) {
       if (_typingInEditableText()) return false;
       if (_homeQuickCaptureSheetOpen) return true;
+      final detailsState = _expectationDetailsPanelKey.currentState;
+      if (detailsState != null) {
+        unawaited(_openQuickCaptureClosingDetailsIfNeeded(detailsState));
+        return true;
+      }
       _openHomeQuickCaptureModal();
       return true;
     }
@@ -1344,7 +1423,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
       if (_pillar == LedgerPillar.addExpectation) {
         final text = _captureController.text;
-        if (!_composerCaptureTextIsSubmittable(text) || _submitInFlight) {
+        if (!_expectationCaptureTextIsSubmittable(text) || _submitInFlight) {
           return true;
         }
         final forced =
@@ -1787,13 +1866,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               final value = _captureController.value;
               final homePending = _homePendingEntry;
               final canSaveExpectation =
-                  _composerCaptureTextIsSubmittable(value.text);
+                  _expectationCaptureTextIsSubmittable(value.text);
               final canSaveTalkingPoint =
                   _talkingPointPrivateSubmittable(value.text);
-              final hasPerson = _talkingPointLineHasPersonMention(value.text);
               final busy = _submitInFlight;
               final tpEnabled = canSaveTalkingPoint && !busy;
-              final expEnabled = canSaveExpectation && hasPerson && !busy;
+              final expEnabled = canSaveExpectation && !busy;
               final (enA, enB) = _composerSavePairButtonEnabledFlags();
 
               if (homePending == null) {
@@ -1950,6 +2028,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     );
   }
 
+  /// Close the expectation/talking-point details dialog (with unsaved prompt if needed), then Quick Capture.
+  Future<void> _openQuickCaptureClosingDetailsIfNeeded(
+    _ExpectationDetailsPanelState detailsState,
+  ) async {
+    final closed = await detailsState.tryCloseForQuickCapture();
+    if (!mounted || !closed) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_homeQuickCaptureSheetOpen) return;
+      _openHomeQuickCaptureModal();
+    });
+  }
+
   void _openHomeQuickCaptureModal() {
     if (!mounted) return;
     if (_homeQuickCaptureSheetOpen) return;
@@ -2044,19 +2135,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   String _composerCaptureHintForPillar() {
     if (_pillar == LedgerPillar.addExpectation) {
-      return 'Capture an expectation. Use @<name> (or @me) and #hashtags. '
-          'Optional deadline: end the line with +7d, +1w, or +14 days (stripped when saved). '
-          'While completing @ or #, Tab completes or cycles matches; Enter inserts. '
-          'Otherwise Tab moves between the field and the two save buttons (Shift+Tab reverse); '
-          'Enter from the field matches the highlighted save (Save as Draft while you type, '
-          'or whichever you Tab-selected last).';
+      return 'Example: @Alex please review the budget #finance ‚Äî add +7d at the end for a due date.';
     }
     if (_pillar == LedgerPillar.addTopic) {
-      return 'Talking-point line: use #hashtags for public threads, or @person for a private colleague note (no # required). '
-          'Optional deadline: +7d, +1w, or +14 days at the end (stripped when saved). '
-          'While completing @ or #, Tab completes or cycles matches; Enter inserts. '
-          'Otherwise Tab moves between the field, Save privately, and Save publicly; '
-          'Enter from the field saves privately (same as Save privately).';
+      return 'Example: #weeklymeeting notes @Sam @Alex ‚Äî or @Sam only for a private note.';
     }
     if (_pillar == LedgerPillar.home) {
       if (_homePendingEntry == _ComposerEntryMode.topic) {
@@ -2158,8 +2240,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               Padding(
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
-                  'Tab to cycle selection ù Enter to insert ù Shift+Tab reverse ù '
-                  'or click a match',
+                  'Use Tab to choose, Enter to insert, or click a match',
                   style: hintStyle,
                 ),
               ),
@@ -2228,8 +2309,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   _ComposerEntryMode? _homeEnterResolvedComposerMode(String text) {
     if (_submitInFlight) return null;
     final tpPrivate = _talkingPointPrivateSubmittable(text);
-    final expOk = _composerCaptureTextIsSubmittable(text) &&
-        _talkingPointLineHasPersonMention(text);
+    final expOk = _expectationCaptureTextIsSubmittable(text);
     final t = text.trim();
     // @-person note without # is a colleague talking point only, not an expectation.
     if (tpPrivate &&
@@ -2242,7 +2322,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return null;
   }
 
-  /// Same rules as [_submitCapture]: need @ or # and at least one word that is not only tokens.
+  /// Expectations must @mention a receiver; #tags alone are not enough.
+  bool _expectationCaptureTextIsSubmittable(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return false;
+    if (!_talkingPointLineHasPersonMention(t)) return false;
+    return _hasContentWord(t);
+  }
+
+  /// Talking points / ambiguous capture: need @ or # and real content.
   bool _composerCaptureTextIsSubmittable(String text) {
     final t = text.trim();
     if (t.isEmpty) return false;
@@ -2259,16 +2347,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return _hashTagRegex.hasMatch(t) || _talkingPointLineHasPersonMention(t);
   }
 
-  /// Talking point can be saved **publicly**: needs #, no @-person (colleague notes stay private).
+  /// Talking point can be saved **publicly**: needs at least one # ( @mentions stay in the text only).
   bool _talkingPointPublicSubmittable(String text) {
     final t = text.trim();
     if (t.isEmpty) return false;
     if (!_hashTagRegex.hasMatch(t)) return false;
-    if (_talkingPointLineHasPersonMention(t)) return false;
     return _hasContentWord(t);
   }
 
-  /// True when the line has an @mention (talking points with a person cannot publish).
+  /// True when the line has an @mention.
   bool _talkingPointLineHasPersonMention(String text) {
     return _extractMentionHandle(text.trim()) != null;
   }
@@ -2345,13 +2432,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (_submitInFlight) return;
     final text = _captureController.text.trim();
     if (text.isEmpty) return;
-    final hasTag = _atTagRegex.hasMatch(text) || _hashTagRegex.hasMatch(text);
-    if (!hasTag) {
-      _showComposerToast(
-        'Please add @XYZ to tag a person, or at least one #tag to classify the expectation.',
-      );
-      return;
-    }
     if (!_hasContentWord(text)) {
       _showComposerToast(
         'Please include at least one word besides @mentions and #tags.',
@@ -2364,6 +2444,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final isExpectationSubmitContext = _pillar == LedgerPillar.addExpectation ||
         (_pillar == LedgerPillar.home &&
             _composerMode == _ComposerEntryMode.expectation);
+    if (isExpectationSubmitContext &&
+        !_talkingPointLineHasPersonMention(text)) {
+      _showComposerToast(
+        'Expectations must @mention who they are for (e.g. @name or @me).',
+      );
+      return;
+    }
     if (isTalkingPointSubmit && !_hashTagRegex.hasMatch(text)) {
       final colleagueShadowOk =
           forcedTalkingPointVisibility == ExpectationVisibility.shadow &&
@@ -2371,18 +2458,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               _hasContentWord(text);
       if (!colleagueShadowOk) {
         _showComposerToast(
-          'Talking points need at least one #hashtag to publish, or @person for a private colleague note.',
+          'Talking points need at least one #hashtag to publish publicly, or @person for a private colleague note.',
         );
         return;
       }
     }
-    if (_pillar == LedgerPillar.home &&
-        _composerMode == _ComposerEntryMode.expectation &&
-        _extractMentionHandle(text) == null) {
-      _showComposerToast(
-        'Link someone with @name or @me before saving as an expectation.',
-      );
-      return;
+    if (!isExpectationSubmitContext && !isTalkingPointSubmit) {
+      final hasTag = _atTagRegex.hasMatch(text) || _hashTagRegex.hasMatch(text);
+      if (!hasTag) {
+        _showComposerToast(
+          'Please add @name for someone, or #tag to classify a talking point.',
+        );
+        return;
+      }
     }
     if (forcedTalkingPointVisibility != null &&
         forcedExpectationVisibility != null) {
@@ -2397,6 +2485,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _showComposerToast('Use the buttons only when capturing an expectation.');
       return;
     }
+    final openDetailsAfterQuickCapture = _homeQuickCaptureSheetOpen;
     _submitInFlight = true;
     _homeComposerUiRevision.value++;
     setState(() {});
@@ -2426,26 +2515,24 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         person = _findPersonByHandle(handle);
       }
       if (person == null) {
-        // Shadow "Save privately" may skip inviting only for **#tag-only** talking points.
-        // If the line @-mentions someone, we must resolve/create their [people] row so
-        // [target_person_id] is set (Private cloud + receiver label).
-        final draftWithoutInvite =
-            (entryType == ExpectationType.topic &&
+        // #tag-only private talking points: no @person row required.
+        final tagOnlyPrivateTalkingPointDraft =
+            entryType == ExpectationType.topic &&
                 forcedTalkingPointVisibility ==
                     ExpectationVisibility.shadow &&
-                _extractMentionHandle(text) == null) ||
-            (entryType == ExpectationType.expectation &&
-                forcedExpectationVisibility == ExpectationVisibility.shadow);
-        if (draftWithoutInvite) {
-          // Draft / personal save: no company person row or invite required.
+                !_talkingPointLineHasPersonMention(text);
+        if (tagOnlyPrivateTalkingPointDraft) {
           shouldAskSubmitMode = false;
-        } else {
+        } else if (handle != null) {
           shouldAskSubmitMode = false;
-          // Talking points @'d at someone are always private notes; no email invite flow.
-          final skipInviteForTopicMention = entryType == ExpectationType.topic &&
-              _talkingPointLineHasPersonMention(text);
+          final skipEmailInvite =
+              (entryType == ExpectationType.topic &&
+                  _talkingPointLineHasPersonMention(text)) ||
+              (entryType == ExpectationType.expectation &&
+                  forcedExpectationVisibility ==
+                      ExpectationVisibility.shadow);
           final String? email;
-          if (skipInviteForTopicMention) {
+          if (skipEmailInvite) {
             email = null;
           } else {
             email = await _askOptionalEmailForHandle(handle);
@@ -2470,25 +2557,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final trimmedLine = text.trim();
     final deadlineCmd = _stripCaptureDeadlineSuffix(trimmedLine);
     final captureBody = deadlineCmd.text;
-    final storedText = _normalizeExpectationTextForStorage(captureBody);
+    final storedText = entryType == ExpectationType.topic
+        ? _normalizeTalkingPointTextForStorage(captureBody)
+        : _normalizeExpectationTextForStorage(captureBody);
     final parse = parseCaptureLine(captureBody);
-    final topicForSomeone =
-        entryType == ExpectationType.topic && person != null;
-
     late final ExpectationVisibility visibility;
-    if (topicForSomeone) {
-      // Talking point @'d at a person: private note for the author onlyùnever
-      // surfaced to the other person (no inbox / no public talking-points feed).
-      visibility = ExpectationVisibility.shadow;
-    } else if (forcedTalkingPointVisibility != null &&
+    if (forcedTalkingPointVisibility != null &&
         entryType == ExpectationType.topic) {
-      // Explicit buttons: skip dialog (and skip the no-receiver acknowledge).
-      if (person != null &&
-          forcedTalkingPointVisibility == ExpectationVisibility.echo) {
-        visibility = ExpectationVisibility.shadow;
-      } else {
-        visibility = forcedTalkingPointVisibility;
-      }
+      // Talking points: @mentions live in summary (+ expectation_mentions when echo).
+      visibility = forcedTalkingPointVisibility;
     } else if (forcedExpectationVisibility != null &&
         entryType == ExpectationType.expectation) {
       visibility = forcedExpectationVisibility;
@@ -2507,6 +2584,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           : ExpectationVisibility.echo;
     }
 
+    final persistTarget = entryType == ExpectationType.topic ? null : person;
+
     setState(() {
       final tempExpectationId = 'exp_${DateTime.now().millisecondsSinceEpoch}';
       _homeRecent.insert(0, FeedEntry(
@@ -2514,17 +2593,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         createdAt: DateTime.now().toUtc(),
         body: captureBody,
         parse: parse,
-        linkedExpectationId: person != null ? tempExpectationId : null,
+        linkedExpectationId: persistTarget != null ? tempExpectationId : null,
         isUserCapture: true,
       ));
-      final target = person;
       _expectations.insert(
         0,
         Expectation(
           id: tempExpectationId,
           createdAt: DateTime.now().toUtc(),
           writerUserId: Supabase.instance.client.auth.currentUser?.id,
-          personId: target?.id ?? '',
+          personId: persistTarget?.id ?? '',
           summary: storedText,
           deadlineLabel:
               deadlineCmd.deadlineAt != null ? deadlineCmd.deadlineLabel : 'TBD',
@@ -2560,9 +2638,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     try {
       final persistedExpectationId = await _persistExpectationToSupabase(
         text: storedText,
+        mentionSourceText:
+            entryType == ExpectationType.topic ? captureBody : null,
         visibility: visibility,
         type: entryType,
-        target: person,
+        target: persistTarget,
         deadlineAt: deadlineCmd.deadlineAt,
         deadlineLabel: deadlineCmd.deadlineLabel,
       );
@@ -2584,6 +2664,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       await _loadExpectationsFromSupabase();
       if (mounted && entryType == ExpectationType.topic) {
         await _loadRecentTagsFromSupabase();
+      }
+      if (mounted && openDetailsAfterQuickCapture) {
+        _presentNewCaptureDetailsAfterQuickCapture(
+          expectationId: persistedExpectationId,
+          fallbackPerson: persistTarget,
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -2852,7 +2938,24 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         .hasMatch(token);
   }
 
+  /// Expectations: drop leading @receiver (stored on [target_person_id]); capitalize body.
   String _normalizeExpectationTextForStorage(String input) {
+    final trimmed = input.trim();
+    if (trimmed.isEmpty) return trimmed;
+    var normalized = trimmed.replaceFirst(_leadingMentionRegex, '').trim();
+    if (normalized.isEmpty) {
+      return trimmed;
+    }
+    final first = normalized[0];
+    final upperFirst = first.toUpperCase();
+    if (first != upperFirst) {
+      normalized = '$upperFirst${normalized.substring(1)}';
+    }
+    return normalized;
+  }
+
+  /// Talking points: strip leading @mention (stored in [expectation_mentions]); keep other @/# in body.
+  String _normalizeTalkingPointTextForStorage(String input) {
     final trimmed = input.trim();
     if (trimmed.isEmpty) return trimmed;
     var normalized = trimmed.replaceFirst(_leadingMentionRegex, '').trim();
@@ -2869,6 +2972,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   Future<String> _persistExpectationToSupabase({
     required String text,
+    String? mentionSourceText,
     required ExpectationVisibility visibility,
     required ExpectationType type,
     required Person? target,
@@ -2896,6 +3000,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final targetPersonId = (target != null && _uuidRegex.hasMatch(target.id))
         ? target.id
         : null;
+    final isPublicTalkingPoint = type == ExpectationType.topic &&
+        visibility == ExpectationVisibility.echo;
     final title = text.length > 80 ? '${text.substring(0, 80)}...' : text;
 
     final labelTrimmed = deadlineLabel.trim();
@@ -2964,7 +3070,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final kindWord = type == ExpectationType.topic ? 'talking point' : 'expectation';
     final oneLine = text.trim().replaceAll(RegExp(r'\s+'), ' ');
     final clipped =
-        oneLine.length > 160 ? '${oneLine.substring(0, 160)}ù' : oneLine;
+        oneLine.length > 160 ? '${oneLine.substring(0, 160)}‚Ä¶' : oneLine;
     try {
       await insertExpectationAppMessage(
         client: client,
@@ -2980,6 +3086,33 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         expectationWriterUserId: user.id,
       );
     } catch (_) {}
+    if (type == ExpectationType.topic) {
+      final mentionLine = (mentionSourceText ?? text).trim();
+      await syncTalkingPointMentions(
+        client: client,
+        companyId: companyId,
+        expectationId: expectationId,
+        summary: mentionLine,
+        authorPersonId: mePersonId,
+        people: _people,
+        resolveMe: (_) async {
+          return Person(
+            id: mePersonId,
+            createdAt: DateTime.now().toUtc(),
+            displayName: (meRow['display_name'] as String?) ?? '',
+            handle: (meRow['handle'] as String?) ?? 'me',
+            authUserId: user.id,
+          );
+        },
+        createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
+      );
+      if (mounted) {
+        setState(() {
+          _talkingPointMentionHandlesByExpectationId[expectationId] =
+              extractMentionHandlesFromText(mentionLine);
+        });
+      }
+    }
     if (mounted) {
       await _loadRecentTagsFromSupabase();
     }
@@ -3034,6 +3167,81 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     } finally {
       if (mounted) setState(() => _refreshInFlight = false);
     }
+  }
+
+  static String _dbString(dynamic value, {String fallback = ''}) {
+    if (value == null) return fallback;
+    if (value is String) return value;
+    return value.toString();
+  }
+
+  static String? _dbStringOrNull(dynamic value) {
+    if (value == null) return null;
+    if (value is String) return value;
+    return value.toString();
+  }
+
+  static int _dbInt(dynamic value, {int fallback = 0}) {
+    if (value == null) return fallback;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse('$value') ?? fallback;
+  }
+
+  static DateTime? _dbDateTime(dynamic value) {
+    final raw = _dbStringOrNull(value);
+    if (raw == null || raw.isEmpty) return null;
+    return DateTime.tryParse(raw)?.toUtc();
+  }
+
+  Expectation _mapSupabaseExpectationRow(Map<String, dynamic> r) {
+    final statusIdx = _dbInt(r['expectation_status']);
+    final healthIdx = _dbInt(r['expectation_health']);
+    final visIdx = _dbInt(r['expectation_visibility']);
+    final typeIdx = _dbInt(r['expectation_type']);
+    final status = _statusFromDb(statusIdx);
+    final health = _healthFromDb(healthIdx);
+    final type = _typeFromDb(typeIdx);
+    final visibility = (visIdx >= 0 && visIdx < ExpectationVisibility.values.length)
+        ? ExpectationVisibility.values[visIdx]
+        : ExpectationVisibility.shadow;
+    final createdAt = _dbDateTime(r['created_at']) ?? DateTime.now().toUtc();
+    final publishedAt = _dbDateTime(r['published_at']) ??
+        (visIdx == ExpectationVisibility.echo.index ? createdAt : null);
+    return Expectation(
+      id: _dbString(r['id']),
+      createdAt: createdAt,
+      writerUserId: _dbStringOrNull(r['writer_user_id']),
+      personId: _dbString(r['target_person_id']),
+      summary: _dbString(r['summary']).trim(),
+      deadlineLabel: _dbString(r['deadline_label'], fallback: 'TBD').trim(),
+      deadlineAt: _dbDateTime(r['deadline_at']),
+      finishedAt: _dbDateTime(r['finished_at']),
+      responsibleUpdatedAt: _dbDateTime(r['responsible_updated_at']),
+      publishedAt: publishedAt,
+      seenAt: _dbDateTime(r['seen_at']),
+      lastChattedSenderAt: _dbDateTime(r['last_chatted_sender_at']),
+      lastChattedReceiverAt: _dbDateTime(r['last_chatted_receiver_at']),
+      updateRequestedAt: _dbDateTime(r['update_requested_at']),
+      progress: r['progress'] == null ? null : _dbInt(r['progress']),
+      health: health,
+      type: type,
+      status: status,
+      visibility: visibility,
+    );
+  }
+
+  String _authorLabelForExpectation(Expectation e) {
+    final uid = e.writerUserId;
+    if (uid == null) return 'Someone';
+    for (final p in _people) {
+      if (p.authUserId == uid) {
+        final dn = p.displayName.trim();
+        if (dn.isNotEmpty) return dn;
+        return '@${p.handle}';
+      }
+    }
+    return 'Someone';
   }
 
   String? _extractMentionHandle(String input) {
@@ -3373,10 +3581,20 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       });
       return;
     }
-    final party = expectationsPartyForPerson(
+    var party = expectationsPartyForPerson(
       expectations: _expectations,
       authUserId: uid,
       myPersonId: me,
+    );
+    final mentioned = await fetchExpectationsMentioningPerson(
+      client: client,
+      companyId: companyId,
+      myPersonId: me,
+      mapRow: _mapSupabaseExpectationRow,
+    );
+    party = mergePartyExpectationsWithMentions(
+      party: party,
+      mentioned: mentioned,
     );
     try {
       final snap = await computeChangelogUnreadPartySnapshot(
@@ -3423,7 +3641,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'That item is not loaded ù pull Refresh or reopen the list.',
+            'That item is not loaded ‚Äî pull Refresh or reopen the list.',
           ),
         ),
       );
@@ -3492,10 +3710,20 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       );
       return;
     }
-    final party = expectationsPartyForPerson(
+    var party = expectationsPartyForPerson(
       expectations: _expectations,
       authUserId: uid,
       myPersonId: me,
+    );
+    final mentioned = await fetchExpectationsMentioningPerson(
+      client: client,
+      companyId: companyId,
+      myPersonId: me,
+      mapRow: _mapSupabaseExpectationRow,
+    );
+    party = mergePartyExpectationsWithMentions(
+      party: party,
+      mentioned: mentioned,
     );
     if (!mounted) return;
     final anchorContext = _activityBellAnchorKey.currentContext;
@@ -3581,10 +3809,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                         child: Text(
-                          'Updates on expectations and talking points you are related to. '
-                          'Tap a row to open it, or tap the check icon to mark that itemùs changelog as seen '
-                          '(rows for that item then leave this list). '
-                          'Hover the check icon to see Mark as read.',
+                          'Changelog and @mentions on public talking points. '
+                          'Tap a row to open; use the check to mark changelog as read.',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: scheme.onSurfaceVariant,
                           ),
@@ -3601,6 +3827,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           readerPersonId: me,
                           myPersonId: me,
                           partyExpectations: party,
+                          authorLabelForExpectation: _authorLabelForExpectation,
                           onRowTap: _handleActivityFeedRowTap,
                           onMarkExpectationRead: _markActivityExpectationChangelogRead,
                         ),
@@ -3622,6 +3849,44 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   void _scheduleChangelogUnreadSnapshotRefresh() {
     Future<void>.delayed(const Duration(milliseconds: 500), () {
       if (mounted) unawaited(_refreshActivityUnreadCount());
+    });
+  }
+
+  Expectation? _expectationById(String id) {
+    for (final e in _expectations) {
+      if (e.id == id) return e;
+    }
+    return null;
+  }
+
+  Person? _personForExpectation(Expectation e, {Person? fallback}) {
+    final pid = e.personId.trim();
+    if (pid.isNotEmpty) {
+      for (final p in _people) {
+        if (p.id == pid) return p;
+      }
+    }
+    return fallback;
+  }
+
+  /// After Quick Capture saves, close the sheet and show the new item's detail panel.
+  void _presentNewCaptureDetailsAfterQuickCapture({
+    required String expectationId,
+    Person? fallbackPerson,
+  }) {
+    if (_homeQuickCaptureSheetOpen) {
+      Navigator.of(context).maybePop();
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final e = _expectationById(expectationId);
+      if (e == null) return;
+      unawaited(
+        _openExpectationDetails(
+          e: e,
+          person: _personForExpectation(e, fallback: fallbackPerson),
+        ),
+      );
     });
   }
 
@@ -3660,8 +3925,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               maxHeight: _isDiscussionPoint(e) ? 720 : 900,
             ),
             child: _ExpectationDetailsPanel(
+              key: _expectationDetailsPanelKey,
               expectation: e,
               person: person,
+              talkingPointPersistedMentions: _isDiscussionPoint(e)
+                  ? _talkingPointPersistedMentions(e)
+                  : const [],
               canEdit: true,
               onInvitePerson: (personId) => _openInviteFlow(personId: personId),
               onChangelogReadSynced: _scheduleChangelogUnreadSnapshotRefresh,
@@ -3693,7 +3962,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           tooltip: _railExpanded ? 'Collapse sidebar' : 'Expand sidebar',
           onPressed: () => setState(() => _railExpanded = !_railExpanded),
         ),
-        title: Text(supabaseIsLeamDevHost ? 'exled ù dev' : 'exled'),
+        title: Text(supabaseIsLeamDevHost ? 'exled ¬∑ dev' : 'exled'),
         actions: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
@@ -3789,20 +4058,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 selected: _pillar,
                 recentTags: _mergedPublicRailTags(),
                 recentTagsHasMore: _recentTagsHasMore,
+                publicRailMentions: _publicRailMentionHandlesFromExpectations(),
+                onPublicRailMention: _openPublicMentionPillar,
                 privateRailTags: _privateRailTagsFromExpectations(),
                 onPrivateRailTag: _onPrivateRailTagSelect,
+                privateRailMentions: _privateRailMentionHandlesFromExpectations(),
+                onPrivateRailMention: _openPrivateMentionColleagues,
+                selectedPrivateMentionHandle: _colleagueMentionFilterHandle,
                 tagsLoading: _tagsLoading,
                 tagsLoadError: _tagsLoadError,
                 onRetryTags: () {
                   _loadRecentTagsFromSupabase();
                 },
                 talkingPointsSubView: _talkingPointsSubView,
-                colleagueCloudEntries: _colleagueTalkingPointCloudEntries(),
-                colleagueFilterPersonId: _colleagueFilterPersonId,
-                onColleagueFilterSelect: (id) {
-                  setState(() => _colleagueFilterPersonId = id);
-                },
-                onColleagueRailPersonTap: _openColleaguesFilteredToPerson,
                 footerDirectoryTitle:
                     (_companyName ?? '').trim().isNotEmpty
                         ? _companyName!.trim()
@@ -3821,7 +4089,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _pillar = p;
                     if (p == LedgerPillar.tags) {
                       _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
-                      _colleagueFilterPersonId = null;
+                      _colleagueMentionFilterHandle = null;
                     }
                     if (p == LedgerPillar.addExpectation) {
                       _composerMode = _ComposerEntryMode.expectation;
@@ -3872,12 +4140,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                           ),
                           child: _PillarHeader(pillar: _pillar, theme: theme),
                         ),
-                        SizedBox(
-                          height: (_pillar == LedgerPillar.expectationsMe ||
-                                  _pillar == LedgerPillar.expectationsOthers)
-                              ? 16
-                              : 12,
-                        ),
+                        const SizedBox(height: _kPillarHeaderTrailingGap),
                       ],
                       if (_pillar == LedgerPillar.addExpectation ||
                           _pillar == LedgerPillar.addTopic) ...[
@@ -3948,7 +4211,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             builder: (context, _) {
                               final value = _captureController.value;
                               final canSave =
-                                  _composerCaptureTextIsSubmittable(value.text);
+                                  _expectationCaptureTextIsSubmittable(
+                                value.text,
+                              );
                               final enabled = canSave && !_submitInFlight;
                               final fieldFocused = _captureFocus.hasFocus;
                               final draftEnterDefault =
@@ -4039,8 +4304,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                                 : (_pillar == LedgerPillar.expectationsMe ||
                                         _pillar ==
                                             LedgerPillar.expectationsOthers)
-                                    ? const EdgeInsets.fromLTRB(24, 4, 24, 32)
-                                    : const EdgeInsets.only(right: 12, bottom: 16),
+                                    ? const EdgeInsets.fromLTRB(24, 8, 24, 32)
+                                    : const EdgeInsets.fromLTRB(0, 4, 12, 16),
                             children: _threadChildren(
                               theme: theme,
                               scheme: scheme,
@@ -4158,6 +4423,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onDelete: () => _deleteExpectationFromList(x),
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
               composerRecentListing: true,
+              talkingPointPersistedMentions: x.type == ExpectationType.topic
+                  ? _talkingPointPersistedMentions(x)
+                  : const [],
             ),
           );
         }
@@ -4217,10 +4485,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
 
         final currentUserIdTags = Supabase.instance.client.auth.currentUser?.id;
-        // All of your private talking points (shadow topics), regardless of whether
-        // they @-mention a specific person. The rail @ cloud still only surfaces
-        // person-linked topics, but the listing itself should include general
-        // private #tag lines as well.
+        // All of your private talking points (shadow topics). The @ rail cloud
+        // surfaces people cited in the summary; the listing includes #tag-only lines too.
         final colleagueTopics = (expectations
                 .where(
                   (x) =>
@@ -4231,12 +4497,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 )
                 .toList()
               ..sort((a, b) => b.createdAt.compareTo(a.createdAt)));
-        final colleagueCloudEntries = _colleagueTalkingPointCloudEntries();
         final publicTagged = expectations.where((x) {
           if (x.visibility != ExpectationVisibility.echo) return false;
           if (x.type != ExpectationType.topic) return false;
-          if (x.personId.trim().isNotEmpty) return false;
-          return _extractInlineTags(x.summary).isNotEmpty;
+          return _extractInlineTags(x.summary).isNotEmpty ||
+              extractMentionHandlesFromText(x.summary).isNotEmpty;
         }).toList();
         final availableTags = publicTagged
             .expand((e) => _extractInlineTags(e.summary))
@@ -4272,7 +4537,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         if (_talkingPointsSubView == _TalkingPointsSubView.meetingsOrTags) {
           out.add(
             Padding(
-              padding: const EdgeInsets.only(bottom: 12),
+              padding: _listingToolbarPadding,
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
@@ -4291,6 +4556,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     onTagChanged: (v) {
                       setState(() {
                         _tagsSelectedTag = v;
+                        _publicMentionFilterHandle = null;
                         _talkingPointsSubView =
                             _TalkingPointsSubView.meetingsOrTags;
                       });
@@ -4307,7 +4573,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           if (availablePrivateTags.isNotEmpty) {
             out.add(
               Padding(
-                padding: const EdgeInsets.only(bottom: 12),
+                padding: _listingToolbarPadding,
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
@@ -4326,6 +4592,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       onTagChanged: (v) {
                         setState(() {
                           _tagsSelectedTag = v;
+                          _colleagueMentionFilterHandle = null;
                           _talkingPointsSubView =
                               _TalkingPointsSubView.colleagues;
                         });
@@ -4337,19 +4604,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               ),
             );
           }
-          final colleaguePersonIds = {
-              for (final c in colleagueCloudEntries) c.person.id,
-            };
-            final effectiveTalkingPointPerson =
-                _colleagueFilterPersonId != null &&
-                        colleaguePersonIds.contains(_colleagueFilterPersonId!)
-                    ? _colleagueFilterPersonId
-                    : null;
-            var filtered = effectiveTalkingPointPerson == null
+            final mentionFilter = _colleagueMentionFilterHandle?.trim().toLowerCase();
+            var filtered = mentionFilter != null && mentionFilter.isNotEmpty
                 ? colleagueTopics
-                : colleagueTopics
-                    .where((x) => x.personId == effectiveTalkingPointPerson)
-                    .toList();
+                    .where((x) => _talkingPointMentionsHandle(x, mentionFilter))
+                    .toList()
+                : colleagueTopics;
             if (privateTagNeedle != null) {
               filtered = filtered
                   .where(
@@ -4376,9 +4636,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             out.add(
               _ExpectationsOthersSection(
                 title: 'Active',
-                emptyText: effectiveTalkingPointPerson == null
+                emptyText: mentionFilter == null
                     ? 'No active private talking points yet.'
-                    : 'No active private talking points for this person.',
+                    : 'No active private talking points mentioning @$mentionFilter.',
                 items: activeColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -4389,7 +4649,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 onOpenDetails: (e, p) => onOpenExpectationDetails(e, p),
                 onDeleteExpectation: _deleteExpectationFromList,
                 onToggleCollapsed: () {},
+                personForItem: (_) => null,
                 talkingPointsBrowseListing: true,
+                talkingPointMentionHandlesById:
+                    _talkingPointMentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
                 onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
@@ -4398,9 +4661,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             out.add(
               _ExpectationsOthersSection(
                 title: 'Archive',
-                emptyText: effectiveTalkingPointPerson == null
+                emptyText: mentionFilter == null
                     ? 'No archived private talking points yet.'
-                    : 'No archived private talking points for this person.',
+                    : 'No archived private talking points mentioning @$mentionFilter.',
                 items: archiveColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -4415,14 +4678,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _colleagueArchiveCollapsed = !_colleagueArchiveCollapsed;
                   });
                 },
+                personForItem: (_) => null,
                 talkingPointsBrowseListing: true,
+                talkingPointMentionHandlesById:
+                    _talkingPointMentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
                 onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
             );
           break;
         }
-        // Public (#tags, echo, no @person)
+        // Public (#tags, echo)
         if (_tagsLoading) {
           out.add(const _TagsLoadingCard());
         } else if (_tagsLoadError != null) {
@@ -4436,13 +4702,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           // Public is already implied by this subview; avoid an extra "Public" heading.
           final publicTagDisplay =
               publicTagDropdownValue ?? publicTagNeedle;
-          final filtered = publicTagNeedle == null
-              ? publicTagged
-              : publicTagged.where((x) {
-                  return _extractInlineTags(x.summary)
-                      .map((t) => t.toLowerCase())
-                      .contains(publicTagNeedle);
-                }).toList();
+          final mentionFilter = _publicMentionFilterHandle;
+          final filtered = publicTagged.where((x) {
+            if (publicTagNeedle != null) {
+              return _extractInlineTags(x.summary)
+                  .map((t) => t.toLowerCase())
+                  .contains(publicTagNeedle);
+            }
+            if (mentionFilter != null && mentionFilter.isNotEmpty) {
+              return _talkingPointMentionsHandle(x, mentionFilter);
+            }
+            return true;
+          }).toList();
           final inflow = filtered
               .where((x) =>
                   x.status != ExpectationStatus.finished &&
@@ -4456,9 +4727,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
-              emptyText: publicTagNeedle == null
+              emptyText: publicTagNeedle == null && mentionFilter == null
                   ? 'No published talking points yet.'
-                  : 'No active talking points for #$publicTagDisplay.',
+                  : mentionFilter != null
+                      ? 'No active talking points mentioning @$mentionFilter.'
+                      : 'No active talking points for #$publicTagDisplay.',
               items: inflow,
               peopleById: peopleById,
               theme: theme,
@@ -4469,7 +4742,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onOpenDetails: (e, p) => _openExpectationDetails(e: e, person: p),
               onDeleteExpectation: _deleteExpectationFromList,
               onToggleCollapsed: () {},
+              personForItem: (_) => null,
               talkingPointsBrowseListing: true,
+              talkingPointMentionHandlesById:
+                  _talkingPointMentionHandlesByExpectationId,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
@@ -4478,9 +4754,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           out.add(
             _ExpectationsOthersSection(
               title: 'Archive',
-              emptyText: publicTagNeedle == null
+              emptyText: publicTagNeedle == null && mentionFilter == null
                   ? 'No archived published talking points.'
-                  : 'No archive for #$publicTagDisplay.',
+                  : mentionFilter != null
+                      ? 'No archive for @$mentionFilter.'
+                      : 'No archive for #$publicTagDisplay.',
               items: archive,
               peopleById: peopleById,
               theme: theme,
@@ -4493,7 +4771,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onToggleCollapsed: () {
                 setState(() => _tagsArchiveCollapsed = !_tagsArchiveCollapsed);
               },
+              personForItem: (_) => null,
               talkingPointsBrowseListing: true,
+              talkingPointMentionHandlesById:
+                  _talkingPointMentionHandlesByExpectationId,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
@@ -4549,7 +4830,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           }).toList();
           out.add(
             Padding(
-              padding: const EdgeInsets.only(bottom: 12),
+              padding: _listingToolbarPadding,
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
@@ -4783,7 +5064,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }).toList();
         out.add(
           Padding(
-            padding: const EdgeInsets.only(bottom: 12),
+            padding: _listingToolbarPadding,
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
@@ -5069,89 +5350,23 @@ enum _TalkingPointsSubView {
   meetingsOrTags,
 }
 
-/// One colleague with how many @-linked talking points (for cloud sizing).
-class _ColleagueCloudEntry {
-  const _ColleagueCloudEntry({required this.person, required this.count});
-  final Person person;
-  final int count;
-}
-
-/// @-handle chips for the rail (Private view uses the main dropdown; rail is quick filter).
-class _ColleagueAtNameCloud extends StatelessWidget {
-  const _ColleagueAtNameCloud({
-    required this.entries,
-    required this.selectedPersonId,
-    required this.onSelectPerson,
-    this.maxChips = 20,
-    this.onPersonTapFromRail,
-  });
-
-  final List<_ColleagueCloudEntry> entries;
-  final String? selectedPersonId;
-  final ValueChanged<String?> onSelectPerson;
-  final int maxChips;
-  final void Function(String personId)? onPersonTapFromRail;
-
-  @override
-  Widget build(BuildContext context) {
-    if (entries.isEmpty) return const SizedBox.shrink();
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final limit = maxChips.clamp(1, 1 << 20);
-    final shown = entries.take(limit).toList();
-    final more = entries.length > limit;
-    return Wrap(
-      alignment: WrapAlignment.start,
-      spacing: 6,
-      runSpacing: 6,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        for (final e in shown)
-          LedgerTagChip(
-            tag: e.person.handle,
-            tokenPrefix: '@',
-            unselectedLabelColor: LedgerListingAccents.topic,
-            selected: selectedPersonId == e.person.id,
-            selectionAccent: LedgerListingAccents.topic,
-            onPressed: () {
-              if (onPersonTapFromRail != null) {
-                onPersonTapFromRail!(e.person.id);
-              } else if (selectedPersonId == e.person.id) {
-                onSelectPerson(null);
-              } else {
-                onSelectPerson(e.person.id);
-              }
-            },
-          ),
-        if (more)
-          Text(
-            'ù',
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: scheme.onSurfaceVariant,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-      ],
-    );
-  }
-}
-
 class _PillarRail extends StatelessWidget {
   const _PillarRail({
     required this.expanded,
     required this.selected,
     required this.recentTags,
     required this.recentTagsHasMore,
+    required this.publicRailMentions,
+    required this.onPublicRailMention,
     required this.privateRailTags,
     required this.onPrivateRailTag,
+    required this.privateRailMentions,
+    required this.onPrivateRailMention,
+    required this.selectedPrivateMentionHandle,
     required this.tagsLoading,
     required this.tagsLoadError,
     required this.onRetryTags,
     required this.talkingPointsSubView,
-    required this.colleagueCloudEntries,
-    required this.colleagueFilterPersonId,
-    required this.onColleagueFilterSelect,
-    required this.onColleagueRailPersonTap,
     required this.footerDirectoryTitle,
     required this.profileName,
     required this.profileTitle,
@@ -5166,7 +5381,7 @@ class _PillarRail extends StatelessWidget {
 
   static const double _widthExpanded = 280;
   static const double _widthCollapsed = 72;
-  /// Aligns heading ù+ù with [ListTile] trailing (see Talking points tile [contentPadding]).
+  /// Aligns heading ‚Äî+‚Äî with [ListTile] trailing (see Talking points tile [contentPadding]).
   static const double _railPlusRightInset = 16;
   static const double _railPlusDiameter = 32;
   /// Trailing Invite / Logout share this width so their right edges align.
@@ -5181,16 +5396,17 @@ class _PillarRail extends StatelessWidget {
   final LedgerPillar selected;
   final List<String> recentTags;
   final bool recentTagsHasMore;
+  final List<String> publicRailMentions;
+  final ValueChanged<String> onPublicRailMention;
   final List<String> privateRailTags;
   final ValueChanged<String> onPrivateRailTag;
+  final List<String> privateRailMentions;
+  final ValueChanged<String> onPrivateRailMention;
+  final String? selectedPrivateMentionHandle;
   final bool tagsLoading;
   final String? tagsLoadError;
   final VoidCallback onRetryTags;
   final _TalkingPointsSubView talkingPointsSubView;
-  final List<_ColleagueCloudEntry> colleagueCloudEntries;
-  final String? colleagueFilterPersonId;
-  final ValueChanged<String?> onColleagueFilterSelect;
-  final ValueChanged<String> onColleagueRailPersonTap;
   /// Shown on the footer directory row (company name from DB, or "People").
   final String footerDirectoryTitle;
   final String profileName;
@@ -5207,14 +5423,25 @@ class _PillarRail extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final colleagueRailCloudChild = colleagueCloudEntries.isEmpty
+    final privateMentionRailChild = privateRailMentions.isEmpty
         ? const SizedBox.shrink()
-        : _ColleagueAtNameCloud(
-            entries: colleagueCloudEntries,
-            selectedPersonId: colleagueFilterPersonId,
-            onSelectPerson: onColleagueFilterSelect,
-            maxChips: 20,
-            onPersonTapFromRail: onColleagueRailPersonTap,
+        : Wrap(
+            alignment: WrapAlignment.start,
+            spacing: 6,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              for (final handle in privateRailMentions)
+                LedgerTagChip(
+                  tag: handle,
+                  tokenPrefix: '@',
+                  unselectedLabelColor: LedgerListingAccents.topic,
+                  selected: selectedPrivateMentionHandle ==
+                      handle.toLowerCase(),
+                  selectionAccent: LedgerListingAccents.topic,
+                  onPressed: () => onPrivateRailMention(handle),
+                ),
+            ],
           );
     final railColor = theme.drawerTheme.backgroundColor ??
         scheme.surfaceContainerLow;
@@ -5277,9 +5504,10 @@ class _PillarRail extends StatelessWidget {
                         fillColor: LedgerPillar.addTopic.captureAccent,
                       ),
                     ),
+                    const SizedBox(height: 4),
                     ListTile(
                       dense: true,
-                      contentPadding: const EdgeInsets.fromLTRB(20, 0, 12, 0),
+                      contentPadding: const EdgeInsets.fromLTRB(20, 10, 12, 6),
                       leading: Icon(
                         Icons.lock_outline,
                         size: 20,
@@ -5294,29 +5522,37 @@ class _PillarRail extends StatelessWidget {
                       onTap: () =>
                           onTalkingPointsBrowse(_TalkingPointsSubView.colleagues),
                     ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                      child: colleagueRailCloudChild,
-                    ),
-                    if (privateRailTags.isNotEmpty)
+                    if (privateRailMentions.isNotEmpty ||
+                        privateRailTags.isNotEmpty)
                       Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                        child: Wrap(
-                          spacing: 6,
-                          runSpacing: 6,
-                          crossAxisAlignment: WrapCrossAlignment.center,
+                        padding: const EdgeInsets.fromLTRB(12, 4, 12, 18),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            for (final tag in privateRailTags)
-                              LedgerTagChip(
-                                tag: tag,
-                                onPressed: () => onPrivateRailTag(tag),
+                            if (privateRailMentions.isNotEmpty)
+                              privateMentionRailChild,
+                            if (privateRailMentions.isNotEmpty &&
+                                privateRailTags.isNotEmpty)
+                              const SizedBox(height: 10),
+                            if (privateRailTags.isNotEmpty)
+                              Wrap(
+                                spacing: 6,
+                                runSpacing: 8,
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                children: [
+                                  for (final tag in privateRailTags)
+                                    LedgerTagChip(
+                                      tag: tag,
+                                      onPressed: () => onPrivateRailTag(tag),
+                                    ),
+                                ],
                               ),
                           ],
                         ),
                       ),
                     ListTile(
                       dense: true,
-                      contentPadding: const EdgeInsets.fromLTRB(20, 0, 12, 0),
+                      contentPadding: const EdgeInsets.fromLTRB(20, 8, 12, 6),
                       leading: Icon(
                         Icons.public_outlined,
                         size: 20,
@@ -5332,7 +5568,7 @@ class _PillarRail extends StatelessWidget {
                           onTalkingPointsBrowse(_TalkingPointsSubView.meetingsOrTags),
                     ),
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 14),
                       child: tagsLoading
                           ? const SizedBox(
                               height: 2,
@@ -5354,12 +5590,22 @@ class _PillarRail extends StatelessWidget {
                                 ),
                               ],
                             )
-                          : (recentTags.isNotEmpty || recentTagsHasMore)
+                          : (recentTags.isNotEmpty ||
+                              publicRailMentions.isNotEmpty ||
+                              recentTagsHasMore)
                           ? Wrap(
                               spacing: 6,
-                              runSpacing: 6,
+                              runSpacing: 8,
                               crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
+                                for (final handle in publicRailMentions)
+                                  LedgerTagChip(
+                                    tag: handle,
+                                    tokenPrefix: '@',
+                                    unselectedLabelColor:
+                                        LedgerListingAccents.topic,
+                                    onPressed: () => onPublicRailMention(handle),
+                                  ),
                                 for (final tag in recentTags)
                                   LedgerTagChip(
                                     tag: tag,
@@ -5367,7 +5613,7 @@ class _PillarRail extends StatelessWidget {
                                   ),
                                 if (recentTagsHasMore)
                                   Text(
-                                    'ù',
+                                    '‚Ä¶',
                                     style: theme.textTheme.labelSmall?.copyWith(
                                       color: scheme.onSurfaceVariant,
                                       fontWeight: FontWeight.w600,
@@ -5681,7 +5927,7 @@ class _PillarRail extends StatelessWidget {
     );
   }
 
-  /// Filled circle with ù+ù; used for Expectations and Talking points headings.
+  /// Filled circle with ‚Äî+‚Äî; used for Expectations and Talking points headings.
   Widget _railHomeCaptureCircle(
     ColorScheme scheme,
     VoidCallback onPressed, {
@@ -6098,6 +6344,7 @@ class _ChangelogActivityFeedList extends StatefulWidget {
     required this.readerPersonId,
     required this.myPersonId,
     required this.partyExpectations,
+    required this.authorLabelForExpectation,
     required this.onRowTap,
     required this.onMarkExpectationRead,
   });
@@ -6110,6 +6357,7 @@ class _ChangelogActivityFeedList extends StatefulWidget {
   final String readerPersonId;
   final String myPersonId;
   final List<Expectation> partyExpectations;
+  final String Function(Expectation expectation) authorLabelForExpectation;
   final Future<void> Function(ExpectationActivityFeedItem item) onRowTap;
   final Future<bool> Function(String expectationId) onMarkExpectationRead;
 
@@ -6130,7 +6378,7 @@ class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> 
 
   Future<void> _load() async {
     try {
-      final list = await loadChangelogActivityFeed(
+      final changelog = await loadChangelogActivityFeed(
         client: widget.client,
         companyId: widget.companyId,
         authUserId: widget.authUserId,
@@ -6138,9 +6386,19 @@ class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> 
         partyExpectations: widget.partyExpectations,
         limit: 80,
       );
+      final mentions = await loadTalkingPointMentionActivityFeed(
+        client: widget.client,
+        companyId: widget.companyId,
+        readerPersonId: widget.readerPersonId,
+        partyExpectations: widget.partyExpectations,
+        authorLabel: widget.authorLabelForExpectation,
+        limit: 40,
+      );
+      final merged = [...changelog, ...mentions]
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
       if (!mounted) return;
       setState(() {
-        _items = list;
+        _items = merged.take(80).toList();
         _loading = false;
         _error = null;
       });
@@ -6195,7 +6453,7 @@ class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> 
         final mine = item.senderPersonId == widget.myPersonId;
         final atSender = _expectationBubbleAtSenderLabel(item.senderLabel);
         final labelLine =
-            'Activity ù $atSender ù ${_chatRelativeLabel(item.createdAt)}';
+            'Activity ¬∑ $atSender ¬∑ ${_chatRelativeLabel(item.createdAt)}';
         return Padding(
           padding: EdgeInsets.only(
             bottom: i < items.length - 1 ? 10 : 0,
@@ -6289,7 +6547,7 @@ class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
           fontSize: (theme.textTheme.bodySmall?.fontSize ?? 12) - 0.5,
         );
     final displayBody = item.messageText.trim();
-    final contextPrefix = '${item.kindLabel} ù ';
+    final contextPrefix = '${item.kindLabel} ¬∑ ';
     const maxContextChars = 90;
     final snippetBudget =
         (maxContextChars - contextPrefix.length - 2).clamp(16, 120);
@@ -6499,7 +6757,7 @@ class _ActivityFeedBubbleTileState extends State<_ActivityFeedBubbleTile> {
   }
 }
 
-/// Same paint as the main title ù|ù bar ù keep tab highlights visually identical.
+/// Same paint as the main title ‚Äî|‚Äî bar ‚Äî keep tab highlights visually identical.
 Color _pillarAccentBarColor(LedgerPillar pillar, ThemeData theme) {
   var base = pillar.captureAccent;
   if (pillar == LedgerPillar.home && theme.brightness == Brightness.light) {
@@ -6507,6 +6765,12 @@ Color _pillarAccentBarColor(LedgerPillar pillar, ThemeData theme) {
   }
   return base.withValues(alpha: 0.94);
 }
+
+/// Vertical gap between [_PillarHeader] and composer / list toolbars.
+const double _kPillarHeaderTrailingGap = 20;
+
+/// Inset around filter rows and segmented controls below the pillar header.
+const EdgeInsets _listingToolbarPadding = EdgeInsets.only(top: 8, bottom: 20);
 
 class _PillarHeader extends StatelessWidget {
   const _PillarHeader({required this.pillar, required this.theme});
@@ -6519,7 +6783,7 @@ class _PillarHeader extends StatelessWidget {
     final scheme = theme.colorScheme;
     final barColor = _pillarAccentBarColor(pillar, theme);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.only(bottom: 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -6544,12 +6808,12 @@ class _PillarHeader extends StatelessWidget {
             ],
           ),
           if (pillar.description.trim().isNotEmpty) ...[
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             Text(
               pillar.description,
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: scheme.onSurfaceVariant,
-                height: 1.35,
+                height: 1.45,
               ),
             ),
           ],
@@ -6593,18 +6857,18 @@ class _PairedSaveAction extends StatelessWidget {
       style: ButtonStyle(
         visualDensity: VisualDensity.compact,
         backgroundColor: WidgetStateProperty.resolveWith((states) {
-          // 1) Disabled ù visible but clearly inactive
+          // 1) Disabled ‚Äî visible but clearly inactive
           if (!enabled) {
             return isLight
                 ? scheme.surfaceContainer
                 : scheme.surfaceContainerHighest.withValues(alpha: 0.72);
           }
-          // 4) Hover or Tab on *this* button ù strongest (clearly above Enter-default idle)
+          // 4) Hover or Tab on *this* button ‚Äî strongest (clearly above Enter-default idle)
           if (states.contains(WidgetState.focused) ||
               states.contains(WidgetState.hovered)) {
             return scheme.primary;
           }
-          // 3) Enter-default idle (e.g. Save privately while field focused): mid blue ù
+          // 3) Enter-default idle (e.g. Save privately while field focused): mid blue ‚Äî
           // stronger than secondary enabled, softer than hover/focus
           if (emphasizeAsKeyboardDefault) {
             return Color.lerp(
@@ -6746,7 +7010,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                       WidgetSpan(
                         alignment: PlaceholderAlignment.middle,
                         child: Tooltip(
-                          message: 'Open People ù your colleagues',
+                          message: 'Open People ‚Äî your colleagues',
                           child: MouseRegion(
                             cursor: SystemMouseCursors.click,
                             child: InkWell(
@@ -6758,7 +7022,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                                   vertical: 1,
                                 ),
                                 child: Text(
-                                  ' ù $company',
+                                  ' ¬∑ $company',
                                   style: theme.textTheme.bodyMedium?.copyWith(
                                     color: scheme.primary,
                                     fontWeight: FontWeight.w600,
@@ -6781,9 +7045,9 @@ class _HomeDashboardPanel extends StatelessWidget {
         ),
         const SizedBox(height: 12),
         Text(
-          'exled helps you track expectations with others and talking points for '
-          'later. Use Quick Capture in the app bar and start reliably managing '
-          'commitments and follow-ups.',
+          'Exled is a collaborative execution ledger designed to keep teams perfectly aligned'
+          'Use it to log shared expectations, track personal commitments, and capture talking points for upcoming rituals.'
+          'Use Quick Capture above to log an entry, clear up ambiguity, and keep work moving forward reliably.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: muted,
             height: 1.35,
@@ -6893,7 +7157,7 @@ class _HomeDashboardPanel extends StatelessWidget {
                         ),
                       ),
                       child: Text(
-                        'Nothing here yet ù capture from the bar, or open Inbox / Outbox.',
+                        'Nothing here yet ‚Äî capture from the bar, or open Inbox / Outbox.',
                         style: theme.textTheme.bodyMedium?.copyWith(
                           color: muted,
                           height: 1.4,
@@ -7280,7 +7544,7 @@ class _RecentCaptureTileState extends State<_RecentCaptureTile> {
         _mentionRegex.firstMatch(widget.entry.body)?.group(1)?.trim();
     final handle =
         (parseHandle?.isNotEmpty ?? false) ? parseHandle! : mentionHandle;
-    if (handle == null || handle.isEmpty) return 'General';
+    if (handle == null || handle.isEmpty) return kLedgerAllMentionLabel;
     for (final person in widget.people) {
       if (person.handle.toLowerCase() == handle.toLowerCase()) {
         return person.displayName.trim().isNotEmpty
@@ -7680,7 +7944,7 @@ bool _homeUrgentUserIsWriterOrReceiver(
   return pid == mePerson.id;
 }
 
-/// You are the addressee (including self-addressed); urgency is on your side ù Inbox rail icon.
+/// You are the addressee (including self-addressed); urgency is on your side ‚Äî Inbox rail icon.
 bool _homeUrgentNeedsMyAction(
   Expectation e,
   String? currentUserId,
@@ -7692,7 +7956,7 @@ bool _homeUrgentNeedsMyAction(
   return pid == mePerson.id;
 }
 
-/// You sent this to someone else (or no receiver yet); waiting on them / your dispatch ù Outbox.
+/// You sent this to someone else (or no receiver yet); waiting on them / your dispatch ‚Äî Outbox.
 bool _homeUrgentWaitingOnCounterparty(
   Expectation e,
   String? currentUserId,
@@ -7731,10 +7995,10 @@ String _homeUrgentRoleTooltip(
   Person? mePerson,
 ) {
   if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
-    return 'On you (Inbox): you are the receiver ù progress, reply, or resolve.';
+    return 'On you (Inbox): you are the receiver ‚Äî progress, reply, or resolve.';
   }
   if (_homeUrgentWaitingOnCounterparty(e, currentUserId, mePerson)) {
-    return 'Waiting on them (Outbox): you are the sender ù follow up with the other party.';
+    return 'Waiting on them (Outbox): you are the sender ‚Äî follow up with the other party.';
   }
   return 'Urgent item';
 }
@@ -7762,7 +8026,7 @@ String _homeUrgentTrailingLabel(Expectation e, ColorScheme scheme) {
       parts.add(_healthMeta(e.health, scheme).$1);
     }
   }
-  return parts.join(' ù ');
+  return parts.join(' ¬∑ ');
 }
 
 void _sortHomeUrgentExpectations(List<Expectation> list) {
@@ -8010,6 +8274,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
     this.inboxReceiverPersonId,
     this.onArchiveInbox,
     this.talkingPointsBrowseListing = false,
+    this.talkingPointMentionHandlesById,
     this.onArchiveTalkingPoint,
     this.onPublishTalkingPoint,
   });
@@ -8042,8 +8307,9 @@ class _ExpectationsOthersSection extends StatelessWidget {
   final Future<void> Function(Expectation expectation)? onArchiveInbox;
   /// Tags pillar (Private / Public lists): hover Archive + owner Delete.
   final bool talkingPointsBrowseListing;
+  final Map<String, List<String>>? talkingPointMentionHandlesById;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
-  /// Private shadow talking points: hover Publish (no @-addressee only) before Archive / Delete.
+  /// Private shadow talking points: hover Publish before Archive / Delete.
   final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
 
   @override
@@ -8129,6 +8395,8 @@ class _ExpectationsOthersSection extends StatelessWidget {
                   inboxReceiverPersonId: inboxReceiverPersonId,
                   onArchiveInbox: onArchiveInbox,
                   talkingPointsBrowseListing: talkingPointsBrowseListing,
+                  talkingPointPersistedMentions:
+                      talkingPointMentionHandlesById?[e.id] ?? const [],
                   onArchiveTalkingPoint: onArchiveTalkingPoint,
                   onPublishTalkingPoint: onPublishTalkingPoint,
                 );
@@ -8340,6 +8608,7 @@ class _ExpectationOthersTile extends StatefulWidget {
     this.onArchiveInbox,
     this.composerRecentListing = false,
     this.talkingPointsBrowseListing = false,
+    this.talkingPointPersistedMentions = const [],
     this.onArchiveTalkingPoint,
     this.onPublishTalkingPoint,
   });
@@ -8360,10 +8629,11 @@ class _ExpectationOthersTile extends StatefulWidget {
   final bool inboxHoverIncludeDelete;
   final String? inboxReceiverPersonId;
   final Future<void> Function(Expectation expectation)? onArchiveInbox;
-  /// Add Expectation / Add talking point ù Recent: hover Delete (no under-avatar trash).
+  /// Add Expectation / Add talking point ‚Äî Recent: hover Delete (no under-avatar trash).
   final bool composerRecentListing;
   /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
   final bool talkingPointsBrowseListing;
+  final List<String> talkingPointPersistedMentions;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
   /// Shadow talking points only: publish to echo when [Expectation.personId] is empty (no @-addressee).
   final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
@@ -8417,11 +8687,20 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   @override
   Widget build(BuildContext context) {
     final locale = Localizations.localeOf(context);
-    final baseWho = widget.person?.displayName ??
-        (widget.expectation.personId.trim().isEmpty
-            ? 'General'
-            : widget.expectation.personId);
-    final who = ledgerAtMentionLine(baseWho);
+    final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
+    final baseWho = isDiscussionPoint
+        ? talkingPointMentionWhoLabel(
+            widget.expectation.summary,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
+          )
+        : expectationReceiverWhoLabel(
+            summary: widget.expectation.summary,
+            personDisplayName: widget.person?.displayName,
+            personHandle: widget.person?.handle,
+            personId: widget.expectation.personId,
+          );
+    final who =
+        isDiscussionPoint ? baseWho : ledgerAtMentionLine(baseWho);
     final initials = ledgerPersonInitialLetter(who);
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
@@ -8430,10 +8709,8 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
     final tags = _extractInlineTags(widget.expectation.summary);
     final (healthLabel, healthColor) =
         _healthMeta(widget.expectation.health, widget.scheme);
-    final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
-    final colorPrivateTalkingSummaryTokens = widget.talkingPointsBrowseListing &&
-        isDiscussionPoint &&
-        widget.expectation.visibility == ExpectationVisibility.shadow;
+    final colorTalkingSummaryTokens =
+        widget.talkingPointsBrowseListing && isDiscussionPoint;
     final showWarningIndicator =
         !isDiscussionPoint &&
         (widget.expectation.health == ExpectationHealth.unknown ||
@@ -8498,8 +8775,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         isWriter &&
         !isTerminalTpBrowse &&
         widget.expectation.visibility == ExpectationVisibility.shadow &&
-        isDiscussionPoint &&
-        widget.expectation.personId.trim().isEmpty;
+        isDiscussionPoint;
     final showTalkingPointsBrowseHoverBar = widget.talkingPointsBrowseListing &&
         _hoverTalkingPointsBrowseRow &&
         (canTpBrowsePublish || canTpBrowseArchive || canDelete);
@@ -8596,7 +8872,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                         LayoutBuilder(
                           builder: (context, constraints) {
                             final richSummary = summaryStyle != null &&
-                                    colorPrivateTalkingSummaryTokens
+                                    colorTalkingSummaryTokens
                                 ? _richPrivateTalkingSummarySpan(
                                     summary: widget.expectation.summary,
                                     baseStyle: summaryStyle,
@@ -9313,8 +9589,10 @@ enum _UnsavedDetailsCloseChoice { keepEditing, discard, save }
 
 class _ExpectationDetailsPanel extends StatefulWidget {
   const _ExpectationDetailsPanel({
+    super.key,
     required this.expectation,
     required this.person,
+    this.talkingPointPersistedMentions = const [],
     required this.canEdit,
     this.onInvitePerson,
     this.onChangelogReadSynced,
@@ -9323,6 +9601,7 @@ class _ExpectationDetailsPanel extends StatefulWidget {
 
   final Expectation expectation;
   final Person? person;
+  final List<String> talkingPointPersistedMentions;
   final bool canEdit;
   final Future<void> Function(String? personId)? onInvitePerson;
   final VoidCallback? onChangelogReadSynced;
@@ -9369,7 +9648,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
 
   /// Changelog bubbles compare [DateTime.isAfter] against this UTC instant:
   /// - On first load we seed from `expectation_changelog_reads.last_read_at` (your stored read
-  ///   cursor). A **brighter / wider** left stripe means that row was still ùunreadù vs that
+  ///   cursor). A **brighter / wider** left stripe means that row was still ‚Äîunread‚Äî vs that
   ///   cursor (same idea as the activity bell).
   /// - After a successful [syncExpectationChangelogReadWatermark], we advance this to the latest
   ///   changelog `created_at` in the loaded thread so **opening details counts as reading**
@@ -9442,14 +9721,21 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   bool get _canPopDetailsWithoutPrompt =>
       !_saving && !_deleting && (!widget.canEdit || !_dirty);
 
-  Future<void> _attemptCloseDetails() async {
-    if (!mounted) return;
-    if (_saving || _deleting) return;
+  /// Returns true when the details route was dismissed (or user chose discard/save).
+  Future<bool> tryCloseForQuickCapture() async {
+    if (!mounted) return false;
+    if (_saving || _deleting) return false;
     if (_canPopDetailsWithoutPrompt) {
       Navigator.of(context).pop(_hasSavedChanges);
-      return;
+      return true;
     }
     await _confirmUnsavedThenMaybeCloseDetails();
+    if (!mounted) return true;
+    return false;
+  }
+
+  Future<void> _attemptCloseDetails() async {
+    await tryCloseForQuickCapture();
   }
 
   Future<void> _confirmUnsavedThenMaybeCloseDetails() async {
@@ -9807,7 +10093,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Update requested ù your counterparty was notified.'),
+          content: Text('Update requested ‚Äî your counterparty was notified.'),
         ),
       );
     } catch (e) {
@@ -10043,7 +10329,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
             }
           }
         } on PostgrestException {
-          // Reads table / policy not deployed ù keep epoch baseline.
+          // Reads table / policy not deployed ‚Äî keep epoch baseline.
         }
         _changelogVisitBaselineCaptured = true;
       }
@@ -10471,6 +10757,15 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                 ),
                               ],
                             ],
+                          ),
+                        )
+                      else if (isDiscussionPoint)
+                        _DetailRow(
+                          label: 'To',
+                          value: talkingPointMentionWhoLabel(
+                            widget.expectation.summary,
+                            persistedMentionHandles:
+                                widget.talkingPointPersistedMentions,
                           ),
                         ),
                       if (widget.expectation.seenAt != null)
@@ -10953,10 +11248,10 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                     m.attachments.isNotEmpty);
                             final atSender = _bubbleAtSenderLabel(m.senderLabel);
                             final labelLine = isChangelog
-                                ? 'Activity ù $atSender ù ${_chatRelativeLabel(m.createdAt)}'
+                                ? 'Activity ¬∑ $atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}'
                                 : isAttachmentChat
-                                    ? 'Attachment ù $atSender ù ${_chatRelativeLabel(m.createdAt)}'
-                                    : '$atSender ù ${_chatRelativeLabel(m.createdAt)}';
+                                    ? 'Attachment ¬∑ $atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}'
+                                    : '$atSender ¬∑ ${_chatRelativeLabel(m.createdAt)}';
                             String bodyPreview() {
                               if (isChangelog) {
                                 return expectationChangelogActivityFeedLine(
@@ -10979,7 +11274,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
 
                             String clipBody(String s, int max) {
                               if (s.length <= max) return s;
-                              return '${s.substring(0, max)}ù';
+                              return '${s.substring(0, max)}‚Ä¶';
                             }
 
                             var previewRaw = bodyPreview();
@@ -10989,8 +11284,6 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                   : '(empty message body)';
                             }
                             final preview = clipBody(previewRaw, 280);
-                            final meta =
-                                'R$i ù type ${m.messageType} ù ${m.messageText.length}c ù ${m.attachments.length} att';
                             final listingTypeAccent = _isDiscussionPoint(widget.expectation)
                                 ? LedgerListingAccents.topic
                                 : LedgerListingAccents.expectation;
@@ -11112,21 +11405,6 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                     ),
                                     SizedBox(height: isChangelog ? 5 : 8),
                                     bodyNode(),
-                                    SizedBox(height: isChangelog ? 5 : 8),
-                                    Text(
-                                      meta,
-                                      textAlign: mine
-                                          ? TextAlign.left
-                                          : TextAlign.right,
-                                      style: TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: isChangelog ? 10 : 10.5,
-                                        height: 1.25,
-                                        color: scheme.onSurfaceVariant.withValues(
-                                          alpha: isChangelog ? 0.85 : 1,
-                                        ),
-                                      ),
-                                    ),
                                     if (mine &&
                                         expectationMessageTypeIsChatRow(
                                             m.messageType)) ...[
@@ -11134,7 +11412,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                       Tooltip(
                                         message: m.readAtByCounterparty != null
                                             ? 'Seen ${formatDisplayDateTime(m.readAtByCounterparty!, locale)}'
-                                            : 'Delivered ù opens as read when the other person views this thread',
+                                            : 'Delivered ‚Äî opens as read when the other person views this thread',
                                         child: Icon(
                                           m.readAtByCounterparty != null
                                               ? Icons.done_all_rounded

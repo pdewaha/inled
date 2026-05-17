@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:exled/supabase_config.dart';
 import 'package:exled/theme.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -229,9 +231,18 @@ class _LoginOtpDialogState extends State<_LoginOtpDialog> {
         lower.contains('network') ||
         lower.contains('connection') ||
         lower.contains('cors')) {
+      final host = Uri.tryParse(supabaseUrl)?.host ?? supabaseUrl;
+      if (kIsWeb) {
+        return 'Could not $action due to a network/CORS issue.\n'
+            'This app is calling $host from the browser. On localhost, that '
+            'server must allow your page origin (e.g. http://localhost:8080) in '
+            'Supabase Auth URL settings and API gateway CORS.\n'
+            'Or run on Windows desktop (`flutter run -d windows`), or use '
+            '`--dart-define=SUPABASE_URL=...` for another backend.\n'
+            'Details: $raw';
+      }
       return 'Could not $action due to a network/CORS issue.\n'
-          'Please verify the Supabase URL is reachable from the browser and '
-          'that auth endpoints allow this app origin.\n'
+          'Please verify $host is reachable and auth endpoints allow this app.\n'
           'Details: $raw';
     }
     if (lower.contains('smtp') ||

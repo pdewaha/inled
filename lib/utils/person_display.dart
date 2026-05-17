@@ -1,11 +1,17 @@
+/// Label when an item has no single receiver and no @mentions in the text.
+const String kLedgerAllMentionLabel = '@All';
+
 /// Ledger UI: show people with a leading `@` when presenting a line label.
 ///
-/// Does not prefix [generalLabel] (default `'General'`). Idempotent if [raw]
-/// already starts with `@`.
-String ledgerAtMentionLine(String raw, {String generalLabel = 'General'}) {
+/// Does not prefix [allMentionLabel] (default [kLedgerAllMentionLabel]). Idempotent
+/// if [raw] already starts with `@`.
+String ledgerAtMentionLine(
+  String raw, {
+  String allMentionLabel = kLedgerAllMentionLabel,
+}) {
   final t = raw.trim();
-  if (t.isEmpty) return generalLabel;
-  if (t == generalLabel) return generalLabel;
+  if (t.isEmpty) return allMentionLabel;
+  if (t == allMentionLabel) return allMentionLabel;
   if (t.startsWith('@')) return t;
   return '@$t';
 }
@@ -13,7 +19,7 @@ String ledgerAtMentionLine(String raw, {String generalLabel = 'General'}) {
 /// First letter for [CircleAvatar], skipping a leading `@` from [ledgerAtMentionLine].
 String ledgerPersonInitialLetter(String labeledLine) {
   final t = labeledLine.trim();
-  if (t.isEmpty || t == 'General') return '?';
+  if (t.isEmpty) return '?';
   final from = t.startsWith('@') && t.length > 1 ? t.substring(1) : t;
   final s = from.trim();
   if (s.isEmpty) return '?';
