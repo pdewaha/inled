@@ -1,10 +1,17 @@
-// Activity email outbox → SMTP. Single file, no external imports (self-hosted).
-// Env on **functions** container: SMTP_*, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, EXLED_APP_URL
+// SMTP via Nodemailer — dynamic import() so worker boot does not block on npm.
+// First send may take a while while registry.npmjs.org is reached.
 // Deploy: volumes/functions/send-activity-email/index.ts  (+ chmod 755 on the folder)
-// Health: GET .../send-activity-email?health=1
+// Health: GET .../send-activity-email?health=1&diagnose=1
+// Logs: docker compose logs -f functions | grep send-activity-email-trace
 
-// --- smtp_native (inlined) ---
-type NativeSmtpConfig = {
+type NodemailerLike = {
+  createTransport: (opts: Record<string, unknown>) => {
+    sendMail: (opts: Record<string, unknown>) => Promise<unknown>;
+    close: (cb: () => void) => void;
+  };
+};
+
+type SmtpConfig = {
   host: string;
   port: number;
   secure: boolean;
@@ -13,11 +20,44 @@ type NativeSmtpConfig = {
   from: string;
 };
 
-const smtpEnc = new TextEncoder();
-const smtpDec = new TextDecoder();
-const SMTP_CONNECT_MS = 15000;
-const SMTP_READ_MS = 45000;
 const SMTP_TOTAL_MS = 90000;
+
+/** One-line JSON for log pipelines. Never logs passwords. */
+function trace(event: string, data?: Record<string, unknown>) {
+  console.log(
+    JSON.stringify({
+      svc: "send-activity-email-trace",
+      event,
+      ts: new Date().toISOString(),
+      ...(data ?? {}),
+    }),
+  );
+}
+
+function smtpDiag(cfg: SmtpConfig) {
+  return {
+    smtpHost: cfg.host,
+    smtpPort: cfg.port,
+    smtpSecure: cfg.secure,
+    smtpAuthUser: cfg.user,
+    mailFrom: cfg.from,
+    passwordLen: cfg.pass.length,
+  };
+}
+
+let nodemailerPromise: Promise<NodemailerLike> | null = null;
+
+async function loadNodemailer(): Promise<NodemailerLike> {
+  if (!nodemailerPromise) {
+    nodemailerPromise = (async () => {
+      trace("nodemailer_fetch_start", {});
+      const mod = await import("npm:nodemailer@6.9.16");
+      trace("nodemailer_fetch_ok", {});
+      return mod.default as NodemailerLike;
+    })();
+  }
+  return nodemailerPromise;
+}
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -31,226 +71,93 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   ]);
 }
 
-function smtpLines(out: string): string[] {
-  return out.split(/\r?\n/).filter((l) => l.length > 0);
-}
-
-/** True when the buffer contains a full SMTP response (e.g. 220 … or 250 …). */
-function smtpReplyComplete(out: string): boolean {
-  const lines = smtpLines(out);
-  if (lines.length === 0) return false;
-  const last = lines[lines.length - 1]!;
-  if (!/^\d{3}[- ]/.test(last)) return false;
-  const code = last.slice(0, 3);
-  return !lines.some((l) => l.startsWith(`${code}-`));
-}
-
-async function smtpReadReply(
-  conn: Deno.Conn,
-  timeoutMs = SMTP_READ_MS,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  const buf = new Uint8Array(8192);
-  let out = "";
-  while (true) {
-    if (smtpReplyComplete(out)) return out;
-
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      const preview = out.length > 0
-        ? out.replace(/\r?\n/g, " ").slice(0, 160)
-        : "(no bytes from server — wrong port/TLS?)";
-      throw new Error(`SMTP read timed out after ${timeoutMs}ms; got: ${preview}`);
-    }
-
-    let n: number | null;
-    try {
-      n = await withTimeout(conn.read(buf), remaining, "SMTP read");
-    } catch (e) {
+/** Nodemailer close() can hang on some runtimes; never block HTTP on it. */
+async function closeSmtpTransport(
+  transporter: { close: (cb: () => void) => void },
+  deadlineMs: number,
+): Promise<void> {
+  let done = false;
+  await Promise.race([
+    new Promise<void>((resolve) => {
       try {
-        conn.close();
+        transporter.close(() => {
+          if (!done) {
+            done = true;
+            resolve();
+          }
+        });
       } catch {
-        // ignore
+        if (!done) {
+          done = true;
+          resolve();
+        }
       }
-      throw e;
-    }
-
-    if (n === null) continue;
-    if (n === 0) {
-      if (smtpReplyComplete(out)) return out;
-      throw new Error("SMTP connection closed before a complete reply");
-    }
-    out += smtpDec.decode(buf.subarray(0, n));
-  }
+    }),
+    new Promise<void>((resolve) => {
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          trace("smtp_close_deadline", { ms: deadlineMs });
+          resolve();
+        }
+      }, deadlineMs);
+    }),
+  ]);
 }
 
-function smtpExpectCode(reply: string, codes: string[]): void {
-  const line = smtpLines(reply).find((l) => /^\d{3}[- ]/.test(l)) ?? "";
-  const code = line.slice(0, 3);
-  if (!codes.includes(code)) {
-    throw new Error(`SMTP unexpected reply ${code}: ${line}`);
-  }
-}
+async function sendSmtpMail(
+  cfg: SmtpConfig,
+  to: string,
+  subject: string,
+  text: string,
+  html: string,
+): Promise<void> {
+  trace("smtp_send_begin", {
+    to,
+    subjectLen: subject.length,
+    ...smtpDiag(cfg),
+  });
+  const nodemailer = await loadNodemailer();
+  const transporter = nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure: cfg.secure,
+    auth: { user: cfg.user, pass: cfg.pass },
+    pool: false,
+    maxConnections: 1,
+    connectionTimeout: 15000,
+    greetingTimeout: 45000,
+    socketTimeout: 90000,
+    requireTLS: !cfg.secure && cfg.port !== 465,
+    tls: { minVersion: "TLSv1.2" as const },
+  });
+  trace("smtp_transport_created", { host: cfg.host, port: cfg.port });
 
-async function smtpWriteLine(conn: Deno.Conn, line: string): Promise<string> {
-  await conn.write(smtpEnc.encode(`${line}\r\n`));
-  return await smtpReadReply(conn);
-}
-
-function smtpB64(s: string): string {
-  return btoa(s);
-}
-
-function smtpExtractAddr(from: string): string {
-  const m = from.match(/<([^>]+)>/);
-  return (m?.[1] ?? from).trim();
-}
-
-function smtpEncodeSubject(subject: string): string {
-  if (/^[\x20-\x7E]*$/.test(subject)) return subject;
-  return `=?UTF-8?B?${btoa(subject)}?=`;
-}
-
-/** Client hostname for EHLO (not the SMTP server hostname). */
-function smtpEhloName(cfg: NativeSmtpConfig): string {
-  const explicit = envFirst("SMTP_EHLO_NAME");
-  if (explicit) {
-    return explicit.replace(/[^a-zA-Z0-9.-]/g, "").slice(0, 255) || "localhost";
-  }
-  const appUrl = Deno.env.get("EXLED_APP_URL");
-  if (appUrl) {
-    try {
-      const host = new URL(appUrl).hostname;
-      if (host) return host;
-    } catch {
-      // ignore
-    }
-  }
-  const addr = smtpExtractAddr(cfg.user) || smtpExtractAddr(cfg.from);
-  const domain = addr.includes("@") ? addr.split("@")[1]! : "";
-  if (domain) return domain;
-  return "localhost";
-}
-
-async function smtpConnect(cfg: NativeSmtpConfig): Promise<Deno.Conn> {
-  console.log(`[smtp] connect ${cfg.host}:${cfg.port} secure=${cfg.secure}`);
   try {
-    const connectPromise = (cfg.secure || cfg.port === 465)
-      ? Deno.connectTls({ hostname: cfg.host, port: cfg.port })
-      : Deno.connect({ hostname: cfg.host, port: cfg.port });
-    const conn = await withTimeout(connectPromise, SMTP_CONNECT_MS, "SMTP connect");
-    console.log("[smtp] TCP connected");
-    return conn;
+    const info = await withTimeout(
+      transporter.sendMail({
+        from: cfg.from,
+        to,
+        subject,
+        text,
+        html,
+      }) as Promise<{ messageId?: string; response?: string }>,
+      SMTP_TOTAL_MS,
+      "SMTP sendMail",
+    );
+    trace("smtp_send_ok", {
+      messageId: info.messageId ?? null,
+      responsePreview: (info.response ?? "").slice(0, 240),
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error(`[smtp] connect failed: ${msg}`);
-    throw new Error(
-      `Cannot reach SMTP ${cfg.host}:${cfg.port} from functions container (${msg}). ` +
-        "Check SMTP_* env matches GoTrue, outbound port 587, and dns: [8.8.8.8] on the functions service.",
-    );
-  }
-}
-
-async function sendNativeSmtpInner(
-  cfg: NativeSmtpConfig,
-  to: string,
-  subject: string,
-  text: string,
-  html: string,
-): Promise<void> {
-  let conn = await smtpConnect(cfg);
-
-  try {
-    let reply = await smtpReadReply(conn);
-    smtpExpectCode(reply, ["220"]);
-    console.log("[smtp] banner OK");
-
-    const ehlo = smtpEhloName(cfg);
-    console.log(`[smtp] EHLO ${ehlo}`);
-    reply = await smtpWriteLine(conn, `EHLO ${ehlo}`);
-    smtpExpectCode(reply, ["250"]);
-    console.log("[smtp] EHLO OK");
-
-    if (!cfg.secure && cfg.port !== 465) {
-      console.log("[smtp] STARTTLS");
-      reply = await smtpWriteLine(conn, "STARTTLS");
-      smtpExpectCode(reply, ["220"]);
-      conn = await withTimeout(
-        Deno.startTls(conn, { hostname: cfg.host }),
-        SMTP_CONNECT_MS,
-        "SMTP STARTTLS",
-      );
-      console.log("[smtp] STARTTLS OK");
-      reply = await smtpWriteLine(conn, `EHLO ${ehlo}`);
-      smtpExpectCode(reply, ["250"]);
-    }
-
-    console.log("[smtp] AUTH");
-    reply = await smtpWriteLine(conn, "AUTH LOGIN");
-    smtpExpectCode(reply, ["334"]);
-    reply = await smtpWriteLine(conn, smtpB64(cfg.user));
-    smtpExpectCode(reply, ["334"]);
-    reply = await smtpWriteLine(conn, smtpB64(cfg.pass));
-    smtpExpectCode(reply, ["235"]);
-
-    reply = await smtpWriteLine(conn, `MAIL FROM:<${smtpExtractAddr(cfg.from)}>`);
-    smtpExpectCode(reply, ["250"]);
-    reply = await smtpWriteLine(conn, `RCPT TO:<${to}>`);
-    smtpExpectCode(reply, ["250", "251"]);
-
-    console.log("[smtp] DATA");
-    reply = await smtpWriteLine(conn, "DATA");
-    smtpExpectCode(reply, ["354"]);
-
-    const boundary = `exled_${Date.now()}`;
-    const body = [
-      `From: ${cfg.from}`,
-      `To: ${to}`,
-      `Subject: ${smtpEncodeSubject(subject)}`,
-      "MIME-Version: 1.0",
-      `Content-Type: multipart/alternative; boundary="${boundary}"`,
-      "",
-      `--${boundary}`,
-      "Content-Type: text/plain; charset=utf-8",
-      "",
-      text,
-      "",
-      `--${boundary}`,
-      "Content-Type: text/html; charset=utf-8",
-      "",
-      html,
-      "",
-      `--${boundary}--`,
-      ".",
-    ].join("\r\n");
-
-    await conn.write(smtpEnc.encode(`${body}\r\n`));
-    reply = await smtpReadReply(conn);
-    smtpExpectCode(reply, ["250"]);
-    console.log("[smtp] sent OK");
-
-    await smtpWriteLine(conn, "QUIT");
+    trace("smtp_send_error", { error: msg.slice(0, 500) });
+    throw e;
   } finally {
-    try {
-      conn.close();
-    } catch {
-      // ignore
-    }
+    // Do not combine with sendMail inside one withTimeout: close() may never
+    // call back after 250 Ok, so the handler would idle until SMTP_TOTAL_MS.
+    await closeSmtpTransport(transporter, 1000);
   }
-}
-
-async function sendNativeSmtp(
-  cfg: NativeSmtpConfig,
-  to: string,
-  subject: string,
-  text: string,
-  html: string,
-): Promise<void> {
-  await withTimeout(
-    sendNativeSmtpInner(cfg, to, subject, text, html),
-    SMTP_TOTAL_MS,
-    "SMTP",
-  );
 }
 
 // --- main ---
@@ -281,6 +188,104 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** Read body once; do not swallow parse errors (old code turned them into `{}` → misleading 400). */
+async function parseRequestJsonBody(
+  req: Request,
+): Promise<
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response }
+> {
+  const contentType = req.headers.get("content-type") ?? "";
+  let text: string;
+  try {
+    text = await req.text();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    trace("http_body_read_error", { error: msg.slice(0, 200) });
+    return {
+      ok: false,
+      response: jsonResponse({ error: "Could not read request body" }, 400),
+    };
+  }
+  trace("http_body_in", {
+    byteLen: text.length,
+    contentType: contentType.slice(0, 120),
+  });
+  let trimmed = text.trim();
+  // Common paste: -d '{"test_email":"..."}##' with ## inside the quoted payload.
+  if (trimmed.endsWith("#")) {
+    const withoutHash = trimmed.replace(/#+$/, "").trim();
+    if (withoutHash !== trimmed) {
+      trace("http_body_stripped_trailing_hash", {
+        beforeLen: trimmed.length,
+        afterLen: withoutHash.length,
+      });
+      trimmed = withoutHash;
+    }
+  }
+  if (!trimmed) {
+    return {
+      ok: false,
+      response: jsonResponse(
+        {
+          error: "Empty request body",
+          hint: 'POST JSON like {"test_email":"you@example.com"}',
+        },
+        400,
+      ),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    trace("http_body_json_error", {
+      message: msg.slice(0, 200),
+      byteLen: trimmed.length,
+      tailPreview: trimmed.slice(-12),
+    });
+    return {
+      ok: false,
+      response: jsonResponse(
+        {
+          error: "Invalid JSON body",
+          detail: msg.slice(0, 200),
+          byteLen: trimmed.length,
+          tailPreview: trimmed.slice(-12),
+          hint:
+            'Body must be only JSON, e.g. {"test_email":"you@example.com"} — no ## or shell comment after the closing brace.',
+        },
+        400,
+      ),
+    };
+  }
+  if (parsed !== null && typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      /* leave as string; will fail object check below */
+    }
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed)
+  ) {
+    return {
+      ok: false,
+      response: jsonResponse(
+        {
+          error: "JSON body must be one object {...}, not an array or primitive",
+          got: parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed,
+        },
+        400,
+      ),
+    };
+  }
+  return { ok: true, body: parsed as Record<string, unknown> };
+}
+
 function envFirst(...keys: string[]): string | undefined {
   for (const k of keys) {
     const v = Deno.env.get(k)?.trim();
@@ -289,7 +294,31 @@ function envFirst(...keys: string[]): string | undefined {
   return undefined;
 }
 
-function readSmtpConfig(): NativeSmtpConfig | { error: string } {
+/** Build RFC From header; if SMTP_FROM has no @, treat as display name and use SMTP_USERNAME. */
+function buildSmtpFromHeader(
+  senderName: string | undefined,
+  fromRaw: string | undefined,
+  smtpUser: string,
+): string {
+  const nameOpt = senderName?.trim();
+  if (!fromRaw?.trim()) {
+    return nameOpt ? `${nameOpt} <${smtpUser}>` : smtpUser;
+  }
+  const f = fromRaw.trim();
+  // Already "Display Name <email@host>"
+  if (f.includes("<") && f.includes(">") && f.includes("@")) {
+    return f;
+  }
+  // Bare email
+  if (f.includes("@")) {
+    return nameOpt ? `${nameOpt} <${f}>` : f;
+  }
+  // Label only (e.g. SMTP_FROM=ExLed) — same idea as GoTrue admin email + display name
+  const display = nameOpt || f;
+  return `${display} <${smtpUser}>`;
+}
+
+function readSmtpConfig(): SmtpConfig | { error: string } {
   const host = envFirst("SMTP_HOSTNAME", "SMTP_HOST", "GOTRUE_SMTP_HOST");
   const portRaw = envFirst("SMTP_PORT", "GOTRUE_SMTP_PORT") ?? "587";
   const port = Number(portRaw);
@@ -298,20 +327,33 @@ function readSmtpConfig(): NativeSmtpConfig | { error: string } {
   const secure = secureRaw === "true" || secureRaw === "1" || port === 465;
   const user = envFirst("SMTP_USERNAME", "SMTP_USER", "GOTRUE_SMTP_USER");
   const pass = envFirst("SMTP_PASSWORD", "SMTP_PASS", "GOTRUE_SMTP_PASS");
-  const from = envFirst("SMTP_FROM", "SMTP_ADMIN_EMAIL", "GOTRUE_SMTP_ADMIN_EMAIL");
+  const fromRaw = envFirst("SMTP_FROM", "SMTP_ADMIN_EMAIL", "GOTRUE_SMTP_ADMIN_EMAIL");
   const senderName = envFirst("SMTP_SENDER_NAME", "GOTRUE_SMTP_SENDER_NAME");
-  const fromHeader = senderName && from ? `${senderName} <${from}>` : from;
 
-  if (!host) return { error: "SMTP_HOSTNAME not set on functions container" };
+  if (!host) {
+    trace("smtp_config_error", { reason: "missing_host" });
+    return { error: "SMTP_HOSTNAME not set on functions container" };
+  }
   if (!Number.isFinite(port) || port <= 0) {
+    trace("smtp_config_error", { reason: "bad_port", portRaw });
     return { error: `Invalid SMTP_PORT: ${portRaw}` };
   }
   if (!user || !pass) {
+    trace("smtp_config_error", { reason: "missing_user_or_pass" });
     return { error: "SMTP_USERNAME / SMTP_PASSWORD not set on functions container" };
   }
-  if (!fromHeader) return { error: "SMTP_FROM not set on functions container" };
 
-  return { host, port, secure, user, pass, from: fromHeader };
+  const fromHeader = buildSmtpFromHeader(senderName, fromRaw, user);
+  if (!fromHeader.trim()) {
+    trace("smtp_config_error", {
+      reason: "empty_from_header",
+    });
+    return { error: "SMTP_FROM / SMTP_USERNAME could not build a From header" };
+  }
+
+  const cfg = { host, port, secure, user, pass, from: fromHeader };
+  trace("smtp_config_ready", smtpDiag(cfg));
+  return cfg;
 }
 
 function escapeHtml(s: string): string {
@@ -372,7 +414,14 @@ class RestClient {
     });
     if (res.status === 406) return null;
     if (!res.ok) {
-      throw new Error(`PostgREST ${res.status}: ${await res.text()}`);
+      const txt = await res.text();
+      trace("postgrest_error", {
+        op: "selectOne",
+        table,
+        status: res.status,
+        bodyPreview: txt.slice(0, 400),
+      });
+      throw new Error(`PostgREST ${res.status}: ${txt}`);
     }
     return (await res.json()) as T;
   }
@@ -381,9 +430,15 @@ class RestClient {
     const url = `${this.baseUrl}/rest/v1/${table}?${query}`;
     const res = await fetch(url, { headers: this.headers() });
     if (!res.ok) {
-      throw new Error(`PostgREST ${res.status}: ${await res.text()}`);
+      const txt = await res.text();
+      trace("postgrest_error", {
+        op: "selectMany",
+        table,
+        status: res.status,
+        bodyPreview: txt.slice(0, 400),
+      });
+      throw new Error(`PostgREST ${res.status}: ${txt}`);
     }
-    return (await res.json()) as T[];
   }
 
   async patch(table: string, query: string, body: Record<string, unknown>) {
@@ -394,7 +449,14 @@ class RestClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`PostgREST patch ${res.status}: ${await res.text()}`);
+      const txt = await res.text();
+      trace("postgrest_error", {
+        op: "patch",
+        table,
+        status: res.status,
+        bodyPreview: txt.slice(0, 400),
+      });
+      throw new Error(`PostgREST patch ${res.status}: ${txt}`);
     }
   }
 }
@@ -404,19 +466,27 @@ const OUTBOX_SELECT =
 
 async function processOutboxRow(
   rest: RestClient,
-  smtp: NativeSmtpConfig,
+  smtp: SmtpConfig,
   appUrl: string,
   id: string,
 ): Promise<{ id: string; ok: boolean; error?: string }> {
+  trace("outbox_row_start", { outboxId: id });
   const row = await rest.selectOne<OutboxRow>(
     "activity_email_outbox",
     `id=eq.${encodeURIComponent(id)}&select=${OUTBOX_SELECT}`,
   );
 
-  if (!row) return { id, ok: false, error: "outbox row not found" };
-  if (row.status !== "pending") return { id, ok: true };
+  if (!row) {
+    trace("outbox_row_not_found", { outboxId: id });
+    return { id, ok: false, error: "outbox row not found" };
+  }
+  if (row.status !== "pending") {
+    trace("outbox_row_skip_status", { outboxId: id, status: row.status });
+    return { id, ok: true };
+  }
 
   if (!row.recipient_email?.trim()) {
+    trace("outbox_row_skip_no_email", { outboxId: id });
     await rest.patch(
       "activity_email_outbox",
       `id=eq.${encodeURIComponent(id)}`,
@@ -428,7 +498,11 @@ async function processOutboxRow(
   const { subject, text, html } = buildEmail(row, appUrl);
 
   try {
-    await sendNativeSmtp(
+    trace("outbox_row_smtp", {
+      outboxId: id,
+      to: row.recipient_email.trim(),
+    });
+    await sendSmtpMail(
       smtp,
       row.recipient_email.trim(),
       subject,
@@ -444,9 +518,11 @@ async function processOutboxRow(
         error_message: null,
       },
     );
+    trace("outbox_row_sent", { outboxId: id });
     return { id, ok: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    trace("outbox_row_failed", { outboxId: id, error: msg.slice(0, 500) });
     await rest.patch(
       "activity_email_outbox",
       `id=eq.${encodeURIComponent(id)}`,
@@ -457,7 +533,7 @@ async function processOutboxRow(
 }
 
 async function sendDebugTestEmail(
-  smtp: NativeSmtpConfig,
+  smtp: SmtpConfig,
   to: string,
   appUrl: string,
 ): Promise<{ ok: boolean; error?: string }> {
@@ -476,24 +552,30 @@ async function sendDebugTestEmail(
   <p style="color:#666">${escapeHtml(when)} · ${escapeHtml(appUrl)}</p>
   <p>If you received this, SMTP from the functions container is working.</p>
 </body></html>`;
+  trace("test_email_start", { to });
   try {
-    await sendNativeSmtp(smtp, to, subject, text, html);
+    await sendSmtpMail(smtp, to, subject, text, html);
+    trace("test_email_ok", { to });
     return { ok: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    trace("test_email_error", { to, error: msg.slice(0, 500) });
     return { ok: false, error: msg };
   }
 }
 
 async function runHealthCheck(
-  smtp: NativeSmtpConfig,
+  smtp: SmtpConfig,
   supabaseUrl: string,
+  diagnose: boolean,
+  supabaseUrlRaw: string,
+  serviceKeyLen: number,
 ): Promise<Response> {
   const checks: Record<string, string> = {
     supabase_url: supabaseUrl,
     smtp_host: smtp.host,
     smtp_port: String(smtp.port),
-    worker_imports: "single index.ts",
+    worker_imports: "npm:nodemailer@6.9.16",
   };
 
   try {
@@ -517,21 +599,45 @@ async function runHealthCheck(
   }
 
   const ok = checks.kong_reachable === "ok" && checks.smtp_tcp === "ok";
-  return jsonResponse({ ok, checks }, ok ? 200 : 503);
+  trace("health_done", {
+    ok,
+    kong: checks.kong_reachable === "ok",
+    smtpTcp: checks.smtp_tcp === "ok",
+  });
+
+  const payload: Record<string, unknown> = { ok, checks };
+  if (diagnose) {
+    payload.diagnose = {
+      supabaseUrlRaw,
+      supabaseUrlInternal: supabaseUrl,
+      ...smtpDiag(smtp),
+      serviceRoleJwtLen: serviceKeyLen,
+      exledAppUrl: Deno.env.get("EXLED_APP_URL") ?? null,
+      allowDebugTestEmail: Deno.env.get("ALLOW_DEBUG_TEST_EMAIL") ?? null,
+      edgeWorkerTimeoutMs: Deno.env.get("EDGE_WORKER_TIMEOUT_MS") ?? null,
+    };
+  }
+  return jsonResponse(payload, ok ? 200 : 503);
 }
 
 Deno.serve(async (req) => {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  trace("http_request", { method: req.method, path });
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   const smtpResult = readSmtpConfig();
   if ("error" in smtpResult) {
+    trace("smtp_config_failed", { error: smtpResult.error });
     return jsonResponse({ error: smtpResult.error }, 500);
   }
   const smtp = smtpResult;
 
-  let supabaseUrl = (Deno.env.get("SUPABASE_URL") ?? "").replace(/\/$/, "");
+  const supabaseUrlRaw = (Deno.env.get("SUPABASE_URL") ?? "").replace(/\/$/, "");
+  let supabaseUrl = supabaseUrlRaw;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
   const appUrl = Deno.env.get("EXLED_APP_URL") ?? "https://be.exled.app";
 
@@ -540,35 +646,54 @@ Deno.serve(async (req) => {
     supabaseUrl.includes("tauworks.org")) {
     const internal = (Deno.env.get("SUPABASE_INTERNAL_URL") ?? "http://kong:8000")
       .replace(/\/$/, "");
+    trace("supabase_url_rewrite", { from: supabaseUrl, to: internal });
     supabaseUrl = internal;
+  } else {
+    trace("supabase_url_as_env", { url: supabaseUrl });
   }
 
-  const url = new URL(req.url);
   if (url.searchParams.get("health") === "1") {
     if (!supabaseUrl || !serviceKey) {
+      trace("health_aborted", { reason: "missing_url_or_key" });
       return jsonResponse({ error: "SUPABASE_URL / SERVICE_ROLE_KEY missing" }, 500);
     }
-    return await runHealthCheck(smtp, supabaseUrl);
+    const diagnose = url.searchParams.get("diagnose") === "1";
+    return await runHealthCheck(
+      smtp,
+      supabaseUrl,
+      diagnose,
+      supabaseUrlRaw,
+      serviceKey.length,
+    );
   }
 
   if (!supabaseUrl || !serviceKey) {
+    trace("request_aborted", { reason: "missing_supabase_or_service_key" });
     return jsonResponse({ error: "Supabase service env missing" }, 500);
   }
 
   const rest = new RestClient(supabaseUrl, serviceKey);
 
-  let body: Record<string, unknown> = {};
-  try {
-    body = await req.json();
-  } catch {
-    body = {};
+  const parsedBody = await parseRequestJsonBody(req);
+  if (!parsedBody.ok) {
+    return parsedBody.response;
   }
+  const body = parsedBody.body;
+  const processPending =
+    body.process_pending === true ||
+    body.process_pending === "true";
+  trace("http_body_parsed", {
+    hasTestEmail: typeof body.test_email === "string",
+    processPending,
+    hasOutboxId: typeof body.outbox_id === "string",
+  });
 
   const results: Array<{ id: string; ok: boolean; error?: string }> = [];
 
   try {
     if (typeof body.test_email === "string" && body.test_email.trim()) {
       if (Deno.env.get("ALLOW_DEBUG_TEST_EMAIL") !== "true") {
+        trace("test_email_blocked", { reason: "ALLOW_DEBUG_TEST_EMAIL_not_true" });
         return jsonResponse({
           error:
             "test_email disabled. Set ALLOW_DEBUG_TEST_EMAIL=true on the functions service.",
@@ -589,7 +714,7 @@ Deno.serve(async (req) => {
       results.push(
         await processOutboxRow(rest, smtp, appUrl, body.outbox_id.trim()),
       );
-    } else if (body.process_pending === true) {
+    } else if (processPending) {
       const limit =
         typeof body.limit === "number" && body.limit > 0
           ? Math.min(body.limit, 50)
@@ -598,20 +723,30 @@ Deno.serve(async (req) => {
         "activity_email_outbox",
         `status=eq.pending&order=created_at.asc&limit=${limit}&select=id`,
       );
+      trace("outbox_pending_fetched", { count: pending.length, limit });
       for (const row of pending) {
         results.push(await processOutboxRow(rest, smtp, appUrl, row.id));
       }
     } else {
+      trace("http_bad_body", {
+        reason: "no_action",
+        receivedKeys: Object.keys(body),
+      });
       return jsonResponse(
         {
           error:
             'Provide "test_email", "outbox_id", or "process_pending": true',
+          receivedKeys: Object.keys(body),
         },
         400,
       );
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    trace("handler_error", {
+      error: msg.slice(0, 800),
+      stack: e instanceof Error ? (e.stack ?? "").slice(0, 1200) : undefined,
+    });
     if (msg.includes("name resolution") || msg.includes("failed to lookup")) {
       return jsonResponse({
         error:
@@ -623,6 +758,10 @@ Deno.serve(async (req) => {
   }
 
   const failed = results.filter((r) => !r.ok);
+  trace("http_response_ok", {
+    processed: results.length,
+    failed: failed.length,
+  });
   return jsonResponse(
     { processed: results.length, failed: failed.length, results },
     failed.length > 0 ? 207 : 200,

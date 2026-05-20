@@ -6,7 +6,9 @@ The database enqueues `activity_email_outbox` (migration `010`). The **`send-act
 
 1. Apply migration `supabase-db/migrations/010_activity_email_notifications.sql`.
 
-2. Copy function files into the **Docker volume** (not `supabase/functions` on the server unless you keep a full clone):
+2. Copy function files into the **Docker volume** (not `supabase/functions` on the server unless you keep a full git clone there):
+
+   SMTP is implemented with **Nodemailer** (`npm:nodemailer@6.9.16`). The **functions** container must reach **https://registry.npmjs.org** on first cold start to download the package (then cached in the runtime).
 
    ```text
    ~/leam/docker/volumes/functions/main/index.ts
@@ -41,11 +43,13 @@ The database enqueues `activity_email_outbox` (migration `010`). The **`send-act
    SMTP_USERNAME=...
    SMTP_PASSWORD=...
    SMTP_FROM=ExLed <a@exled.app>
+   # Or bare email + name: SMTP_FROM=a@exled.app and SMTP_SENDER_NAME=ExLed
+   # Or label only: SMTP_FROM=ExLed (no @) — function uses SMTP_USERNAME as address
    EXLED_APP_URL=https://be.exled.app
    ALLOW_DEBUG_TEST_EMAIL=true
    ```
 
-   `ALLOW_DEBUG_TEST_EMAIL` enables the app debug menu item **Send test SMTP email** (no outbox row needed).
+   `EXLED_APP_URL` is for **links in emails** (can stay prod even if you debug API on leam). EHLO uses the mailbox domain (`exled.app` from `a@exled.app`) unless you set `SMTP_EHLO_NAME`. `ALLOW_DEBUG_TEST_EMAIL` enables the debug menu test send.
 
 ### `[smtp] connect` fails in `docker compose logs functions`
 
@@ -94,6 +98,10 @@ Redeploy latest `send-activity-email/index.ts` (improved SMTP reader + longer ti
    curl -s "https://be.exled.app/functions/v1/send-activity-email?health=1" \
      -H "Authorization: Bearer $SERVICE_ROLE_KEY"
    ```
+
+   Redacted snapshot (URLs, SMTP summary, JWT length — **not** secrets): add `&diagnose=1` to that URL.
+
+   **Live trace lines** on the server: `docker compose logs -f functions | grep send-activity-email-trace` — each line is JSON with `event` (`smtp_send_begin`, `postgrest_error`, `handler_error`, …).
 
 6. Drain pending (app debug menu, or):
 

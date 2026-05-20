@@ -44,9 +44,11 @@ From your dev machine (repo root):
 
 ```bash
 scp supabase/functions/main/index.ts root@beacon:~/leam/docker/volumes/functions/main/
-scp -r supabase/functions/send-activity-email root@beacon:~/leam/docker/volumes/functions/
+scp supabase/functions/send-activity-email/index.ts root@beacon:~/leam/docker/volumes/functions/send-activity-email/
 ssh root@beacon 'bash -s' < scripts/setup-beacon-edge-functions.sh   # or copy script and run on server
 ```
+
+The function uses **`npm:nodemailer`** (Deno). The **functions** container needs outbound **HTTPS to `registry.npmjs.org`** on first load so the runtime can fetch the package; after that it is cached in the worker cache.
 
 0. **Required:** `volumes/functions/main/index.ts` (Supabase router). Without it the
    `functions` container crash-loops with `main worker boot error … entrypoint`.
@@ -64,8 +66,8 @@ ssh root@beacon 'bash -s' < scripts/setup-beacon-edge-functions.sh   # or copy s
    ```
    Compare with `hello`: `ls -la volumes/functions/hello/`
    ```bash
-   cp -r /path/to/inled/supabase/functions/send-activity-email \
-     /path/to/supabase/docker/volumes/functions/
+   cp /path/to/inled/supabase/functions/send-activity-email/index.ts \
+     /path/to/supabase/docker/volumes/functions/send-activity-email/
    ```
    Wrong layouts that cause `could not find an appropriate entrypoint`:
    - `volumes/functions/send-activity-email.ts` (file, not folder)
@@ -144,6 +146,12 @@ Pick one:
 | 404 on `/functions/v1/...` | Functions container not running or Kong route missing |
 | 500 `could not find an appropriate entrypoint` | **`hello` OK but this function fails:** remove `smtp_native.ts`, `deno.json`, `deno.json.bak` from `volumes/functions/send-activity-email/`; scp fresh single-file `index.ts` (~14 KB, must contain `Deno.serve`); recreate `functions`. Wrong layout: `send-activity-email.ts` as a file instead of folder. |
 | 503 `name resolution failed` | **DNS inside `functions` container** — cannot resolve `SMTP_HOSTNAME` and/or `kong`. Copy **exact** `GOTRUE_SMTP_*` into functions env; add `dns: [8.8.8.8, 1.1.1.1]` under `functions` in compose; test health URL below |
+| `wall clock duration` / `early termination` after nodemailer | **Router** `main/index.ts` `workerTimeoutMs` too low. Redeploy `main/index.ts` (default **10 minutes**) or set `EDGE_WORKER_TIMEOUT_MS=900000` on **functions** and recreate. Mail may still send; the HTTP response is cut off. |
+| 502 after ~60s on test email | SMTP hang from **functions** container — `docker compose logs functions --tail 80` (look for `[smtp]` lines). Copy `GOTRUE_SMTP_*` → `SMTP_*` on functions service. Redeploy `index.ts` with timeouts. |
+| 400 `Provide "test_email"…` + `"receivedKeys":[]` | **Body never reached the function** (Kong/nginx) or **invalid JSON** (smart quotes, truncated `-d`). Ensure `Content-Type: application/json`. Redeploy `send-activity-email/index.ts` (clear empty/JSON errors). Check trace `http_body_in.byteLen`. Router must use **`worker.fetch(req)`** only — not `req.clone()` or a rebuilt `Request`. |
+| 400 `Invalid JSON body` … `position 34` / `after JSON` | Extra characters after `}` — often **`##` pasted inside** `-d '...##'`. Use `-d '{"test_email":"you@example.com"}'` with **nothing after the closing `'`**. Response includes `tailPreview` (last 12 chars). |
+| 400 `Empty request body` | Missing `-d` or empty POST body. |
+| `BadResource` / `streamRid` / `main worker has been destroyed` | Router must **`worker.fetch(req)`** (upstream Supabase pattern). Do **not** use `req.clone()` or `new Request(..., { body: arrayBuffer })` — both break self-hosted edge-runtime body forwarding. |
 
 **Health check (from beacon or your PC):**
 
@@ -153,7 +161,9 @@ curl -s "https://be.exled.app/functions/v1/send-activity-email?health=1" \
 ```
 
 Returns `smtp_tcp: ok` / `kong_reachable: ok` when DNS and env are correct.
-| OTP works, activity mail fails | Edge function env not set (GoTrue env ≠ functions env) |
-| 502 after ~60s on test email | SMTP hang from **functions** container — `docker compose logs functions --tail 80` (look for `[smtp]` lines). Copy `GOTRUE_SMTP_*` → `SMTP_*` on functions service. Redeploy `index.ts` with timeouts. |
+
+**Structured logs** (every request): `docker compose logs -f functions | grep send-activity-email-trace` — JSON lines with `event` (`smtp_send_begin`, `postgrest_error`, `handler_error`, …). No passwords.
+
+**Diagnose in HTTP** (redacted env snapshot): append `&diagnose=1` to the health URL — response includes `diagnose: { supabaseUrlRaw, supabaseUrlInternal, mailFrom, … }`.
 
 **Service role key:** on beacon, usually `SERVICE_ROLE_KEY` or `SUPABASE_SERVICE_ROLE_KEY` in the Supabase `.env` (never commit it).

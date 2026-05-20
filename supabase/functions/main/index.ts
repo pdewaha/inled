@@ -109,8 +109,11 @@ Deno.serve(async (req: Request) => {
   console.error(`serving the request with ${servicePath}`);
 
   const memoryLimitMb = 150;
-  const workerTimeoutMs = Number(Deno.env.get("EDGE_WORKER_TIMEOUT_MS") ?? "") ||
-    3 * 60 * 1000;
+  // Wall-clock limit for the whole request (npm fetch + SMTP). Default 10m so
+  // send-activity-email is not killed after "nodemailer ready" on slow networks.
+  const parsed = Number(Deno.env.get("EDGE_WORKER_TIMEOUT_MS"));
+  const workerTimeoutMs =
+    Number.isFinite(parsed) && parsed >= 30000 ? parsed : 10 * 60 * 1000;
   const noModuleCache = false;
   const importMapPath = null;
   const envVarsObj = Deno.env.toObject();
@@ -125,6 +128,8 @@ Deno.serve(async (req: Request) => {
       importMapPath,
       envVars,
     });
+    // Must pass the incoming Request unchanged. clone() → BadResource on some
+    // builds; new Request({ body: arrayBuffer }) → streamRid TypeError.
     return await worker.fetch(req);
   } catch (e) {
     return new Response(JSON.stringify({ msg: e.toString() }), {
