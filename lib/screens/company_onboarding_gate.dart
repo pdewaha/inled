@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:exled/screens/ledger_console_screen.dart';
 import 'package:exled/theme.dart';
+import 'package:exled/widgets/debug_menu_button.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class CompanyOnboardingGate extends StatefulWidget {
@@ -289,7 +290,10 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     return Scaffold(
-      appBar: AppBar(title: const Text('Company setup')),
+      appBar: AppBar(
+        title: const Text('Company setup'),
+        actions: const [DebugMenuButton(), SizedBox(width: 4)],
+      ),
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 720),

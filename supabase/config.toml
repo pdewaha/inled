@@ -1,0 +1,5 @@
+# Minimal Supabase project config for Edge Functions.
+# Link with: supabase link --project-ref <your-ref>
+
+[functions.send-activity-email]
+verify_jwt = false

@@ -435,6 +435,9 @@ CREATE POLICY inled_expectation_message_reads_insert
     )
   );
 
+GRANT SELECT, INSERT ON TABLE public.expectation_message_reads TO authenticated;
+GRANT ALL ON TABLE public.expectation_message_reads TO service_role;
+
 -- ---------------------------------------------------------------------------
 -- expectation_changelog_reads (per-user changelog read watermark)
 -- ---------------------------------------------------------------------------
@@ -488,7 +491,8 @@ CREATE POLICY inled_expectation_changelog_reads_delete
   );
 
 -- ---------------------------------------------------------------------------
--- expectation_mentions (@people on talking points; not expectations.target_person_id)
+-- expectation_mentions (@people on talking points + co-receivers on expectations;
+-- primary expectation receiver remains expectations.target_person_id)
 -- ---------------------------------------------------------------------------
 
 DROP POLICY IF EXISTS inled_expectation_mentions_select ON expectation_mentions;
@@ -509,8 +513,10 @@ CREATE POLICY inled_expectation_mentions_insert ON expectation_mentions
       WHERE e.id = expectation_id
         AND e.company_id = company_id
         AND e.writer_user_id = auth.uid()
-        AND e.expectation_type = 1
-        AND e.expectation_visibility IN (0, 1)
+        AND (
+          (e.expectation_type = 1 AND e.expectation_visibility IN (0, 1))
+          OR (e.expectation_type = 0 AND e.expectation_visibility IN (0, 1))
+        )
     )
   );
 
@@ -525,5 +531,9 @@ CREATE POLICY inled_expectation_mentions_delete ON expectation_mentions
       FROM expectations e
       WHERE e.id = expectation_id
         AND e.writer_user_id = auth.uid()
+        AND e.expectation_type IN (0, 1)
     )
   );
+
+-- activity_email_outbox (migration 010): RLS enabled, no authenticated policies.
+-- Rows are written by SECURITY DEFINER triggers; sent by the send-activity-email Edge Function (service role).

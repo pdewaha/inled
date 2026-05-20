@@ -8,6 +8,29 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 final RegExp expectationMentionHandleRe = RegExp(r'@([a-zA-Z0-9._-]+)');
 
+final RegExp _leadingMentionTokenRegex =
+    RegExp(r'^\s*@([a-zA-Z0-9._-]+)\b\s*');
+
+/// Removes a leading run of @mentions (`@a @b @c …`); @mentions later in text stay.
+String stripLeadingMentionBurst(String text) {
+  var t = text.trim();
+  while (_leadingMentionTokenRegex.hasMatch(t)) {
+    t = t.replaceFirst(_leadingMentionTokenRegex, '');
+  }
+  return t.trim();
+}
+
+/// Index of @handles and mentioned person ids per expectation.
+class ExpectationMentionsIndex {
+  const ExpectationMentionsIndex({
+    this.handlesByExpectationId = const {},
+    this.personIdsByExpectationId = const {},
+  });
+
+  final Map<String, List<String>> handlesByExpectationId;
+  final Map<String, Set<String>> personIdsByExpectationId;
+}
+
 /// Distinct @handles in [text], first occurrence order (case-insensitive dedupe).
 List<String> extractMentionHandlesFromText(String text) {
   final seen = <String>{};
@@ -44,6 +67,31 @@ List<String> talkingPointMentionHandleList({
   return out;
 }
 
+/// Expectation receivers: primary person + persisted @rows + any @ still in [summary].
+List<String> expectationReceiverHandleList({
+  required String summary,
+  String? primaryPersonHandle,
+  Iterable<String> persistedMentionHandles = const [],
+}) {
+  final seen = <String>{};
+  final out = <String>[];
+  void add(String raw) {
+    final h = raw.trim();
+    if (h.isEmpty) return;
+    final k = h.toLowerCase();
+    if (seen.add(k)) out.add(h);
+  }
+
+  add(primaryPersonHandle ?? '');
+  for (final h in persistedMentionHandles) {
+    add(h);
+  }
+  for (final h in extractMentionHandlesFromText(summary)) {
+    add(h);
+  }
+  return out;
+}
+
 /// List-tile header for talking points: `@a @b` when cited, else [fallback].
 String talkingPointMentionWhoLabel(
   String summary, {
@@ -58,23 +106,44 @@ String talkingPointMentionWhoLabel(
   return handles.map((h) => '@$h').join(' ');
 }
 
-/// Expectation list/detail receiver: linked person, first @ in summary, or [@All].
+/// Expectation list/detail receivers: linked person, co-@mentions, or [@All].
 String expectationReceiverWhoLabel({
   required String summary,
   String? personDisplayName,
   String? personHandle,
   String personId = '',
+  Iterable<String> persistedMentionHandles = const [],
 }) {
-  final handle = (personHandle ?? '').trim();
+  final handles = expectationReceiverHandleList(
+    summary: summary,
+    primaryPersonHandle: personHandle,
+    persistedMentionHandles: persistedMentionHandles,
+  );
+  if (handles.isNotEmpty) {
+    return handles.map((h) => '@$h').join(' ');
+  }
   final name = (personDisplayName ?? '').trim();
   if (name.isNotEmpty) return name;
+  final handle = (personHandle ?? '').trim();
   if (handle.isNotEmpty) return handle;
   if (personId.trim().isNotEmpty) return personId.trim();
-  final mentions = extractMentionHandlesFromText(summary);
-  if (mentions.isNotEmpty) {
-    return mentions.map((h) => '@$h').join(' ');
-  }
   return kLedgerAllMentionLabel;
+}
+
+bool expectationAppliesToPerson({
+  required Expectation e,
+  required String myPersonId,
+  ExpectationMentionsIndex? mentionsIndex,
+}) {
+  if (e.personId.trim() == myPersonId) return true;
+  // Private prep talking points: @mentions are not receivers until published (echo).
+  if (e.type == ExpectationType.topic &&
+      e.visibility == ExpectationVisibility.shadow) {
+    return false;
+  }
+  final co = mentionsIndex?.personIdsByExpectationId[e.id];
+  if (co != null && co.contains(myPersonId)) return true;
+  return false;
 }
 
 /// Record @mentions from the **capture line** (before leading @ is stripped from summary).
@@ -87,9 +156,74 @@ Future<void> syncTalkingPointMentions({
   required List<Person> people,
   required Future<Person?> Function(String handle) resolveMe,
   required Future<Person> Function(String handle) createPlaceholder,
+  bool replaceExisting = false,
+}) async {
+  await _syncMentionsFromText(
+    client: client,
+    companyId: companyId,
+    expectationId: expectationId,
+    summary: summary,
+    authorPersonId: authorPersonId,
+    people: people,
+    resolveMe: resolveMe,
+    createMe: resolveMe,
+    createPlaceholder: createPlaceholder,
+    replaceExisting: replaceExisting,
+  );
+}
+
+/// Co-receivers on expectations (@Marc @John …): first @ → [target_person_id], all → [expectation_mentions].
+Future<void> syncExpectationCoReceiverMentions({
+  required SupabaseClient client,
+  required String companyId,
+  required String expectationId,
+  required String mentionSourceText,
+  required String authorPersonId,
+  required List<Person> people,
+  required Future<Person?> Function(String handle) resolveMe,
+  required Future<Person> Function(String handle) createPlaceholder,
+  bool replaceExisting = true,
+}) async {
+  await _syncMentionsFromText(
+    client: client,
+    companyId: companyId,
+    expectationId: expectationId,
+    summary: mentionSourceText,
+    authorPersonId: authorPersonId,
+    people: people,
+    resolveMe: resolveMe,
+    createMe: resolveMe,
+    createPlaceholder: createPlaceholder,
+    replaceExisting: replaceExisting,
+  );
+}
+
+Future<void> _syncMentionsFromText({
+  required SupabaseClient client,
+  required String companyId,
+  required String expectationId,
+  required String summary,
+  required String authorPersonId,
+  required List<Person> people,
+  required Future<Person?> Function(String handle) resolveMe,
+  required Future<Person?> Function(String handle) createMe,
+  required Future<Person> Function(String handle) createPlaceholder,
+  required bool replaceExisting,
 }) async {
   final handles = extractMentionHandlesFromText(summary);
   if (handles.isEmpty) return;
+
+  if (replaceExisting) {
+    try {
+      await client
+          .from('expectation_mentions')
+          .delete()
+          .eq('company_id', companyId)
+          .eq('expectation_id', expectationId);
+    } on PostgrestException {
+      // Table / policy not deployed yet.
+    }
+  }
 
   final byHandle = {for (final p in people) p.handle.toLowerCase(): p};
   final mentionedIds = <String>{};
@@ -97,7 +231,7 @@ Future<void> syncTalkingPointMentions({
   for (final raw in handles) {
     Person? person;
     if (raw.toLowerCase() == 'me') {
-      person = await resolveMe(raw);
+      person = await createMe(raw);
     } else {
       person = byHandle[raw.toLowerCase()];
       person ??= await createPlaceholder(raw);
@@ -120,15 +254,17 @@ Future<void> syncTalkingPointMentions({
   }
 }
 
-/// @handles per talking point (including leading @ stripped from stored summary).
-Future<Map<String, List<String>>> loadMentionHandlesByExpectationId({
+/// @handles and mentioned person ids per expectation.
+Future<ExpectationMentionsIndex> loadMentionHandlesByExpectationId({
   required SupabaseClient client,
   required String companyId,
   required Iterable<String> expectationIds,
   required Map<String, Person> peopleById,
 }) async {
   final ids = expectationIds.where((id) => id.trim().isNotEmpty).toList();
-  if (ids.isEmpty) return {};
+  if (ids.isEmpty) {
+    return const ExpectationMentionsIndex();
+  }
 
   try {
     final rows = await client
@@ -140,33 +276,40 @@ Future<Map<String, List<String>>> loadMentionHandlesByExpectationId({
         .eq('company_id', companyId)
         .inFilter('expectation_id', ids);
 
-    final out = <String, List<String>>{};
+    final handles = <String, List<String>>{};
+    final personIds = <String, Set<String>>{};
     for (final raw in rows as List) {
       if (raw is! Map) continue;
       final expId = (raw['expectation_id'] as String?)?.trim() ?? '';
       if (expId.isEmpty) continue;
+      final mentionedPersonId =
+          (raw['mentioned_person_id'] as String?)?.trim() ?? '';
+      if (mentionedPersonId.isNotEmpty) {
+        personIds.putIfAbsent(expId, () => <String>{}).add(mentionedPersonId);
+      }
       final personObj = raw['people'];
       String? handle;
       if (personObj is Map) {
         handle = (personObj['handle'] as String?)?.trim();
       }
-      handle ??= peopleById[(raw['mentioned_person_id'] as String?) ?? '']
-          ?.handle
-          .trim();
+      handle ??= peopleById[mentionedPersonId]?.handle.trim();
       if (handle == null || handle.isEmpty) continue;
-      out.putIfAbsent(expId, () => <String>[]);
-      final list = out[expId]!;
+      handles.putIfAbsent(expId, () => <String>[]);
+      final list = handles[expId]!;
       if (!list.any((h) => h.toLowerCase() == handle!.toLowerCase())) {
         list.add(handle);
       }
     }
-    return out;
+    return ExpectationMentionsIndex(
+      handlesByExpectationId: handles,
+      personIdsByExpectationId: personIds,
+    );
   } on PostgrestException {
-    return {};
+    return const ExpectationMentionsIndex();
   }
 }
 
-/// Expectations where [myPersonId] is @mentioned on a public talking point.
+/// Expectations where [myPersonId] is @mentioned (talking points + co-receiver expectations).
 Future<List<Expectation>> fetchExpectationsMentioningPerson({
   required SupabaseClient client,
   required String companyId,
@@ -197,11 +340,13 @@ Future<List<Expectation>> fetchExpectationsMentioningPerson({
       if (expMap == null) continue;
       final id = _mentionDbString(expMap['id']);
       if (id.isEmpty || !seen.add(id)) continue;
-      if (_mentionDbInt(expMap['expectation_type']) != ExpectationType.topic.index) {
-        continue;
-      }
-      if (_mentionDbInt(expMap['expectation_visibility']) !=
-          ExpectationVisibility.echo.index) {
+      final type = _mentionDbInt(expMap['expectation_type']);
+      final visibility = _mentionDbInt(expMap['expectation_visibility']);
+      if (type == ExpectationType.topic.index) {
+        if (visibility != ExpectationVisibility.echo.index) continue;
+      } else if (type == ExpectationType.expectation.index) {
+        if (visibility != ExpectationVisibility.echo.index) continue;
+      } else {
         continue;
       }
       out.add(mapRow(expMap));
@@ -236,7 +381,7 @@ int _mentionDbInt(dynamic value, {int fallback = 0}) {
   return int.tryParse('$value') ?? fallback;
 }
 
-/// Activity feed rows for "mentioned in a public talking point".
+/// Activity feed rows for @mentions on talking points and co-receiver expectations.
 Future<List<ExpectationActivityFeedItem>> loadTalkingPointMentionActivityFeed({
   required SupabaseClient client,
   required String companyId,
@@ -265,28 +410,27 @@ Future<List<ExpectationActivityFeedItem>> loadTalkingPointMentionActivityFeed({
       if (expId.isEmpty) continue;
       final exp = _embeddedExpectationRow(raw['expectations']);
       if (exp == null) continue;
-      if (_mentionDbInt(exp['expectation_type']) != ExpectationType.topic.index) {
-        continue;
-      }
-      if (_mentionDbInt(exp['expectation_visibility']) !=
-          ExpectationVisibility.echo.index) {
-        continue;
-      }
+      final type = _mentionDbInt(exp['expectation_type']);
+      final visibility = _mentionDbInt(exp['expectation_visibility']);
+      if (visibility != ExpectationVisibility.echo.index) continue;
       final e = byId[expId];
       if (e == null) continue;
       final summary = _mentionDbString(exp['summary'], fallback: e.summary);
       final created =
           DateTime.tryParse(_mentionDbString(raw['created_at'])) ?? e.createdAt;
+      final isTopic = type == ExpectationType.topic.index;
       out.add(
         ExpectationActivityFeedItem(
           messageId: 'mention_${_mentionDbString(raw['id'])}',
           expectationId: expId,
           senderPersonId: '',
           senderLabel: authorLabel(e),
-          messageText: 'You were mentioned in a public talking point',
+          messageText: isTopic
+              ? 'You were mentioned in a public talking point'
+              : 'You were added as a receiver on an expectation',
           createdAt: created,
           expectationSummarySnippet: activityFeedEllipsis(summary, 52),
-          kindLabel: 'Talking point',
+          kindLabel: isTopic ? 'Talking point' : 'Expectation',
           hashtags: activityFeedHashtagsFromSummary(summary),
         ),
       );

@@ -26,6 +26,7 @@ import 'package:exled/utils/person_display.dart';
 import 'package:exled/widgets/command_capture_bar.dart';
 import 'package:exled/widgets/expectation_changelog_message_body.dart';
 import 'package:exled/widgets/ledger_tag_chip.dart';
+import 'package:exled/widgets/debug_menu_button.dart';
 import 'package:exled/widgets/responsive_centered_body.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -159,7 +160,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   ExpectationStatus? _inboxStatusFilter;
   String? _inboxTagFilter;
   /// @handles from [expectation_mentions] (includes leading @ stripped from summary).
-  Map<String, List<String>> _talkingPointMentionHandlesByExpectationId = {};
+  Map<String, List<String>> _mentionHandlesByExpectationId = {};
+  Map<String, Set<String>> _mentionPersonIdsByExpectationId = {};
+  /// Set from `?expectation=` in the page URL (notification email deep link).
+  String? _emailDeepLinkExpectationId;
 
   bool _hasUnreadChat(Expectation e) {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
@@ -270,14 +274,82 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         .contains(handleLower);
   }
 
-  List<String> _talkingPointPersistedMentions(Expectation e) {
-    return _talkingPointMentionHandlesByExpectationId[e.id] ?? const [];
+  List<String> _persistedMentionHandles(Expectation e) {
+    return _mentionHandlesByExpectationId[e.id] ?? const [];
+  }
+
+  /// Primary receiver first, then other @mentioned people (expectations + talking points).
+  List<Person> _receiverPeopleForExpectation(Expectation e) {
+    final out = <Person>[];
+    final seen = <String>{};
+    void addPerson(Person p) {
+      if (seen.add(p.id)) out.add(p);
+    }
+
+    void addId(String id) {
+      final pid = id.trim();
+      if (pid.isEmpty) return;
+      for (final p in _people) {
+        if (p.id == pid) {
+          addPerson(p);
+          return;
+        }
+      }
+    }
+
+    void addHandle(String rawHandle) {
+      final h = rawHandle.trim().toLowerCase();
+      if (h.isEmpty) return;
+      for (final p in _people) {
+        if (p.handle.trim().toLowerCase() == h) {
+          addPerson(p);
+          return;
+        }
+      }
+    }
+
+    addId(e.personId);
+    for (final id in _mentionPersonIdsByExpectationId[e.id] ?? const {}) {
+      addId(id);
+    }
+    if (e.type == ExpectationType.topic) {
+      for (final handle in talkingPointMentionHandleList(
+        summary: e.summary,
+        persistedMentionHandles: _persistedMentionHandles(e),
+      )) {
+        addHandle(handle);
+      }
+    }
+    return out;
+  }
+
+  bool _isExpectationReceiver(Expectation e, String myPersonId) {
+    return expectationAppliesToPerson(
+      e: e,
+      myPersonId: myPersonId,
+      mentionsIndex: ExpectationMentionsIndex(
+        handlesByExpectationId: _mentionHandlesByExpectationId,
+        personIdsByExpectationId: _mentionPersonIdsByExpectationId,
+      ),
+    );
+  }
+
+  bool _canEditExpectationForUser(
+    Expectation e,
+    String? authUserId,
+    String? myPersonId,
+  ) {
+    if (authUserId != null && e.writerUserId == authUserId) return true;
+    if (myPersonId != null && _isExpectationReceiver(e, myPersonId)) {
+      return true;
+    }
+    return false;
   }
 
   bool _talkingPointMentionsHandle(Expectation e, String handleLower) {
     if (handleLower.isEmpty) return false;
     if (_summaryMentionsHandle(e.summary, handleLower)) return true;
-    return _talkingPointPersistedMentions(e)
+    return _persistedMentionHandles(e)
         .any((h) => h.toLowerCase() == handleLower);
   }
 
@@ -306,7 +378,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     for (final e in pool) {
       for (final handle in talkingPointMentionHandleList(
         summary: e.summary,
-        persistedMentionHandles: _talkingPointPersistedMentions(e),
+        persistedMentionHandles: _persistedMentionHandles(e),
       )) {
         final k = handle.toLowerCase();
         if (seen.add(k)) out.add(handle);
@@ -351,7 +423,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     for (final e in pool) {
       for (final handle in talkingPointMentionHandleList(
         summary: e.summary,
-        persistedMentionHandles: _talkingPointPersistedMentions(e),
+        persistedMentionHandles: _persistedMentionHandles(e),
       )) {
         final k = handle.toLowerCase();
         if (seen.add(k)) out.add(handle);
@@ -595,8 +667,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       return;
     }
     final isWriter = expectation.writerUserId == currentUserId;
-    final isReceiver =
-        expectation.personId.trim().isNotEmpty && expectation.personId == meId;
+    final isReceiver = _isExpectationReceiver(expectation, meId);
     if (!isWriter && !isReceiver) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -701,7 +772,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         if ((meRows as List).isNotEmpty) {
           final meRow = meRows.first as Map<String, dynamic>;
           final mentionLine = [
-            ...(_talkingPointMentionHandlesByExpectationId[expectation.id] ??
+            ...(_mentionHandlesByExpectationId[expectation.id] ??
                     const [])
                 .map((h) => '@$h'),
             expectation.summary,
@@ -724,6 +795,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             },
             createPlaceholder: (handle) =>
                 _createPersonFromHandleInSupabase(handle),
+            replaceExisting: true,
           );
         }
       }
@@ -741,6 +813,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           return 'Published this $noun.';
         },
       );
+      await _loadExpectationsFromSupabase();
+      if (mounted) {
+        await _refreshActivityUnreadCount();
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -866,6 +942,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     _captureController.addListener(_onCaptureChanged);
     _composerSavePairFocusA.addListener(_syncExpectationPillarChoiceFromSaveFocus);
     _composerSavePairFocusB.addListener(_syncExpectationPillarChoiceFromSaveFocus);
+    final linkExpId = Uri.base.queryParameters['expectation']?.trim();
+    if (linkExpId != null && linkExpId.isNotEmpty) {
+      _emailDeepLinkExpectationId = linkExpId;
+    }
     _loadPeopleFromSupabase();
     _loadExpectationsFromSupabase();
     _loadRecentTagsFromSupabase();
@@ -1161,18 +1241,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       );
 
       final peopleById = {for (final p in _people) p.id: p};
-      Map<String, List<String>> mentionHandles = {};
+      ExpectationMentionsIndex mentionsIndex = const ExpectationMentionsIndex();
       try {
-        mentionHandles = await loadMentionHandlesByExpectationId(
+        mentionsIndex = await loadMentionHandlesByExpectationId(
           client: client,
           companyId: companyId,
-          expectationIds: combined
-              .where((e) => e.type == ExpectationType.topic)
-              .map((e) => e.id),
+          expectationIds: combined.map((e) => e.id),
           peopleById: peopleById,
         );
       } catch (_) {
-        mentionHandles = {};
+        mentionsIndex = const ExpectationMentionsIndex();
       }
 
       if (!mounted) return;
@@ -1180,12 +1258,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _expectations
           ..clear()
           ..addAll(combined);
-        _talkingPointMentionHandlesByExpectationId = mentionHandles;
+        _mentionHandlesByExpectationId = mentionsIndex.handlesByExpectationId;
+        _mentionPersonIdsByExpectationId = mentionsIndex.personIdsByExpectationId;
         _expectationsLoading = false;
         _expectationsLoadError = null;
         _ledgerCompanyId ??= companyId;
       });
       await _refreshActivityUnreadCount();
+      _tryOpenEmailDeepLinkExpectation();
     } on PostgrestException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1198,6 +1278,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _expectationsLoading = false;
         _expectationsLoadError = 'Failed to load expectations: $e';
       });
+    }
+  }
+
+  /// Opens `?expectation=<id>` from notification email links (web).
+  void _tryOpenEmailDeepLinkExpectation() {
+    final id = _emailDeepLinkExpectationId?.trim();
+    if (id == null || id.isEmpty || !mounted || _expectationsLoading) return;
+    for (final e in _expectations) {
+      if (e.id != id) continue;
+      _emailDeepLinkExpectationId = null;
+      Person? person;
+      if (e.personId.isNotEmpty) {
+        for (final p in _people) {
+          if (p.id == e.personId) {
+            person = p;
+            break;
+          }
+        }
+      }
+      unawaited(_openExpectationDetails(e: e, person: person));
+      return;
     }
   }
 
@@ -2727,7 +2828,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   static const _cancelToken = '__cancel__';
   static final RegExp _mentionRegex = RegExp(r'@([a-zA-Z0-9._-]+)');
-  static final RegExp _leadingMentionRegex = RegExp(r'^\s*@([a-zA-Z0-9._-]+)\b\s*');
   static final RegExp _atTagRegex = RegExp(r'@([a-zA-Z0-9._-]+)');
   static final RegExp _hashTagRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
   static final RegExp _allHashTagsRegex = RegExp(r'#([a-zA-Z0-9._-]+)');
@@ -2768,6 +2868,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     controller: controller,
                     autofocus: true,
                     decoration: InputDecoration(
+                      labelText: person != null
+                          ? _inviteEmailFieldLabel(person)
+                          : 'E-mail',
                       hintText: 'name@company.com',
                       errorText: error,
                     ),
@@ -2819,6 +2922,192 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return result?.trim();
   }
 
+  String _inviteEmailFieldLabel(Person person) {
+    final handle = person.handle.trim();
+    if (handle.isEmpty) return 'E-mail';
+    return 'E-mail of @$handle';
+  }
+
+  /// Email for each person (by id) when several receivers still need an address.
+  Future<Map<String, String>?> _askInviteEmailsForPeopleDialog(
+    List<Person> people,
+  ) async {
+    if (people.isEmpty) return {};
+    final controllers = <String, TextEditingController>{
+      for (final p in people)
+        p.id: TextEditingController(text: (p.email ?? '').trim()),
+    };
+    final errors = <String, String?>{for (final p in people) p.id: null};
+    String? formError;
+
+    bool validateAndCollect(Map<String, String> out) {
+      var hasInvalidNonEmpty = false;
+      for (final p in people) {
+        final value = controllers[p.id]!.text.trim();
+        if (value.isEmpty) {
+          errors[p.id] = null;
+          continue;
+        }
+        if (_emailRegex.hasMatch(value)) {
+          errors[p.id] = null;
+          out[p.id] = value;
+        } else {
+          hasInvalidNonEmpty = true;
+          errors[p.id] = 'Please enter a valid email address.';
+        }
+      }
+      if (out.isEmpty) {
+        formError = people.length == 1
+            ? 'Enter a valid email to send this invite.'
+            : 'Enter at least one valid email. Leave others blank to skip.';
+        return false;
+      }
+      if (hasInvalidNonEmpty) {
+        formError = null;
+        return false;
+      }
+      formError = null;
+      return true;
+    }
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            return AlertDialog(
+              title: Text(
+                people.length == 1
+                    ? 'Invite @${people.first.handle}'
+                    : 'Invite ${people.length} people',
+              ),
+              content: SizedBox(
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        people.length == 1
+                            ? 'Send a personalized invite email for @${people.first.handle}.'
+                            : 'Add emails for the receivers you want to invite now. '
+                                'Fields are optional except you need at least one valid address.',
+                      ),
+                      if (formError != null) ...[
+                        const SizedBox(height: 10),
+                        Text(
+                          formError!,
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      for (final p in people) ...[
+                        TextField(
+                          controller: controllers[p.id],
+                          decoration: InputDecoration(
+                            labelText: _inviteEmailFieldLabel(p),
+                            hintText: 'name@company.com (optional)',
+                            errorText: errors[p.id],
+                          ),
+                          textInputAction: people.last.id == p.id
+                              ? TextInputAction.done
+                              : TextInputAction.next,
+                          onSubmitted: (_) {
+                            final out = <String, String>{};
+                            if (validateAndCollect(out)) {
+                              Navigator.of(dialogContext).pop(out);
+                            } else {
+                              setLocalState(() {});
+                            }
+                          },
+                        ),
+                        if (p != people.last) const SizedBox(height: 10),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final out = <String, String>{};
+                    if (validateAndCollect(out)) {
+                      Navigator.of(dialogContext).pop(out);
+                    } else {
+                      setLocalState(() {});
+                    }
+                  },
+                  child: Text(
+                    people.length == 1 ? 'Send invite' : 'Send invites',
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    for (final c in controllers.values) {
+      c.dispose();
+    }
+    return result;
+  }
+
+  Future<String> _inviteCompanyIdForCurrentUser() async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      throw Exception('No authenticated user.');
+    }
+    final meRows = await client
+        .from('people')
+        .select('company_id')
+        .eq('auth_user_id', user.id)
+        .limit(1);
+    if ((meRows as List).isEmpty) {
+      throw Exception('No linked person/company for this user.');
+    }
+    return meRows.first['company_id'] as String;
+  }
+
+  Future<void> _createInviteForPerson({
+    required String companyId,
+    required Person? person,
+    required String email,
+  }) async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      throw Exception('No authenticated user.');
+    }
+    if (person != null) {
+      await client.from('people').update({'email': email}).eq('id', person.id);
+    }
+    final expiresAt =
+        DateTime.now().toUtc().add(const Duration(days: 14)).toIso8601String();
+    final inviteKind = person == null ? 'generic' : 'personalized:${person.id}';
+    final tokenHash =
+        '$inviteKind:${DateTime.now().microsecondsSinceEpoch}-${user.id}-${email.toLowerCase()}';
+    await client.from('invites').insert({
+      'company_id': companyId,
+      'email': email,
+      'role': 0,
+      'status': 0,
+      'token_hash': tokenHash,
+      'invited_by_user_id': user.id,
+      'expires_at': expiresAt,
+    });
+  }
+
   Future<void> _openInviteFlow({String? personId}) async {
     Person? person;
     if (personId != null) {
@@ -2836,39 +3125,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final email = await _askInviteEmailDialog(person: person);
     if (email == null || !_emailRegex.hasMatch(email)) return;
     try {
-      final client = Supabase.instance.client;
-      final user = client.auth.currentUser;
-      if (user == null) {
-        throw Exception('No authenticated user.');
-      }
-      final meRows = await client
-          .from('people')
-          .select('company_id')
-          .eq('auth_user_id', user.id)
-          .limit(1);
-      if ((meRows as List).isEmpty) {
-        throw Exception('No linked person/company for this user.');
-      }
-      final companyId = meRows.first['company_id'] as String;
-      if (person != null) {
-        await client.from('people').update({'email': email}).eq('id', person.id);
-      }
-      final expiresAt = DateTime.now()
-          .toUtc()
-          .add(const Duration(days: 14))
-          .toIso8601String();
-      final inviteKind = person == null ? 'generic' : 'personalized:${person.id}';
-      final tokenHash =
-          '$inviteKind:${DateTime.now().microsecondsSinceEpoch}-${user.id}-${email.toLowerCase()}';
-      await client.from('invites').insert({
-        'company_id': companyId,
-        'email': email,
-        'role': 0,
-        'status': 0,
-        'token_hash': tokenHash,
-        'invited_by_user_id': user.id,
-        'expires_at': expiresAt,
-      });
+      final companyId = await _inviteCompanyIdForCurrentUser();
+      await _createInviteForPerson(
+        companyId: companyId,
+        person: person,
+        email: email,
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -2878,6 +3140,74 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 : 'Personalized invite created for @${
                     person.handle
                   } ($email).',
+          ),
+        ),
+      );
+      await _loadPeopleFromSupabase();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to create invite: $e')),
+      );
+    }
+  }
+
+  /// Invite every receiver without an account; prompt for emails only when missing.
+  Future<void> _openInviteFlowForReceivers(List<Person> receivers) async {
+    final pending = receivers
+        .where((p) => (p.authUserId ?? '').trim().isEmpty)
+        .toList();
+    if (pending.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('All receivers already have accounts.')),
+      );
+      return;
+    }
+
+    final emailsByPersonId = <String, String>{};
+    final needsEmailPrompt = <Person>[];
+    for (final p in pending) {
+      final existing = (p.email ?? '').trim();
+      if (existing.isNotEmpty && _emailRegex.hasMatch(existing)) {
+        emailsByPersonId[p.id] = existing;
+      } else {
+        needsEmailPrompt.add(p);
+      }
+    }
+
+    if (needsEmailPrompt.isNotEmpty) {
+      final collected = await _askInviteEmailsForPeopleDialog(needsEmailPrompt);
+      if (collected == null) return;
+      emailsByPersonId.addAll(collected);
+    }
+
+    try {
+      final companyId = await _inviteCompanyIdForCurrentUser();
+      final sent = <String>[];
+      for (final p in pending) {
+        final email = emailsByPersonId[p.id]?.trim() ?? '';
+        if (!_emailRegex.hasMatch(email)) continue;
+        await _createInviteForPerson(
+          companyId: companyId,
+          person: p,
+          email: email,
+        );
+        sent.add('@${p.handle}');
+      }
+      if (!mounted) return;
+      if (sent.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No invites were sent.')),
+        );
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            sent.length == 1
+                ? 'Invite sent to ${sent.first}.'
+                : 'Invites sent to ${sent.join(', ')}.',
           ),
         ),
       );
@@ -2938,11 +3268,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         .hasMatch(token);
   }
 
-  /// Expectations: drop leading @receiver (stored on [target_person_id]); capitalize body.
+  /// Expectations: drop leading @receiver burst (stored on target + mentions); capitalize body.
   String _normalizeExpectationTextForStorage(String input) {
     final trimmed = input.trim();
     if (trimmed.isEmpty) return trimmed;
-    var normalized = trimmed.replaceFirst(_leadingMentionRegex, '').trim();
+    var normalized = stripLeadingMentionBurst(trimmed);
     if (normalized.isEmpty) {
       return trimmed;
     }
@@ -2954,11 +3284,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return normalized;
   }
 
-  /// Talking points: strip leading @mention (stored in [expectation_mentions]); keep other @/# in body.
+  /// Talking points: strip leading @mention burst (stored in [expectation_mentions]); keep other @/# in body.
   String _normalizeTalkingPointTextForStorage(String input) {
     final trimmed = input.trim();
     if (trimmed.isEmpty) return trimmed;
-    var normalized = trimmed.replaceFirst(_leadingMentionRegex, '').trim();
+    var normalized = stripLeadingMentionBurst(trimmed);
     if (normalized.isEmpty) {
       return trimmed;
     }
@@ -3086,8 +3416,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         expectationWriterUserId: user.id,
       );
     } catch (_) {}
-    if (type == ExpectationType.topic) {
-      final mentionLine = (mentionSourceText ?? text).trim();
+    final mentionLine = (mentionSourceText ?? text).trim();
+    if (type == ExpectationType.topic &&
+        visibility == ExpectationVisibility.echo) {
+      // Private prep (shadow): sync @mentions only on publish so receivers are not notified early.
       await syncTalkingPointMentions(
         client: client,
         companyId: companyId,
@@ -3105,13 +3437,33 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           );
         },
         createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
+        replaceExisting: true,
       );
-      if (mounted) {
-        setState(() {
-          _talkingPointMentionHandlesByExpectationId[expectationId] =
-              extractMentionHandlesFromText(mentionLine);
-        });
-      }
+    } else if (type != ExpectationType.topic) {
+      await syncExpectationCoReceiverMentions(
+        client: client,
+        companyId: companyId,
+        expectationId: expectationId,
+        mentionSourceText: mentionLine.isNotEmpty ? mentionLine : text,
+        authorPersonId: mePersonId,
+        people: _people,
+        resolveMe: (_) async {
+          return Person(
+            id: mePersonId,
+            createdAt: DateTime.now().toUtc(),
+            displayName: (meRow['display_name'] as String?) ?? '',
+            handle: (meRow['handle'] as String?) ?? 'me',
+            authUserId: user.id,
+          );
+        },
+        createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
+      );
+    }
+    if (mounted) {
+      setState(() {
+        _mentionHandlesByExpectationId[expectationId] =
+            extractMentionHandlesFromText(mentionLine.isNotEmpty ? mentionLine : text);
+      });
     }
     if (mounted) {
       await _loadRecentTagsFromSupabase();
@@ -3581,20 +3933,21 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       });
       return;
     }
-    var party = expectationsPartyForPerson(
-      expectations: _expectations,
-      authUserId: uid,
-      myPersonId: me,
-    );
     final mentioned = await fetchExpectationsMentioningPerson(
       client: client,
       companyId: companyId,
       myPersonId: me,
       mapRow: _mapSupabaseExpectationRow,
     );
-    party = mergePartyExpectationsWithMentions(
-      party: party,
+    final mergedExpectations = mergePartyExpectationsWithMentions(
+      party: _expectations,
       mentioned: mentioned,
+    );
+    var party = expectationsPartyForPerson(
+      expectations: mergedExpectations,
+      authUserId: uid,
+      myPersonId: me,
+      coReceiverPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
     );
     try {
       final snap = await computeChangelogUnreadPartySnapshot(
@@ -3710,20 +4063,21 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       );
       return;
     }
-    var party = expectationsPartyForPerson(
-      expectations: _expectations,
-      authUserId: uid,
-      myPersonId: me,
-    );
     final mentioned = await fetchExpectationsMentioningPerson(
       client: client,
       companyId: companyId,
       myPersonId: me,
       mapRow: _mapSupabaseExpectationRow,
     );
-    party = mergePartyExpectationsWithMentions(
-      party: party,
+    final mergedExpectations = mergePartyExpectationsWithMentions(
+      party: _expectations,
       mentioned: mentioned,
+    );
+    final party = expectationsPartyForPerson(
+      expectations: mergedExpectations,
+      authUserId: uid,
+      myPersonId: me,
+      coReceiverPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
     );
     if (!mounted) return;
     final anchorContext = _activityBellAnchorKey.currentContext;
@@ -3928,11 +4282,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               key: _expectationDetailsPanelKey,
               expectation: e,
               person: person,
-              talkingPointPersistedMentions: _isDiscussionPoint(e)
-                  ? _talkingPointPersistedMentions(e)
-                  : const [],
-              canEdit: true,
-              onInvitePerson: (personId) => _openInviteFlow(personId: personId),
+              talkingPointPersistedMentions: _persistedMentionHandles(e),
+              coReceiverPersonIds:
+                  _mentionPersonIdsByExpectationId[e.id] ?? const {},
+              receiverPeople: _receiverPeopleForExpectation(e),
+              canEdit: _canEditExpectationForUser(
+                e,
+                uid,
+                _myPersonId,
+              ),
+              onInviteReceivers: _openInviteFlowForReceivers,
               onChangelogReadSynced: _scheduleChangelogUnreadSnapshotRefresh,
               onExpectationDataMutated: () {
                 unawaited(_loadExpectationsFromSupabase());
@@ -3962,8 +4321,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           tooltip: _railExpanded ? 'Collapse sidebar' : 'Expand sidebar',
           onPressed: () => setState(() => _railExpanded = !_railExpanded),
         ),
-        title: Text(supabaseIsLeamDevHost ? 'exled · dev' : 'exled'),
+        title: Text(
+          supabaseIsLeamDevHost ? 'exled · dev' : 'exled',
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
+          DebugMenuButton(
+            activityUnreadCount: _activityUnreadCount,
+            onReloadExpectations: () async {
+              await _loadExpectationsFromSupabase();
+              await _refreshActivityUnreadCount();
+            },
+          ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
             child: FilledButton.tonalIcon(
@@ -4372,6 +4741,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             mePerson: mePerson,
             currentUserId: Supabase.instance.client.auth.currentUser?.id,
             peopleById: peopleById,
+            mentionHandlesByExpectationId: _mentionHandlesByExpectationId,
+            mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
             hasUnreadChat: _hasUnreadListingIndicator,
             activityUnreadCount: _activityUnreadCount,
             onOpenActivityFeed: _toggleActivityFeedPanel,
@@ -4423,9 +4794,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onDelete: () => _deleteExpectationFromList(x),
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
               composerRecentListing: true,
-              talkingPointPersistedMentions: x.type == ExpectationType.topic
-                  ? _talkingPointPersistedMentions(x)
-                  : const [],
+              talkingPointPersistedMentions: _persistedMentionHandles(x),
             ),
           );
         }
@@ -4652,7 +5021,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 personForItem: (_) => null,
                 talkingPointsBrowseListing: true,
                 talkingPointMentionHandlesById:
-                    _talkingPointMentionHandlesByExpectationId,
+                    _mentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
                 onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
@@ -4681,7 +5050,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 personForItem: (_) => null,
                 talkingPointsBrowseListing: true,
                 talkingPointMentionHandlesById:
-                    _talkingPointMentionHandlesByExpectationId,
+                    _mentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
                 onPublishTalkingPoint: _publishTalkingPointBrowse,
               ),
@@ -4745,7 +5114,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               personForItem: (_) => null,
               talkingPointsBrowseListing: true,
               talkingPointMentionHandlesById:
-                  _talkingPointMentionHandlesByExpectationId,
+                  _mentionHandlesByExpectationId,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
@@ -4774,7 +5143,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               personForItem: (_) => null,
               talkingPointsBrowseListing: true,
               talkingPointMentionHandlesById:
-                  _talkingPointMentionHandlesByExpectationId,
+                  _mentionHandlesByExpectationId,
               onArchiveTalkingPoint: _archiveTalkingPointBrowse,
               onPublishTalkingPoint: _publishTalkingPointBrowse,
             ),
@@ -4801,8 +5170,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           final towardsMe = expectations
               .where(
                 (x) =>
-                    x.personId == mePerson.id &&
-                    x.type == ExpectationType.expectation,
+                    x.type == ExpectationType.expectation &&
+                    _isExpectationReceiver(x, mePerson.id),
               )
               .toList();
           final towardsMeForTab = towardsMe
@@ -4952,6 +5321,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               inboxHoverIncludeDelete:
                   _inboxListingTab == _InboxListingTab.personal,
               inboxReceiverPersonId: mePerson.id,
+              mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
               onArchiveInbox: _archiveInboxExpectation,
             ),
           );
@@ -4979,6 +5349,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 inboxHoverIncludeDelete:
                     _inboxListingTab == _InboxListingTab.personal,
                 inboxReceiverPersonId: mePerson.id,
+                mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
                 onArchiveInbox: _archiveInboxExpectation,
               ),
             );
@@ -6927,6 +7298,8 @@ class _HomeDashboardPanel extends StatelessWidget {
     required this.mePerson,
     required this.currentUserId,
     required this.peopleById,
+    required this.mentionHandlesByExpectationId,
+    required this.mentionPersonIdsByExpectationId,
     required this.hasUnreadChat,
     required this.activityUnreadCount,
     required this.onOpenActivityFeed,
@@ -6943,6 +7316,8 @@ class _HomeDashboardPanel extends StatelessWidget {
   final Person? mePerson;
   final String? currentUserId;
   final Map<String, Person> peopleById;
+  final Map<String, List<String>> mentionHandlesByExpectationId;
+  final Map<String, Set<String>> mentionPersonIdsByExpectationId;
   final bool Function(Expectation e) hasUnreadChat;
   final int activityUnreadCount;
   final VoidCallback onOpenActivityFeed;
@@ -6958,7 +7333,13 @@ class _HomeDashboardPanel extends StatelessWidget {
         .where(
           (e) =>
               e.status != ExpectationStatus.abandoned &&
-              _ledgerUserInvolvedInExpectation(e, currentUserId, mePerson),
+              _ledgerUserInvolvedInExpectation(
+                e,
+                currentUserId,
+                mePerson,
+                mentionPersonIdsByExpectationId:
+                    mentionPersonIdsByExpectationId,
+              ),
         )
         .toList()
       ..sort(
@@ -6969,7 +7350,13 @@ class _HomeDashboardPanel extends StatelessWidget {
         .where(
           (e) =>
               _expectationQualifiesForHomeUrgent(e) &&
-              _homeUrgentUserIsWriterOrReceiver(e, currentUserId, mePerson),
+              _homeUrgentUserIsWriterOrReceiver(
+                e,
+                currentUserId,
+                mePerson,
+                mentionPersonIdsByExpectationId:
+                    mentionPersonIdsByExpectationId,
+              ),
         )
         .toList();
     _sortHomeUrgentExpectations(urgentPool);
@@ -7178,6 +7565,10 @@ class _HomeDashboardPanel extends StatelessWidget {
                               mePerson,
                               peopleById,
                               people,
+                              mentionHandlesByExpectationId:
+                                  mentionHandlesByExpectationId,
+                              mentionPersonIdsByExpectationId:
+                                  mentionPersonIdsByExpectationId,
                             ),
                             trailingLabel: _activityRecencyShortLabel(
                               _expectationActivityAt(e),
@@ -7247,6 +7638,10 @@ class _HomeDashboardPanel extends StatelessWidget {
                               mePerson,
                               peopleById,
                               people,
+                              mentionHandlesByExpectationId:
+                                  mentionHandlesByExpectationId,
+                              mentionPersonIdsByExpectationId:
+                                  mentionPersonIdsByExpectationId,
                             ),
                             trailingLabel: _homeUrgentTrailingLabel(e, scheme),
                             trailingColor: _homeUrgentTrailingColor(e, scheme),
@@ -7254,16 +7649,22 @@ class _HomeDashboardPanel extends StatelessWidget {
                               e,
                               currentUserId,
                               mePerson,
+                              mentionPersonIdsByExpectationId:
+                                  mentionPersonIdsByExpectationId,
                             ),
                             urgencyRoleTooltip: _homeUrgentRoleTooltip(
                               e,
                               currentUserId,
                               mePerson,
+                              mentionPersonIdsByExpectationId:
+                                  mentionPersonIdsByExpectationId,
                             ),
                             urgencyRoleIconColor: _homeUrgentRoleIconColor(
                               e,
                               currentUserId,
                               mePerson,
+                              mentionPersonIdsByExpectationId:
+                                  mentionPersonIdsByExpectationId,
                             ),
                             unread: hasUnreadChat(e),
                             onTap: () => onOpenItem(e, peopleById[e.personId]),
@@ -7835,12 +8236,18 @@ DateTime _expectationActivityAt(Expectation e) {
 bool _ledgerUserInvolvedInExpectation(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
   if (currentUserId != null && e.writerUserId == currentUserId) return true;
   if (mePerson != null &&
-      e.personId.trim().isNotEmpty &&
-      e.personId == mePerson.id) {
+      expectationAppliesToPerson(
+        e: e,
+        myPersonId: mePerson.id,
+        mentionsIndex: ExpectationMentionsIndex(
+          personIdsByExpectationId: mentionPersonIdsByExpectationId,
+        ),
+      )) {
     return true;
   }
   return false;
@@ -7861,16 +8268,32 @@ String? _homeActivitySubline(
   String? currentUserId,
   Person? mePerson,
   Map<String, Person> peopleById,
-  List<Person> people,
-) {
+  List<Person> people, {
+  Map<String, List<String>> mentionHandlesByExpectationId = const {},
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
   final uid = currentUserId;
   final isWriter = uid != null && e.writerUserId == uid;
   if (isWriter) {
-    final p = peopleById[e.personId];
-    if (p == null) return null;
-    return 'With ${ledgerAtMentionLine(p.displayName.trim().isNotEmpty ? p.displayName : p.handle)}';
+    final receivers = expectationReceiverWhoLabel(
+      summary: e.summary,
+      personDisplayName: peopleById[e.personId]?.displayName,
+      personHandle: peopleById[e.personId]?.handle,
+      personId: e.personId,
+      persistedMentionHandles:
+          mentionHandlesByExpectationId[e.id] ?? const [],
+    );
+    if (receivers == kLedgerAllMentionLabel) return null;
+    return 'With ${ledgerAtMentionLine(receivers)}';
   }
-  if (mePerson != null && e.personId.trim() == mePerson.id) {
+  if (mePerson != null &&
+      expectationAppliesToPerson(
+        e: e,
+        myPersonId: mePerson.id,
+        mentionsIndex: ExpectationMentionsIndex(
+          personIdsByExpectationId: mentionPersonIdsByExpectationId,
+        ),
+      )) {
     final w = _ledgerWriterPerson(e, people);
     if (w == null) return 'From someone on the team';
     return 'From ${ledgerAtMentionLine(w.displayName.trim().isNotEmpty ? w.displayName : w.handle)}';
@@ -7934,45 +8357,67 @@ bool _expectationQualifiesForHomeUrgent(Expectation e) {
 bool _homeUrgentUserIsWriterOrReceiver(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
   final uid = currentUserId;
   if (uid != null && e.writerUserId == uid) return true;
   if (mePerson == null) return false;
-  final pid = e.personId.trim();
-  if (pid.isEmpty) return false;
-  return pid == mePerson.id;
+  return expectationAppliesToPerson(
+    e: e,
+    myPersonId: mePerson.id,
+    mentionsIndex: ExpectationMentionsIndex(
+      personIdsByExpectationId: mentionPersonIdsByExpectationId,
+    ),
+  );
 }
 
 /// You are the addressee (including self-addressed); urgency is on your side — Inbox rail icon.
 bool _homeUrgentNeedsMyAction(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
   if (mePerson == null) return false;
-  final pid = e.personId.trim();
-  if (pid.isEmpty) return false;
-  return pid == mePerson.id;
+  return expectationAppliesToPerson(
+    e: e,
+    myPersonId: mePerson.id,
+    mentionsIndex: ExpectationMentionsIndex(
+      personIdsByExpectationId: mentionPersonIdsByExpectationId,
+    ),
+  );
 }
 
 /// You sent this to someone else (or no receiver yet); waiting on them / your dispatch — Outbox.
 bool _homeUrgentWaitingOnCounterparty(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
   final uid = currentUserId;
   if (uid == null || e.writerUserId != uid) return false;
-  return !_homeUrgentNeedsMyAction(e, currentUserId, mePerson);
+  return !_homeUrgentNeedsMyAction(
+    e,
+    currentUserId,
+    mePerson,
+    mentionPersonIdsByExpectationId: mentionPersonIdsByExpectationId,
+  );
 }
 
 IconData _homeUrgentRoleIcon(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
-  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
+  if (_homeUrgentNeedsMyAction(
+    e,
+    currentUserId,
+    mePerson,
+    mentionPersonIdsByExpectationId: mentionPersonIdsByExpectationId,
+  )) {
     return Icons.south_west_outlined;
   }
   return Icons.north_east_outlined;
@@ -7981,9 +8426,15 @@ IconData _homeUrgentRoleIcon(
 Color _homeUrgentRoleIconColor(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
-  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
+  if (_homeUrgentNeedsMyAction(
+    e,
+    currentUserId,
+    mePerson,
+    mentionPersonIdsByExpectationId: mentionPersonIdsByExpectationId,
+  )) {
     return LedgerPillar.expectationsMe.accent;
   }
   return LedgerPillar.expectationsOthers.accent;
@@ -7992,12 +8443,23 @@ Color _homeUrgentRoleIconColor(
 String _homeUrgentRoleTooltip(
   Expectation e,
   String? currentUserId,
-  Person? mePerson,
-) {
-  if (_homeUrgentNeedsMyAction(e, currentUserId, mePerson)) {
+  Person? mePerson, {
+  Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
+}) {
+  if (_homeUrgentNeedsMyAction(
+    e,
+    currentUserId,
+    mePerson,
+    mentionPersonIdsByExpectationId: mentionPersonIdsByExpectationId,
+  )) {
     return 'On you (Inbox): you are the receiver — progress, reply, or resolve.';
   }
-  if (_homeUrgentWaitingOnCounterparty(e, currentUserId, mePerson)) {
+  if (_homeUrgentWaitingOnCounterparty(
+    e,
+    currentUserId,
+    mePerson,
+    mentionPersonIdsByExpectationId: mentionPersonIdsByExpectationId,
+  )) {
     return 'Waiting on them (Outbox): you are the sender — follow up with the other party.';
   }
   return 'Urgent item';
@@ -8272,6 +8734,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
     this.inboxHoverListing = false,
     this.inboxHoverIncludeDelete = false,
     this.inboxReceiverPersonId,
+    this.mentionPersonIdsByExpectationId = const {},
     this.onArchiveInbox,
     this.talkingPointsBrowseListing = false,
     this.talkingPointMentionHandlesById,
@@ -8304,6 +8767,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
   final bool inboxHoverListing;
   final bool inboxHoverIncludeDelete;
   final String? inboxReceiverPersonId;
+  final Map<String, Set<String>> mentionPersonIdsByExpectationId;
   final Future<void> Function(Expectation expectation)? onArchiveInbox;
   /// Tags pillar (Private / Public lists): hover Archive + owner Delete.
   final bool talkingPointsBrowseListing;
@@ -8393,6 +8857,8 @@ class _ExpectationsOthersSection extends StatelessWidget {
                   inboxHoverListing: inboxHoverListing,
                   inboxHoverIncludeDelete: inboxHoverIncludeDelete,
                   inboxReceiverPersonId: inboxReceiverPersonId,
+                  coReceiverPersonIds:
+                      mentionPersonIdsByExpectationId[e.id] ?? const {},
                   onArchiveInbox: onArchiveInbox,
                   talkingPointsBrowseListing: talkingPointsBrowseListing,
                   talkingPointPersistedMentions:
@@ -8605,6 +9071,7 @@ class _ExpectationOthersTile extends StatefulWidget {
     this.inboxHoverListing = false,
     this.inboxHoverIncludeDelete = false,
     this.inboxReceiverPersonId,
+    this.coReceiverPersonIds = const {},
     this.onArchiveInbox,
     this.composerRecentListing = false,
     this.talkingPointsBrowseListing = false,
@@ -8628,6 +9095,7 @@ class _ExpectationOthersTile extends StatefulWidget {
   final bool inboxHoverListing;
   final bool inboxHoverIncludeDelete;
   final String? inboxReceiverPersonId;
+  final Set<String> coReceiverPersonIds;
   final Future<void> Function(Expectation expectation)? onArchiveInbox;
   /// Add Expectation / Add talking point — Recent: hover Delete (no under-avatar trash).
   final bool composerRecentListing;
@@ -8698,6 +9166,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
             personDisplayName: widget.person?.displayName,
             personHandle: widget.person?.handle,
             personId: widget.expectation.personId,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
           );
     final who =
         isDiscussionPoint ? baseWho : ledgerAtMentionLine(baseWho);
@@ -8748,11 +9217,12 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         widget.onArchiveDraft != null &&
         widget.onDelete != null;
     final recvId = widget.inboxReceiverPersonId?.trim() ?? '';
+    final isInboxReceiver = recvId.isNotEmpty &&
+        (widget.expectation.personId.trim() == recvId ||
+            widget.coReceiverPersonIds.contains(recvId));
     final canArchiveInbox = widget.inboxHoverListing &&
         widget.onArchiveInbox != null &&
-        (isWriter ||
-            (recvId.isNotEmpty &&
-                widget.expectation.personId.trim() == recvId));
+        (isWriter || isInboxReceiver);
     final showInboxHoverBar = widget.inboxHoverListing &&
         _hoverInboxRow &&
         canArchiveInbox;
@@ -9593,8 +10063,10 @@ class _ExpectationDetailsPanel extends StatefulWidget {
     required this.expectation,
     required this.person,
     this.talkingPointPersistedMentions = const [],
+    this.coReceiverPersonIds = const {},
+    this.receiverPeople = const [],
     required this.canEdit,
-    this.onInvitePerson,
+    this.onInviteReceivers,
     this.onChangelogReadSynced,
     this.onExpectationDataMutated,
   });
@@ -9602,8 +10074,10 @@ class _ExpectationDetailsPanel extends StatefulWidget {
   final Expectation expectation;
   final Person? person;
   final List<String> talkingPointPersistedMentions;
+  final Set<String> coReceiverPersonIds;
+  final List<Person> receiverPeople;
   final bool canEdit;
-  final Future<void> Function(String? personId)? onInvitePerson;
+  final Future<void> Function(List<Person> receivers)? onInviteReceivers;
   final VoidCallback? onChangelogReadSynced;
   final VoidCallback? onExpectationDataMutated;
 
@@ -10110,7 +10584,9 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     setState(() => _saving = true);
     final client = Supabase.instance.client;
     await _ensureActorContext();
-    final isReceiverActor = _myPersonId != null && _myPersonId == widget.expectation.personId;
+    final isReceiverActor = _myPersonId != null &&
+        (_myPersonId == widget.expectation.personId ||
+            widget.coReceiverPersonIds.contains(_myPersonId));
     // If receiver saves while still pending, auto-promote to accepted.
     if (isReceiverActor && _status == ExpectationStatus.pending) {
       _status = ExpectationStatus.accepted;
@@ -10183,10 +10659,130 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
           _updateRequestedAt = null;
         }
       });
+      if (widget.expectation.type == ExpectationType.expectation &&
+          _companyId != null &&
+          _myPersonId != null) {
+        try {
+          final peopleRows = await client
+              .from('people')
+              .select(
+                'id,created_at,display_name,handle,auth_user_id,email,title',
+              )
+              .eq('company_id', _companyId!);
+          final people = <Person>[];
+          for (final raw in peopleRows as List) {
+            if (raw is! Map) continue;
+            final row = Map<String, dynamic>.from(raw);
+            people.add(
+              Person(
+                id: row['id'] as String,
+                createdAt: DateTime.tryParse(
+                      (row['created_at'] as String?) ?? '',
+                    ) ??
+                    DateTime.now().toUtc(),
+                displayName: ((row['display_name'] as String?) ?? '').trim(),
+                handle: ((row['handle'] as String?) ?? '').trim(),
+                authUserId: (row['auth_user_id'] as String?)?.trim(),
+                email: ((row['email'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['email'] as String?) ?? '').trim(),
+                title: ((row['title'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['title'] as String?) ?? '').trim(),
+              ),
+            );
+          }
+          final primaryHandle = (widget.person?.handle ?? '').trim();
+          final mentionLine = primaryHandle.isNotEmpty
+              ? '@$primaryHandle $summary'
+              : summary;
+          await syncExpectationCoReceiverMentions(
+            client: client,
+            companyId: _companyId!,
+            expectationId: widget.expectation.id,
+            mentionSourceText: mentionLine,
+            authorPersonId: _myPersonId!,
+            people: people,
+            resolveMe: (_) async {
+              for (final p in people) {
+                if (p.id == _myPersonId) return p;
+              }
+              return null;
+            },
+            createPlaceholder: (_) async {
+              throw StateError('Unexpected unknown @mention on save');
+            },
+          );
+        } on PostgrestException {
+          // Mentions table / policy not deployed.
+        } catch (_) {}
+      } else if (widget.expectation.type == ExpectationType.topic &&
+          publish &&
+          nextVisibility == ExpectationVisibility.echo &&
+          _companyId != null &&
+          _myPersonId != null) {
+        try {
+          final peopleRows = await client
+              .from('people')
+              .select(
+                'id,created_at,display_name,handle,auth_user_id,email,title',
+              )
+              .eq('company_id', _companyId!);
+          final people = <Person>[];
+          for (final raw in peopleRows as List) {
+            if (raw is! Map) continue;
+            final row = Map<String, dynamic>.from(raw);
+            people.add(
+              Person(
+                id: row['id'] as String,
+                createdAt: DateTime.tryParse(
+                      (row['created_at'] as String?) ?? '',
+                    ) ??
+                    DateTime.now().toUtc(),
+                displayName: ((row['display_name'] as String?) ?? '').trim(),
+                handle: ((row['handle'] as String?) ?? '').trim(),
+                authUserId: (row['auth_user_id'] as String?)?.trim(),
+                email: ((row['email'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['email'] as String?) ?? '').trim(),
+                title: ((row['title'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['title'] as String?) ?? '').trim(),
+              ),
+            );
+          }
+          await syncTalkingPointMentions(
+            client: client,
+            companyId: _companyId!,
+            expectationId: widget.expectation.id,
+            summary: summary,
+            authorPersonId: _myPersonId!,
+            people: people,
+            resolveMe: (_) async {
+              for (final p in people) {
+                if (p.id == _myPersonId) return p;
+              }
+              return null;
+            },
+            createPlaceholder: (_) async {
+              throw StateError('Unexpected unknown @mention on publish');
+            },
+            replaceExisting: true,
+          );
+        } on PostgrestException {
+          // Mentions table / policy not deployed.
+        } catch (_) {}
+      }
       await _loadConversation();
       widget.onExpectationDataMutated?.call();
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Expectation saved.')),
+        SnackBar(
+          content: Text(
+            publish && widget.expectation.type == ExpectationType.topic
+                ? 'Talking point published.'
+                : 'Expectation saved.',
+          ),
+        ),
       );
     } catch (_) {
       if (!mounted) return;
@@ -10242,13 +10838,13 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     }
   }
 
-  Future<void> _inviteReceiver() async {
-    final receiver = widget.person;
-    if (receiver == null || _inviting) return;
-    if (widget.onInvitePerson == null) return;
+  Future<void> _inviteReceivers() async {
+    if (_inviting || widget.onInviteReceivers == null) return;
+    final targets = widget.receiverPeople;
+    if (targets.isEmpty) return;
     setState(() => _inviting = true);
     try {
-      await widget.onInvitePerson!(receiver.id);
+      await widget.onInviteReceivers!(targets);
       if (!mounted) return;
       setState(() => _inviting = false);
     } catch (_) {
@@ -10277,6 +10873,38 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         peerMessageIds: peerIds,
       ),
     );
+  }
+
+  static const _expectationMessagesSelectWithReads =
+      'id,sender_person_id,message_text,created_at,type,'
+      'people!expectation_messages_sender_person_id_fkey(display_name,handle),'
+      'expectation_message_attachments(file_name,file_url),'
+      'expectation_message_reads(reader_person_id,read_at)';
+
+  static const _expectationMessagesSelectWithoutReads =
+      'id,sender_person_id,message_text,created_at,type,'
+      'people!expectation_messages_sender_person_id_fkey(display_name,handle),'
+      'expectation_message_attachments(file_name,file_url)';
+
+  /// Loads thread rows; omits read-receipt embed if prod RLS/grants are not deployed yet.
+  Future<List<dynamic>> _fetchExpectationMessageRows({
+    required SupabaseClient client,
+    required String expectationId,
+  }) async {
+    try {
+      return await client
+          .from('expectation_messages')
+          .select(_expectationMessagesSelectWithReads)
+          .eq('expectation_id', expectationId)
+          .order('created_at', ascending: false) as List;
+    } on PostgrestException catch (e) {
+      if (e.code != '42501') rethrow;
+      return await client
+          .from('expectation_messages')
+          .select(_expectationMessagesSelectWithoutReads)
+          .eq('expectation_id', expectationId)
+          .order('created_at', ascending: false) as List;
+    }
   }
 
   Future<void> _loadConversation() async {
@@ -10334,17 +10962,10 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         _changelogVisitBaselineCaptured = true;
       }
 
-      final rows = await client
-          .from('expectation_messages')
-          .select(
-            'id,sender_person_id,message_text,created_at,type,'
-            // Disambiguate vs expectation_message_reads ? people (reader).
-            'people!expectation_messages_sender_person_id_fkey(display_name,handle),'
-            'expectation_message_attachments(file_name,file_url),'
-            'expectation_message_reads(reader_person_id,read_at)',
-          )
-          .eq('expectation_id', widget.expectation.id)
-          .order('created_at', ascending: false);
+      final rows = await _fetchExpectationMessageRows(
+        client: client,
+        expectationId: widget.expectation.id,
+      );
 
       String normalizeLoadedMessageText(dynamic raw) {
         if (raw == null) return '';
@@ -10611,12 +11232,32 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
-    final hasReceiver = handle != null &&
-        handle.trim().isNotEmpty &&
-        widget.expectation.personId.trim().isNotEmpty;
-    final showInviteForReceiver = canEdit &&
-        widget.person != null &&
-        (widget.person!.authUserId ?? '').trim().isEmpty;
+    final receiverLabel = isDiscussionPoint
+        ? talkingPointMentionWhoLabel(
+            widget.expectation.summary,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
+          )
+        : expectationReceiverWhoLabel(
+            summary: widget.expectation.summary,
+            personDisplayName: widget.person?.displayName,
+            personHandle: widget.person?.handle,
+            personId: widget.expectation.personId,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
+          );
+    final hasReceiver = receiverLabel != kLedgerAllMentionLabel;
+    final inviteRecipients = widget.receiverPeople.isNotEmpty
+        ? widget.receiverPeople
+        : [
+            if (widget.person != null) widget.person!,
+          ];
+    final receiversMissingEmail = inviteRecipients
+        .where((p) => (p.email ?? '').trim().isEmpty)
+        .toList();
+    final showInviteForReceivers =
+        canEdit && receiversMissingEmail.isNotEmpty;
+    final inviteButtonLabel = receiversMissingEmail.length > 1
+        ? 'Invite all'
+        : 'Invite';
     final working = Expectation(
       id: widget.expectation.id,
       createdAt: widget.expectation.createdAt,
@@ -10727,17 +11368,21 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                           valueWidget: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Text(
-                                handle.startsWith('@') ? handle : '@$handle',
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: scheme.onSurface,
-                                  fontWeight: FontWeight.w600,
+                              Flexible(
+                                child: Text(
+                                  isDiscussionPoint
+                                      ? receiverLabel
+                                      : ledgerAtMentionLine(receiverLabel),
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: scheme.onSurface,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                               ),
-                              if (showInviteForReceiver) ...[
+                              if (showInviteForReceivers) ...[
                                 const SizedBox(width: 8),
                                 TextButton(
-                                  onPressed: _inviting ? null : _inviteReceiver,
+                                  onPressed: _inviting ? null : _inviteReceivers,
                                   style: TextButton.styleFrom(
                                     visualDensity: VisualDensity.compact,
                                     padding: const EdgeInsets.symmetric(
@@ -10753,7 +11398,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                           height: 12,
                                           child: CircularProgressIndicator(strokeWidth: 2),
                                         )
-                                      : const Text('Invite'),
+                                      : Text(inviteButtonLabel),
                                 ),
                               ],
                             ],

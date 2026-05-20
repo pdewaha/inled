@@ -24,7 +24,7 @@
             "deviceId": "chrome",
             "args": [
                 "--web-port=8080",
-                "--dart-define=SUPABASE_URL=https://exled-be.tauworks.org"
+                "--dart-define=SUPABASE_URL=https://be.exled.app"
             ]
         },
         {

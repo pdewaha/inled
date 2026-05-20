@@ -1,5 +1,6 @@
 import 'package:exled/models/expectation.dart';
 import 'package:exled/models/expectation_type.dart';
+import 'package:exled/models/expectation_visibility.dart';
 import 'package:exled/models/expectation_changelog_payload.dart';
 import 'package:exled/services/expectation_chat_changelog.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -50,10 +51,19 @@ bool expectationIsPartyForPerson({
   required Expectation e,
   required String authUserId,
   required String myPersonId,
+  Set<String>? coReceiverPersonIds,
 }) {
   if (e.writerUserId == authUserId) return true;
   final target = e.personId.trim();
   if (target.isNotEmpty && target == myPersonId) return true;
+  // Shadow talking points: co-@mentions are not party until publish (echo).
+  if (e.type == ExpectationType.topic &&
+      e.visibility == ExpectationVisibility.shadow) {
+    return false;
+  }
+  if (coReceiverPersonIds != null && coReceiverPersonIds.contains(myPersonId)) {
+    return true;
+  }
   return false;
 }
 
@@ -61,6 +71,7 @@ List<Expectation> expectationsPartyForPerson({
   required List<Expectation> expectations,
   required String authUserId,
   required String myPersonId,
+  Map<String, Set<String>>? coReceiverPersonIdsByExpectationId,
 }) {
   return expectations
       .where(
@@ -68,6 +79,8 @@ List<Expectation> expectationsPartyForPerson({
           e: e,
           authUserId: authUserId,
           myPersonId: myPersonId,
+          coReceiverPersonIds:
+              coReceiverPersonIdsByExpectationId?[e.id],
         ),
       )
       .toList();

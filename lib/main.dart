@@ -8,10 +8,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await loadDebugSupabaseBackendPreference();
   await Supabase.initialize(
     url: supabaseUrl,
-    anonKey:
-        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjEzMTQyMDcxLCJleHAiOjE5Mjg3MTMyNzF9.NC1GLG2-Ae8_vpynii0-Omd8qnQRlnZOd7ZWRsYoCE8',
+    anonKey: supabaseAnonKey,
   );
   runApp(const ExledApp());
 }
@@ -27,9 +27,26 @@ class _ExledAppState extends State<ExledApp> {
   AppThemeVariant _variant = AppThemeVariant.dark;
 
   @override
+  void initState() {
+    super.initState();
+    supabaseEnvironmentRevision.addListener(_onSupabaseEnvironmentChanged);
+  }
+
+  @override
+  void dispose() {
+    supabaseEnvironmentRevision.removeListener(_onSupabaseEnvironmentChanged);
+    super.dispose();
+  }
+
+  void _onSupabaseEnvironmentChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
   Widget build(BuildContext context) {
     final auth = Supabase.instance.client.auth;
     return MaterialApp(
+      key: ValueKey('supabase-env-${supabaseEnvironmentRevision.value}'),
       debugShowCheckedModeBanner: false,
       title: 'exled',
       theme: _variant.themeData,

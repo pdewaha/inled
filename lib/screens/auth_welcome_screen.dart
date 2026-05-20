@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:exled/supabase_config.dart';
 import 'package:exled/theme.dart';
+import 'package:exled/widgets/debug_menu_button.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthWelcomeScreen extends StatelessWidget {
@@ -19,8 +20,12 @@ class AuthWelcomeScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('exled'),
+        title: Text(
+          supabaseIsLeamDevHost ? 'exled · dev' : 'exled',
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
+          const DebugMenuButton(),
           MenuAnchor(
             menuChildren: [
               for (final v in AppThemeVariant.values)
