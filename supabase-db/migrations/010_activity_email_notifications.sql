@@ -3,11 +3,9 @@
 -- 2) Deploy Edge Function: supabase/functions/send-activity-email
 -- 3) Set Edge Function secrets (same SMTP mailbox as GoTrue / Open-Xchange OTP):
 --    SMTP_HOSTNAME, SMTP_PORT, SMTP_SECURE, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM, EXLED_APP_URL
--- 4) Hook delivery (pick one):
---    A) Cron / manual: POST send-activity-email { "process_pending": true } (debug menu or invoke script)
---    B) Database Webhook: INSERT on activity_email_outbox → send-activity-email
---       body: { "outbox_id": "{{ record.id }}" }
---    C) pg_net: set app.activity_email_function_url + app.service_role_key (see trigger at end of file)
+-- 4) Hook delivery:
+--    Recommended: migration 011 + scripts/setup-activity-email-immediate-dispatch.sh (pg_net on INSERT).
+--    Fallback: cron / manual POST { "process_pending": true } or Database Webhook on INSERT.
 -- Self-hosted deploy: scripts/setup-beacon-edge-functions.sh + scripts/ACTIVITY_EMAIL.md
 
 CREATE TABLE IF NOT EXISTS activity_email_outbox (

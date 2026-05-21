@@ -1,0 +1,14 @@
+# Beacon activity email — fixed addresses (scripts/beacon-environments.sh)
+
+#  leam = DEV     Kong: leam-kong:8000     Public: https://leam.tauworks.org
+#  exled = PROD   Kong: exled-kong:8000    Public: https://be.exled.app
+
+# --- PROD (exled) ---
+cd ~/exled/docker && source .env
+sed -i 's/\r$//' scripts/*.sh
+bash scripts/setup-activity-email-immediate-dispatch.sh
+bash scripts/check-activity-email-dispatch.sh
+
+# --- DEV (leam) ---
+cd ~/leam/docker && source .env
+bash scripts/setup-activity-email-immediate-dispatch.sh

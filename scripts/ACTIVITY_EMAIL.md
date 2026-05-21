@@ -4,7 +4,9 @@ The database enqueues `activity_email_outbox` (migration `010`). The **`send-act
 
 ## Self-hosted beacon (no Supabase CLI)
 
-1. Apply migration `supabase-db/migrations/010_activity_email_notifications.sql`.
+1. Apply migrations `010`–`015` (at minimum `010`, `012`, `013`, `014`, `015` for changelog mail including **Request update**), then `012_activity_email_dispatch_config_table.sql` for immediate pg_net dispatch (011 optional if 012 applied).
+
+   **Request update:** when the author taps Request update, the app inserts `expectation_messages.type = 15`; migration `015` enqueues mail to every receiver (`target_person_id` + `expectation_mentions`) who has an email and is not the sender.
 
 2. Copy function files into the **Docker volume** (not `supabase/functions` on the server unless you keep a full git clone there):
 
@@ -103,13 +105,16 @@ Redeploy latest `send-activity-email/index.ts` (improved SMTP reader + longer ti
 
    **Live trace lines** on the server: `docker compose logs -f functions | grep send-activity-email-trace` — each line is JSON with `event` (`smtp_send_begin`, `postgrest_error`, `handler_error`, …).
 
-6. Drain pending (app debug menu, or):
+6. **Immediate send on queue** (after health check works — no cron):
 
-   ```powershell
-   .\scripts\invoke-send-activity-email.ps1 -ProcessPending
+   ```bash
+   cd ~/leam/docker && source .env
+   bash scripts/setup-activity-email-immediate-dispatch.sh
    ```
 
-7. **Auto-send:** cron or DB webhook — see [deploy-send-activity-email-selfhosted.md](deploy-send-activity-email-selfhosted.md) section E.
+   Each outbox `INSERT` → pg_net POST `send-activity-email` with `{ "outbox_id": "…" }`. Use `KONG_HOST=leam-kong` if your compose network uses that instead of `kong`.
+
+7. **Backlog only:** `bash scripts/drain-activity-email-queue.sh` (from `~/leam/docker` after `source .env`). Inspect: `bash scripts/show-activity-email-queue.sh`.
 
 Full walkthrough + troubleshooting: [deploy-send-activity-email-selfhosted.md](deploy-send-activity-email-selfhosted.md).
 

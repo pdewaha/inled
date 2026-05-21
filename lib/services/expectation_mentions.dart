@@ -22,13 +22,18 @@ String stripLeadingMentionBurst(String text) {
 
 /// Index of @handles and mentioned person ids per expectation.
 class ExpectationMentionsIndex {
-  const ExpectationMentionsIndex({
-    this.handlesByExpectationId = const {},
-    this.personIdsByExpectationId = const {},
-  });
+  ExpectationMentionsIndex({
+    Map<String, List<String>>? handlesByExpectationId,
+    Map<String, Set<String>>? personIdsByExpectationId,
+  })  : handlesByExpectationId =
+            handlesByExpectationId ?? <String, List<String>>{},
+        personIdsByExpectationId =
+            personIdsByExpectationId ?? <String, Set<String>>{};
 
   final Map<String, List<String>> handlesByExpectationId;
   final Map<String, Set<String>> personIdsByExpectationId;
+
+  static ExpectationMentionsIndex empty() => ExpectationMentionsIndex();
 }
 
 /// Distinct @handles in [text], first occurrence order (case-insensitive dedupe).
@@ -172,7 +177,7 @@ Future<void> syncTalkingPointMentions({
   );
 }
 
-/// Co-receivers on expectations (@Marc @John …): first @ → [target_person_id], all → [expectation_mentions].
+/// Expectation receivers (@Marc @John …): first @ → [target_person_id], rest → [expectation_mentions].
 Future<void> syncExpectationCoReceiverMentions({
   required SupabaseClient client,
   required String companyId,
@@ -184,18 +189,65 @@ Future<void> syncExpectationCoReceiverMentions({
   required Future<Person> Function(String handle) createPlaceholder,
   bool replaceExisting = true,
 }) async {
-  await _syncMentionsFromText(
-    client: client,
-    companyId: companyId,
-    expectationId: expectationId,
-    summary: mentionSourceText,
-    authorPersonId: authorPersonId,
-    people: people,
-    resolveMe: resolveMe,
-    createMe: resolveMe,
-    createPlaceholder: createPlaceholder,
-    replaceExisting: replaceExisting,
-  );
+  final handles = extractMentionHandlesFromText(mentionSourceText);
+  if (handles.isEmpty) return;
+
+  final byHandle = {for (final p in people) p.handle.toLowerCase(): p};
+  final resolved = <Person>[];
+  for (final raw in handles) {
+    Person? person;
+    if (raw.toLowerCase() == 'me') {
+      person = await resolveMe(raw);
+    } else {
+      person = byHandle[raw.toLowerCase()];
+      person ??= await createPlaceholder(raw);
+    }
+    if (person != null) resolved.add(person);
+  }
+  if (resolved.isEmpty) return;
+
+  final primary = resolved.first;
+  try {
+    await client
+        .from('expectations')
+        .update({'target_person_id': primary.id})
+        .eq('company_id', companyId)
+        .eq('id', expectationId);
+  } on PostgrestException {
+    // RLS / column not writable.
+  }
+
+  if (replaceExisting) {
+    try {
+      await client
+          .from('expectation_mentions')
+          .delete()
+          .eq('company_id', companyId)
+          .eq('expectation_id', expectationId);
+    } on PostgrestException {
+      // Table / policy not deployed yet.
+    }
+  }
+
+  final coReceiverIds = <String>{};
+  for (var i = 1; i < resolved.length; i++) {
+    final p = resolved[i];
+    if (p.id == authorPersonId) continue;
+    if (p.id == primary.id) continue;
+    coReceiverIds.add(p.id);
+  }
+
+  for (final personId in coReceiverIds) {
+    try {
+      await client.from('expectation_mentions').insert({
+        'company_id': companyId,
+        'expectation_id': expectationId,
+        'mentioned_person_id': personId,
+      });
+    } on PostgrestException {
+      // Duplicate or table not deployed yet.
+    }
+  }
 }
 
 Future<void> _syncMentionsFromText({
@@ -263,7 +315,7 @@ Future<ExpectationMentionsIndex> loadMentionHandlesByExpectationId({
 }) async {
   final ids = expectationIds.where((id) => id.trim().isNotEmpty).toList();
   if (ids.isEmpty) {
-    return const ExpectationMentionsIndex();
+    return ExpectationMentionsIndex.empty();
   }
 
   try {
@@ -305,7 +357,7 @@ Future<ExpectationMentionsIndex> loadMentionHandlesByExpectationId({
       personIdsByExpectationId: personIds,
     );
   } on PostgrestException {
-    return const ExpectationMentionsIndex();
+    return ExpectationMentionsIndex.empty();
   }
 }
 

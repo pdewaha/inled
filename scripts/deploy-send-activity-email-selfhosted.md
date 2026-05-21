@@ -116,32 +116,49 @@ $env:SUPABASE_SERVICE_ROLE_KEY = "<SERVICE_ROLE_JWT from beacon .env>"
 
 Check SQL again — `status` should be `sent` and `sent_at` set. Check the recipient inbox (and spam).
 
-## E. Automatic delivery (after manual test works)
+## E. Automatic delivery — send on queue (recommended)
 
-Pick one:
+**Intended:** each `INSERT` triggers **pg_net** → `send-activity-email` with `{ "outbox_id": "<uuid>" }`.
 
-1. **Database Webhook** (Studio → Database → Webhooks):  
-   Table `activity_email_outbox`, Insert → POST  
-   `https://be.exled.app/functions/v1/send-activity-email`  
-   Body: `{"outbox_id":"{{ record.id }}"}`  
-   Header: `Authorization: Bearer <SERVICE_ROLE_KEY>`
+**Self-hosted reality:** pg_net often **queues** the HTTP call but the **background worker does not run** the request, so rows stay `pending`. Run `bash scripts/check-activity-email-dispatch.sh` to confirm. **Reliable fix:** 1-minute cron — `bash scripts/install-activity-email-cron-beacon.sh` (uses `drain-activity-email-queue.sh`).
 
-2. **Cron on beacon** every 2 minutes:
-   ```bash
-   */2 * * * * curl -s -X POST https://be.exled.app/functions/v1/send-activity-email \
-     -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{"process_pending":true,"limit":30}'
-   ```
+On beacon (after migrations **010** + **012**, function deployed, `.env` sourced):
 
-3. **pg_net** (migration trigger): set DB settings `app.activity_email_function_url` and `app.service_role_key` if you use immediate dispatch.
+```bash
+cd ~/leam/docker && source .env
+bash /path/to/inled/scripts/setup-activity-email-immediate-dispatch.sh
+```
+
+If your compose service is not named `kong`, use internal Kong hostname:
+
+```bash
+KONG_HOST=leam-kong \
+  ACTIVITY_EMAIL_FUNCTION_URL=http://leam-kong:8000/functions/v1/send-activity-email \
+  bash /path/to/inled/scripts/setup-activity-email-immediate-dispatch.sh
+```
+
+Verify: cause a changelog email, then `SELECT id, status, sent_at FROM activity_email_outbox ORDER BY created_at DESC LIMIT 5;` — should move to **`sent`** within seconds.
+
+**Later / backlog** (old `pending` rows only — config changes do not resend them):
+
+```bash
+cd ~/leam/docker && source .env
+bash scripts/drain-activity-email-queue.sh    # send all pending
+bash scripts/show-activity-email-queue.sh     # inspect queue
+```
+
+Or `invoke-send-activity-email.ps1 -ProcessPending` from Windows.
+- **Cron** every 2 minutes — only if pg_net is unavailable.
+- **Database Webhook** (Studio) — same as pg_net, alternative on hosted Supabase.
 
 ## F. Troubleshooting
 
 | Symptom | Fix |
 |--------|-----|
 | No outbox rows | Migration not applied; recipient missing `people.email`; shadow talking point not published |
-| `pending` forever | Function not deployed / webhook not configured / cron not running |
+| `pending` forever | Run `bash scripts/setup-activity-email-immediate-dispatch.sh` (migration **012** config table). `ALTER DATABASE SET app.*` fails on many self-hosted images — use 012, not 011 alone. |
+| `permission denied to set parameter app.activity_email_function_url` | Use migration **012** + re-run setup script (stores URL/key in `inled_activity_email_dispatch_config`). |
+| `must be owner of function inled_dispatch_activity_email_outbox` | Function was created in Dashboard as another role. Re-run `bash scripts/setup-activity-email-immediate-dispatch.sh` (drops + recreates), or `PSQL_USER=supabase_admin bash …`, or run `012` SQL in Dashboard. |
 | `failed` + SMTP error | Wrong host/port/`SMTP_SECURE`; try 465 + `true`; match GoTrue settings exactly |
 | 404 on `/functions/v1/...` | Functions container not running or Kong route missing |
 | 500 `could not find an appropriate entrypoint` | **`hello` OK but this function fails:** remove `smtp_native.ts`, `deno.json`, `deno.json.bak` from `volumes/functions/send-activity-email/`; scp fresh single-file `index.ts` (~14 KB, must contain `Deno.serve`); recreate `functions`. Wrong layout: `send-activity-email.ts` as a file instead of folder. |

@@ -364,16 +364,43 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** Intro line only; title lives in summary_snippet (gray box). */
+function emailIntroLine(activityLine: string, summarySnippet: string): string {
+  const line = activityLine.trim();
+  const snip = summarySnippet.trim();
+  if (!snip || snip === "—") return line;
+  const lower = line.toLowerCase();
+  if (lower.startsWith("created a new expectation:")) {
+    return "Created a new expectation.";
+  }
+  if (lower.startsWith("created a new talking point:")) {
+    return "Created a new talking point.";
+  }
+  if (lower.startsWith("published this expectation:") ||
+    lower.startsWith("published this talking point:")) {
+    return line.includes("talking point")
+      ? "Published this talking point."
+      : "Published this expectation.";
+  }
+  const colon = line.indexOf(":");
+  if (colon > 0 && line.slice(colon + 1).trim() === snip) {
+    const head = line.slice(0, colon).trim();
+    return head.endsWith(".") ? head : `${head}.`;
+  }
+  return line;
+}
+
 function buildEmail(row: OutboxRow, appUrl: string) {
   const base = appUrl.replace(/\/$/, "");
   const openUrl = `${base}/?expectation=${row.expectation_id}`;
+  const intro = emailIntroLine(row.activity_line, row.summary_snippet);
   const subject = `[Exled] ${row.kind_label}: ${row.summary_snippet}`;
   const text = [
     "Hi,",
     "",
-    `${row.sender_label}: ${row.activity_line}`,
+    `${row.sender_label}: ${intro}`,
     "",
-    `Summary: ${row.summary_snippet}`,
+    row.summary_snippet,
     "",
     `Open in Exled: ${openUrl}`,
     "",
@@ -382,7 +409,7 @@ function buildEmail(row: OutboxRow, appUrl: string) {
 
   const html = `<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;line-height:1.5;max-width:560px">
-  <p><strong>${escapeHtml(row.sender_label)}</strong>: ${escapeHtml(row.activity_line)}</p>
+  <p><strong>${escapeHtml(row.sender_label)}</strong>: ${escapeHtml(intro)}</p>
   <p style="background:#f4f4f5;padding:12px;border-radius:8px">${escapeHtml(row.summary_snippet)}</p>
   <p><a href="${escapeHtml(openUrl)}">Open in Exled</a></p>
 </body></html>`;
@@ -439,6 +466,7 @@ class RestClient {
       });
       throw new Error(`PostgREST ${res.status}: ${txt}`);
     }
+    return (await res.json()) as T[];
   }
 
   async patch(table: string, query: string, body: Record<string, unknown>) {

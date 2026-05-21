@@ -9,6 +9,9 @@ const _supabaseUrlOverride = String.fromEnvironment('SUPABASE_URL');
 const String supabaseDevUrl = 'https://leam.tauworks.org';
 const String supabaseProdUrl = 'https://be.exled.app';
 
+/// Bumped on each web deploy; shown in save-error toasts so prod vs cache is obvious.
+const String exledWebBuildId = '2026-05-22-mentions-fix';
+
 const String supabaseAnonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjEzMTQyMDcxLCJleHAiOjE5Mjg3MTMyNzF9.NC1GLG2-Ae8_vpynii0-Omd8qnQRlnZOd7ZWRsYoCE8';
 

@@ -161,7 +161,7 @@ String expectationChangelogActivityFeedLine({
     case 'published':
       return 'Published this ${_noun(isTopic)}.';
     case 'update_requested':
-      return 'Requested an update — consider progress, deadline, or status.';
+      return 'Requested an update -consider updating progress, deadline or status.';
     case 'progress':
       final p = changelogProgressPctFromJson(parsed['pct']);
       if (p == null) return 'Changed progress.';

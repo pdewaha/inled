@@ -162,6 +162,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// @handles from [expectation_mentions] (includes leading @ stripped from summary).
   Map<String, List<String>> _mentionHandlesByExpectationId = {};
   Map<String, Set<String>> _mentionPersonIdsByExpectationId = {};
+
+  /// [ExpectationMentionsIndex] uses `const {}` when empty — always clone before storing in state.
+  void _replaceMentionIndexesFrom(ExpectationMentionsIndex index) {
+    _mentionHandlesByExpectationId = {
+      for (final e in index.handlesByExpectationId.entries)
+        e.key: List<String>.from(e.value),
+    };
+    _mentionPersonIdsByExpectationId = {
+      for (final e in index.personIdsByExpectationId.entries)
+        e.key: Set<String>.from(e.value),
+    };
+  }
+
+  void _setMentionHandlesForExpectation(String expectationId, List<String> handles) {
+    final next = <String, List<String>>{};
+    for (final e in _mentionHandlesByExpectationId.entries) {
+      next[e.key] = List<String>.from(e.value);
+    }
+    next[expectationId] = List<String>.from(handles);
+    _mentionHandlesByExpectationId = next;
+  }
   /// Set from `?expectation=` in the page URL (notification email deep link).
   String? _emailDeepLinkExpectationId;
 
@@ -315,6 +336,24 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (e.type == ExpectationType.topic) {
       for (final handle in talkingPointMentionHandleList(
         summary: e.summary,
+        persistedMentionHandles: _persistedMentionHandles(e),
+      )) {
+        addHandle(handle);
+      }
+    } else {
+      Person? primary;
+      final pid = e.personId.trim();
+      if (pid.isNotEmpty) {
+        for (final p in _people) {
+          if (p.id == pid) {
+            primary = p;
+            break;
+          }
+        }
+      }
+      for (final handle in expectationReceiverHandleList(
+        summary: e.summary,
+        primaryPersonHandle: primary?.handle,
         persistedMentionHandles: _persistedMentionHandles(e),
       )) {
         addHandle(handle);
@@ -1193,7 +1232,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     try {
       final meRows = await client
           .from('people')
-          .select('company_id')
+          .select('id,company_id')
           .eq('auth_user_id', user.id)
           .limit(1);
       if ((meRows as List).isEmpty) {
@@ -1218,7 +1257,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       for (final raw in rows as List) {
         if (raw is! Map<String, dynamic>) continue;
         final id = _dbString(raw['id']);
-        if (id.isEmpty) continue;
+        if (id.isEmpty || !isPersistedExpectationId(id)) continue;
         mapped.add(_mapSupabaseExpectationRow(raw));
       }
       final mePersonId = _dbString(meRows.first['id']);
@@ -1241,7 +1280,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       );
 
       final peopleById = {for (final p in _people) p.id: p};
-      ExpectationMentionsIndex mentionsIndex = const ExpectationMentionsIndex();
+      ExpectationMentionsIndex mentionsIndex = ExpectationMentionsIndex.empty();
       try {
         mentionsIndex = await loadMentionHandlesByExpectationId(
           client: client,
@@ -1250,7 +1289,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           peopleById: peopleById,
         );
       } catch (_) {
-        mentionsIndex = const ExpectationMentionsIndex();
+        mentionsIndex = ExpectationMentionsIndex.empty();
       }
 
       if (!mounted) return;
@@ -1258,8 +1297,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _expectations
           ..clear()
           ..addAll(combined);
-        _mentionHandlesByExpectationId = mentionsIndex.handlesByExpectationId;
-        _mentionPersonIdsByExpectationId = mentionsIndex.personIdsByExpectationId;
+        _replaceMentionIndexesFrom(mentionsIndex);
         _expectationsLoading = false;
         _expectationsLoadError = null;
         _ledgerCompanyId ??= companyId;
@@ -2548,7 +2586,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (isExpectationSubmitContext &&
         !_talkingPointLineHasPersonMention(text)) {
       _showComposerToast(
-        'Expectations must @mention who they are for (e.g. @name or @me).',
+        'Expectations must @mention at least one receiver (e.g. @alice or @alice @bob …).',
       );
       return;
     }
@@ -2586,11 +2624,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _showComposerToast('Use the buttons only when capturing an expectation.');
       return;
     }
-    final openDetailsAfterQuickCapture = _homeQuickCaptureSheetOpen;
+    final openDetailsAfterCapture = _homeQuickCaptureSheetOpen ||
+        _pillar == LedgerPillar.addExpectation ||
+        _pillar == LedgerPillar.addTopic;
     _submitInFlight = true;
     _homeComposerUiRevision.value++;
     setState(() {});
-    final handle = _extractMentionHandle(text);
     final ExpectationType entryType;
     if (_pillar == LedgerPillar.addExpectation) {
       entryType = ExpectationType.expectation;
@@ -2601,63 +2640,79 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           ? ExpectationType.expectation
           : ExpectationType.topic;
     }
+    final trimmedLine = text.trim();
+    final deadlineCmd = _stripCaptureDeadlineSuffix(trimmedLine);
+    final captureBody = deadlineCmd.text;
+    late final ExpectationVisibility visibilityForResolve;
+    if (forcedTalkingPointVisibility != null &&
+        entryType == ExpectationType.topic) {
+      visibilityForResolve = forcedTalkingPointVisibility;
+    } else if (forcedExpectationVisibility != null &&
+        entryType == ExpectationType.expectation) {
+      visibilityForResolve = forcedExpectationVisibility;
+    } else {
+      visibilityForResolve = ExpectationVisibility.echo;
+    }
     Person? person;
     var shouldAskSubmitMode = true;
-    if (handle != null) {
-      if (handle.toLowerCase() == 'me') {
-        shouldAskSubmitMode = false;
-        person = await _resolveCurrentPerson();
-        if (person == null) {
-          _showComposerToast('Could not resolve @me for the current user.');
-          _releaseSubmitInFlight();
-          return;
-        }
-      } else {
-        person = _findPersonByHandle(handle);
-      }
+    if (entryType == ExpectationType.expectation) {
+      shouldAskSubmitMode = false;
+      person = await _resolveExpectationReceiversFromCaptureLine(
+        captureBody,
+        visibility: visibilityForResolve,
+      );
       if (person == null) {
-        // #tag-only private talking points: no @person row required.
-        final tagOnlyPrivateTalkingPointDraft =
-            entryType == ExpectationType.topic &&
-                forcedTalkingPointVisibility ==
-                    ExpectationVisibility.shadow &&
-                !_talkingPointLineHasPersonMention(text);
-        if (tagOnlyPrivateTalkingPointDraft) {
+        _releaseSubmitInFlight();
+        return;
+      }
+    } else {
+      final handle = _extractMentionHandle(text);
+      if (handle != null) {
+        if (handle.toLowerCase() == 'me') {
           shouldAskSubmitMode = false;
-        } else if (handle != null) {
-          shouldAskSubmitMode = false;
-          final skipEmailInvite =
-              (entryType == ExpectationType.topic &&
-                  _talkingPointLineHasPersonMention(text)) ||
-              (entryType == ExpectationType.expectation &&
-                  forcedExpectationVisibility ==
-                      ExpectationVisibility.shadow);
-          final String? email;
-          if (skipEmailInvite) {
-            email = null;
+          person = await _resolveCurrentPerson();
+          if (person == null) {
+            _showComposerToast('Could not resolve @me for the current user.');
+            _releaseSubmitInFlight();
+            return;
+          }
+        } else {
+          person = _findPersonByHandle(handle);
+        }
+        if (person == null) {
+          final tagOnlyPrivateTalkingPointDraft =
+              forcedTalkingPointVisibility ==
+                      ExpectationVisibility.shadow &&
+                  !_talkingPointLineHasPersonMention(text);
+          if (tagOnlyPrivateTalkingPointDraft) {
+            shouldAskSubmitMode = false;
           } else {
-            email = await _askOptionalEmailForHandle(handle);
-            if (email == _cancelToken) {
+            shouldAskSubmitMode = false;
+            final skipEmailInvite = _talkingPointLineHasPersonMention(text);
+            final String? email;
+            if (skipEmailInvite) {
+              email = null;
+            } else {
+              email = await _askOptionalEmailForHandle(handle);
+              if (email == _cancelToken) {
+                _releaseSubmitInFlight();
+                return;
+              }
+            }
+            try {
+              person = await _createPersonFromHandleInSupabase(
+                handle,
+                email: email,
+              );
+            } catch (e) {
+              _showComposerToast('Could not create @$handle yet: $e');
               _releaseSubmitInFlight();
               return;
             }
           }
-          try {
-            person = await _createPersonFromHandleInSupabase(
-              handle,
-              email: email,
-            );
-          } catch (e) {
-            _showComposerToast('Could not create @$handle yet: $e');
-            _releaseSubmitInFlight();
-            return;
-          }
         }
       }
     }
-    final trimmedLine = text.trim();
-    final deadlineCmd = _stripCaptureDeadlineSuffix(trimmedLine);
-    final captureBody = deadlineCmd.text;
     final storedText = entryType == ExpectationType.topic
         ? _normalizeTalkingPointTextForStorage(captureBody)
         : _normalizeExpectationTextForStorage(captureBody);
@@ -2686,9 +2741,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
 
     final persistTarget = entryType == ExpectationType.topic ? null : person;
+    final tempExpectationId = 'exp_${DateTime.now().millisecondsSinceEpoch}';
 
     setState(() {
-      final tempExpectationId = 'exp_${DateTime.now().millisecondsSinceEpoch}';
       _homeRecent.insert(0, FeedEntry(
         id: 'cap_${DateTime.now().millisecondsSinceEpoch}',
         createdAt: DateTime.now().toUtc(),
@@ -2739,13 +2794,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     try {
       final persistedExpectationId = await _persistExpectationToSupabase(
         text: storedText,
-        mentionSourceText:
-            entryType == ExpectationType.topic ? captureBody : null,
+        mentionSourceText: captureBody,
         visibility: visibility,
         type: entryType,
         target: persistTarget,
         deadlineAt: deadlineCmd.deadlineAt,
         deadlineLabel: deadlineCmd.deadlineLabel,
+      );
+      _cacheMentionHandlesAfterPersist(
+        expectationId: persistedExpectationId,
+        mentionLine: captureBody,
+        storedText: storedText,
       );
       if (mounted) {
         setState(() {
@@ -2760,13 +2819,46 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               isUserCapture: first.isUserCapture,
             );
           }
+          final i = _expectations.indexWhere((e) => e.id == tempExpectationId);
+          if (i >= 0) {
+            final old = _expectations[i];
+            _expectations[i] = Expectation(
+              id: persistedExpectationId,
+              createdAt: old.createdAt,
+              writerUserId: old.writerUserId,
+              personId: old.personId,
+              summary: old.summary,
+              deadlineLabel: old.deadlineLabel,
+              deadlineAt: old.deadlineAt,
+              finishedAt: old.finishedAt,
+              responsibleUpdatedAt: old.responsibleUpdatedAt,
+              publishedAt: old.publishedAt,
+              seenAt: old.seenAt,
+              lastChattedSenderAt: old.lastChattedSenderAt,
+              lastChattedReceiverAt: old.lastChattedReceiverAt,
+              updateRequestedAt: old.updateRequestedAt,
+              progress: old.progress,
+              health: old.health,
+              type: old.type,
+              status: old.status,
+              visibility: old.visibility,
+            );
+          }
         });
       }
       await _loadExpectationsFromSupabase();
       if (mounted && entryType == ExpectationType.topic) {
         await _loadRecentTagsFromSupabase();
       }
-      if (mounted && openDetailsAfterQuickCapture) {
+      if (mounted && openDetailsAfterCapture) {
+        if (_pillar == LedgerPillar.addExpectation ||
+            _pillar == LedgerPillar.addTopic) {
+          setState(() {
+            _pillar = LedgerPillar.home;
+            _homePendingEntry = null;
+            _composerMode = _composerDefaultMode;
+          });
+        }
         _presentNewCaptureDetailsAfterQuickCapture(
           expectationId: persistedExpectationId,
           fallbackPerson: persistTarget,
@@ -2774,7 +2866,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
     } catch (e) {
       if (mounted) {
-        _showComposerToast('Expectation saved locally, but DB write failed: $e');
+        setState(() {
+          _expectations.removeWhere((e) => e.id == tempExpectationId);
+          _homeRecent.removeWhere((e) => e.linkedExpectationId == tempExpectationId);
+        });
+        final msg = e is PostgrestException
+            ? 'Could not save to the database: ${e.message}'
+            : 'Save failed in the app (not the database): $e';
+        _showComposerToast(msg);
       }
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2835,6 +2934,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   static final RegExp _uuidRegex = RegExp(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$',
   );
+
+  /// True when [id] is a Postgres uuid (not a client-only `exp_<ms>` optimistic id).
+  static bool isPersistedExpectationId(String id) =>
+      _uuidRegex.hasMatch(id.trim());
   static final RegExp _emailRegex = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
 
   Future<String?> _askInviteEmailDialog({Person? person}) async {
@@ -3397,29 +3500,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         // Ignore duplicate link insert attempts for idempotency.
       }
     }
-    final kindWord = type == ExpectationType.topic ? 'talking point' : 'expectation';
-    final oneLine = text.trim().replaceAll(RegExp(r'\s+'), ' ');
-    final clipped =
-        oneLine.length > 160 ? '${oneLine.substring(0, 160)}…' : oneLine;
-    try {
-      await insertExpectationAppMessage(
-        client: client,
-        companyId: companyId,
-        expectationId: expectationId,
-        senderPersonId: mePersonId,
-        messageText: 'Created a new $kindWord: $clipped',
-        type: kExpectationMessageTypeChangelog,
-      );
-      await touchExpectationChatActivityForAuthUser(
-        client: client,
-        expectationId: expectationId,
-        expectationWriterUserId: user.id,
-      );
-    } catch (_) {}
     final mentionLine = (mentionSourceText ?? text).trim();
+    // Sync @mentions before changelog so activity-email triggers see recipients.
+    // Talking points never set target_person_id; recipients come from expectation_mentions only.
     if (type == ExpectationType.topic &&
         visibility == ExpectationVisibility.echo) {
-      // Private prep (shadow): sync @mentions only on publish so receivers are not notified early.
       await syncTalkingPointMentions(
         client: client,
         companyId: companyId,
@@ -3459,16 +3544,49 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
       );
     }
-    if (mounted) {
-      setState(() {
-        _mentionHandlesByExpectationId[expectationId] =
-            extractMentionHandlesFromText(mentionLine.isNotEmpty ? mentionLine : text);
-      });
-    }
+    final kindWord = type == ExpectationType.topic ? 'talking point' : 'expectation';
+    final oneLine = text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    final clipped =
+        oneLine.length > 160 ? '${oneLine.substring(0, 160)}…' : oneLine;
+    try {
+      await insertExpectationAppMessage(
+        client: client,
+        companyId: companyId,
+        expectationId: expectationId,
+        senderPersonId: mePersonId,
+        messageText: 'Created a new $kindWord: $clipped',
+        type: kExpectationMessageTypeChangelog,
+      );
+      await touchExpectationChatActivityForAuthUser(
+        client: client,
+        expectationId: expectationId,
+        expectationWriterUserId: user.id,
+      );
+    } catch (_) {}
     if (mounted) {
       await _loadRecentTagsFromSupabase();
     }
     return expectationId;
+  }
+
+  void _cacheMentionHandlesAfterPersist({
+    required String expectationId,
+    required String mentionLine,
+    required String storedText,
+  }) {
+    if (!mounted) return;
+    try {
+      setState(() {
+        _setMentionHandlesForExpectation(
+          expectationId,
+          extractMentionHandlesFromText(
+            mentionLine.isNotEmpty ? mentionLine : storedText,
+          ),
+        );
+      });
+    } catch (_) {
+      // UI cache only — never fail a successful DB save.
+    }
   }
 
   void _showComposerToast(String message) {
@@ -3607,6 +3725,49 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       if (p.handle.toLowerCase() == key) return p;
     }
     return null;
+  }
+
+  /// First @ on the line is the primary receiver; later @handles become co-receivers on save.
+  Future<Person?> _resolveExpectationReceiversFromCaptureLine(
+    String captureBody, {
+    required ExpectationVisibility visibility,
+  }) async {
+    final handles = extractMentionHandlesFromText(captureBody);
+    if (handles.isEmpty) return null;
+
+    Person? primary;
+    for (var i = 0; i < handles.length; i++) {
+      final handle = handles[i];
+      Person? person;
+      if (handle.toLowerCase() == 'me') {
+        person = await _resolveCurrentPerson();
+        if (person == null && i == 0) {
+          _showComposerToast('Could not resolve @me for the current user.');
+          return null;
+        }
+      } else {
+        person = _findPersonByHandle(handle);
+      }
+      if (person == null) {
+        final skipEmailInvite = visibility == ExpectationVisibility.shadow;
+        String? email;
+        if (!skipEmailInvite && i == 0) {
+          email = await _askOptionalEmailForHandle(handle);
+          if (email == _cancelToken) return null;
+        }
+        try {
+          person = await _createPersonFromHandleInSupabase(
+            handle,
+            email: i == 0 ? email : null,
+          );
+        } catch (e) {
+          _showComposerToast('Could not create @$handle yet: $e');
+          return null;
+        }
+      }
+      if (i == 0) primary = person;
+    }
+    return primary;
   }
 
   Future<Person> _createPersonFromHandleInSupabase(
@@ -4223,7 +4384,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return fallback;
   }
 
-  /// After Quick Capture saves, close the sheet and show the new item's detail panel.
+  /// After capture saves (Quick Capture modal or Add expectation/talking point), close
+  /// any sheet and open the new item's detail dialog.
   void _presentNewCaptureDetailsAfterQuickCapture({
     required String expectationId,
     Person? fallbackPerson,
@@ -4233,21 +4395,66 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final e = _expectationById(expectationId);
-      if (e == null) return;
       unawaited(
-        _openExpectationDetails(
-          e: e,
-          person: _personForExpectation(e, fallback: fallbackPerson),
+        _openCapturedExpectationDetails(
+          expectationId: expectationId,
+          fallbackPerson: fallbackPerson,
         ),
       );
     });
+  }
+
+  Future<void> _openCapturedExpectationDetails({
+    required String expectationId,
+    Person? fallbackPerson,
+  }) async {
+    if (!isPersistedExpectationId(expectationId)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Still saving this item — try again in a moment from the list.',
+          ),
+        ),
+      );
+      return;
+    }
+    Expectation? e = _expectationById(expectationId);
+    if (e == null) {
+      await _loadExpectationsFromSupabase();
+      if (!mounted) return;
+      e = _expectationById(expectationId);
+    }
+    if (e == null || !isPersistedExpectationId(e.id)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open details — refresh the list and try again.'),
+        ),
+      );
+      return;
+    }
+    await _openExpectationDetails(
+      e: e,
+      person: _personForExpectation(e, fallback: fallbackPerson),
+    );
   }
 
   Future<void> _openExpectationDetails({
     required Expectation e,
     required Person? person,
   }) async {
+    if (!isPersistedExpectationId(e.id)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This item is not saved yet — wait for sync or pull to refresh.',
+          ),
+        ),
+      );
+      return;
+    }
     final client = Supabase.instance.client;
     final uid = client.auth.currentUser?.id;
     if (mounted) {
@@ -10506,12 +10713,14 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     final uid = Supabase.instance.client.auth.currentUser?.id;
     final writerId = widget.expectation.writerUserId;
     if (uid == null || writerId == null || writerId != uid) return false;
+    final hasReceivers = widget.expectation.personId.trim().isNotEmpty ||
+        widget.coReceiverPersonIds.isNotEmpty;
     return widget.canEdit &&
         !_editingDescription &&
         widget.expectation.visibility == ExpectationVisibility.echo &&
         _status != ExpectationStatus.finished &&
         _status != ExpectationStatus.abandoned &&
-        widget.expectation.personId.trim().isNotEmpty;
+        hasReceivers;
   }
 
   Future<void> _requestUpdate() async {
@@ -10534,6 +10743,63 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     const note =
         'Update requested: consider updating progress, deadline, or status.';
     try {
+      if (widget.expectation.type == ExpectationType.expectation) {
+        try {
+          final peopleRows = await client
+              .from('people')
+              .select(
+                'id,created_at,display_name,handle,auth_user_id,email,title',
+              )
+              .eq('company_id', _companyId!);
+          final people = <Person>[];
+          for (final raw in peopleRows as List) {
+            if (raw is! Map) continue;
+            final row = Map<String, dynamic>.from(raw);
+            people.add(
+              Person(
+                id: row['id'] as String,
+                createdAt: DateTime.tryParse(
+                      (row['created_at'] as String?) ?? '',
+                    ) ??
+                    DateTime.now().toUtc(),
+                displayName: ((row['display_name'] as String?) ?? '').trim(),
+                handle: ((row['handle'] as String?) ?? '').trim(),
+                authUserId: (row['auth_user_id'] as String?)?.trim(),
+                email: ((row['email'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['email'] as String?) ?? '').trim(),
+                title: ((row['title'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['title'] as String?) ?? '').trim(),
+              ),
+            );
+          }
+          final primaryHandle = (widget.person?.handle ?? '').trim();
+          final mentionLine = primaryHandle.isNotEmpty
+              ? '@$primaryHandle ${widget.expectation.summary}'
+              : widget.expectation.summary;
+          await syncExpectationCoReceiverMentions(
+            client: client,
+            companyId: _companyId!,
+            expectationId: widget.expectation.id,
+            mentionSourceText: mentionLine,
+            authorPersonId: _myPersonId!,
+            people: people,
+            resolveMe: (_) async {
+              for (final p in people) {
+                if (p.id == _myPersonId) return p;
+              }
+              return null;
+            },
+            createPlaceholder: (_) async {
+              throw StateError('Unexpected unknown @mention on request update');
+            },
+          );
+        } on PostgrestException {
+          // Mentions table / policy not deployed.
+        } catch (_) {}
+      }
+
       await client.from('expectations').update({
         'update_requested_at': now.toIso8601String(),
         'expectation_health': _healthToDb(ExpectationHealth.atRisk),
@@ -10632,6 +10898,86 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         await _loadConversation();
         actorReady = _myPersonId != null && _companyId != null;
       }
+      if (actorReady &&
+          _companyId != null &&
+          _myPersonId != null &&
+          changeLogEvents.isNotEmpty) {
+        try {
+          final peopleRows = await client
+              .from('people')
+              .select(
+                'id,created_at,display_name,handle,auth_user_id,email,title',
+              )
+              .eq('company_id', _companyId!);
+          final people = <Person>[];
+          for (final raw in peopleRows as List) {
+            if (raw is! Map) continue;
+            final row = Map<String, dynamic>.from(raw);
+            people.add(
+              Person(
+                id: row['id'] as String,
+                createdAt: DateTime.tryParse(
+                      (row['created_at'] as String?) ?? '',
+                    ) ??
+                    DateTime.now().toUtc(),
+                displayName: ((row['display_name'] as String?) ?? '').trim(),
+                handle: ((row['handle'] as String?) ?? '').trim(),
+                authUserId: (row['auth_user_id'] as String?)?.trim(),
+                email: ((row['email'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['email'] as String?) ?? '').trim(),
+                title: ((row['title'] as String?) ?? '').trim().isEmpty
+                    ? null
+                    : ((row['title'] as String?) ?? '').trim(),
+              ),
+            );
+          }
+          if (widget.expectation.type == ExpectationType.expectation) {
+            final primaryHandle = (widget.person?.handle ?? '').trim();
+            final mentionLine = primaryHandle.isNotEmpty
+                ? '@$primaryHandle $summary'
+                : summary;
+            await syncExpectationCoReceiverMentions(
+              client: client,
+              companyId: _companyId!,
+              expectationId: widget.expectation.id,
+              mentionSourceText: mentionLine,
+              authorPersonId: _myPersonId!,
+              people: people,
+              resolveMe: (_) async {
+                for (final p in people) {
+                  if (p.id == _myPersonId) return p;
+                }
+                return null;
+              },
+              createPlaceholder: (_) async {
+                throw StateError('Unexpected unknown @mention on save');
+              },
+            );
+          } else if (nextVisibility == ExpectationVisibility.echo) {
+            await syncTalkingPointMentions(
+              client: client,
+              companyId: _companyId!,
+              expectationId: widget.expectation.id,
+              summary: summary,
+              authorPersonId: _myPersonId!,
+              people: people,
+              resolveMe: (_) async {
+                for (final p in people) {
+                  if (p.id == _myPersonId) return p;
+                }
+                return null;
+              },
+              createPlaceholder: (_) async {
+                throw StateError('Unexpected unknown @mention on save');
+              },
+              replaceExisting: true,
+            );
+          }
+        } on PostgrestException {
+          // Mentions table / policy not deployed.
+        } catch (_) {}
+      }
       if (actorReady && changeLogEvents.isNotEmpty) {
         for (final ev in changeLogEvents) {
           await _insertExpectationMessage(
@@ -10659,120 +11005,6 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
           _updateRequestedAt = null;
         }
       });
-      if (widget.expectation.type == ExpectationType.expectation &&
-          _companyId != null &&
-          _myPersonId != null) {
-        try {
-          final peopleRows = await client
-              .from('people')
-              .select(
-                'id,created_at,display_name,handle,auth_user_id,email,title',
-              )
-              .eq('company_id', _companyId!);
-          final people = <Person>[];
-          for (final raw in peopleRows as List) {
-            if (raw is! Map) continue;
-            final row = Map<String, dynamic>.from(raw);
-            people.add(
-              Person(
-                id: row['id'] as String,
-                createdAt: DateTime.tryParse(
-                      (row['created_at'] as String?) ?? '',
-                    ) ??
-                    DateTime.now().toUtc(),
-                displayName: ((row['display_name'] as String?) ?? '').trim(),
-                handle: ((row['handle'] as String?) ?? '').trim(),
-                authUserId: (row['auth_user_id'] as String?)?.trim(),
-                email: ((row['email'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['email'] as String?) ?? '').trim(),
-                title: ((row['title'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['title'] as String?) ?? '').trim(),
-              ),
-            );
-          }
-          final primaryHandle = (widget.person?.handle ?? '').trim();
-          final mentionLine = primaryHandle.isNotEmpty
-              ? '@$primaryHandle $summary'
-              : summary;
-          await syncExpectationCoReceiverMentions(
-            client: client,
-            companyId: _companyId!,
-            expectationId: widget.expectation.id,
-            mentionSourceText: mentionLine,
-            authorPersonId: _myPersonId!,
-            people: people,
-            resolveMe: (_) async {
-              for (final p in people) {
-                if (p.id == _myPersonId) return p;
-              }
-              return null;
-            },
-            createPlaceholder: (_) async {
-              throw StateError('Unexpected unknown @mention on save');
-            },
-          );
-        } on PostgrestException {
-          // Mentions table / policy not deployed.
-        } catch (_) {}
-      } else if (widget.expectation.type == ExpectationType.topic &&
-          publish &&
-          nextVisibility == ExpectationVisibility.echo &&
-          _companyId != null &&
-          _myPersonId != null) {
-        try {
-          final peopleRows = await client
-              .from('people')
-              .select(
-                'id,created_at,display_name,handle,auth_user_id,email,title',
-              )
-              .eq('company_id', _companyId!);
-          final people = <Person>[];
-          for (final raw in peopleRows as List) {
-            if (raw is! Map) continue;
-            final row = Map<String, dynamic>.from(raw);
-            people.add(
-              Person(
-                id: row['id'] as String,
-                createdAt: DateTime.tryParse(
-                      (row['created_at'] as String?) ?? '',
-                    ) ??
-                    DateTime.now().toUtc(),
-                displayName: ((row['display_name'] as String?) ?? '').trim(),
-                handle: ((row['handle'] as String?) ?? '').trim(),
-                authUserId: (row['auth_user_id'] as String?)?.trim(),
-                email: ((row['email'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['email'] as String?) ?? '').trim(),
-                title: ((row['title'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['title'] as String?) ?? '').trim(),
-              ),
-            );
-          }
-          await syncTalkingPointMentions(
-            client: client,
-            companyId: _companyId!,
-            expectationId: widget.expectation.id,
-            summary: summary,
-            authorPersonId: _myPersonId!,
-            people: people,
-            resolveMe: (_) async {
-              for (final p in people) {
-                if (p.id == _myPersonId) return p;
-              }
-              return null;
-            },
-            createPlaceholder: (_) async {
-              throw StateError('Unexpected unknown @mention on publish');
-            },
-            replaceExisting: true,
-          );
-        } on PostgrestException {
-          // Mentions table / policy not deployed.
-        } catch (_) {}
-      }
       await _loadConversation();
       widget.onExpectationDataMutated?.call();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -10908,6 +11140,15 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   }
 
   Future<void> _loadConversation() async {
+    if (!_LedgerConsoleScreenState.isPersistedExpectationId(widget.expectation.id)) {
+      if (!mounted) return;
+      setState(() {
+        _messagesLoading = false;
+        _messagesError =
+            'This item is not fully saved yet. Close, refresh the list, and open it again.';
+      });
+      return;
+    }
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
     if (user == null) {
@@ -10992,49 +11233,77 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       }
 
       final mapped = (rows as List).map((r) {
-        final personMap = personRowFrom(r['people']);
+        if (r is! Map) {
+          throw StateError('Expected message row map, got ${r.runtimeType}');
+        }
+        final row = r is Map<String, dynamic> ? r : Map<String, dynamic>.from(r);
+        final personMap = personRowFrom(row['people']);
         final senderLabel = personMap != null
             ? ((personMap['display_name'] as String?)?.trim().isNotEmpty == true
                 ? (personMap['display_name'] as String).trim()
                 : '@${(personMap['handle'] as String?) ?? 'unknown'}')
             : '@unknown';
-        final senderId = (r['sender_person_id'] as String?)?.trim() ?? '';
-        final attachmentRows = (r['expectation_message_attachments'] as List?) ?? const [];
+        final senderId =
+            _LedgerConsoleScreenState._dbString(row['sender_person_id']).trim();
+        final attachmentRows =
+            row['expectation_message_attachments'] is List
+                ? row['expectation_message_attachments'] as List
+                : const <dynamic>[];
         final attachments = attachmentRows
             .map(
-              (a) => _PendingAttachment(
-                fileName: ((a as Map)['file_name'] as String?)?.trim().isNotEmpty == true
-                    ? (a['file_name'] as String).trim()
-                    : 'Attachment',
-                fileUrl: ((a['file_url'] as String?) ?? '').trim(),
-              ),
+              (a) {
+                if (a is! Map) return null;
+                final att = a is Map<String, dynamic>
+                    ? a
+                    : Map<String, dynamic>.from(a);
+                final url =
+                    _LedgerConsoleScreenState._dbString(att['file_url']).trim();
+                if (url.isEmpty) return null;
+                final name =
+                    _LedgerConsoleScreenState._dbString(att['file_name']).trim();
+                return _PendingAttachment(
+                  fileName: name.isNotEmpty ? name : 'Attachment',
+                  fileUrl: url,
+                );
+              },
             )
-            .where((a) => a.fileUrl.isNotEmpty)
+            .whereType<_PendingAttachment>()
             .toList();
-        final rawType = r['type'];
+        final rawType = row['type'];
         final messageType = rawType is int
             ? rawType
             : (rawType is num ? rawType.toInt() : int.tryParse('$rawType') ?? 0);
         DateTime? readAtByCounterparty;
-        final readRaw = r['expectation_message_reads'];
+        final readRaw = row['expectation_message_reads'];
         final readList = readRaw is List ? readRaw : const <dynamic>[];
         for (final raw in readList) {
           if (raw is! Map) continue;
-          final rid = ((raw)['reader_person_id'] as String?)?.trim() ?? '';
+          final readRow =
+              raw is Map<String, dynamic> ? raw : Map<String, dynamic>.from(raw);
+          final rid = _LedgerConsoleScreenState._dbString(
+            readRow['reader_person_id'],
+          ).trim();
           if (rid.isEmpty || rid == senderId) continue;
-          final readStr = raw['read_at'] as String?;
+          final readStr = readRow['read_at'] as String?;
           final parsed = readStr != null ? DateTime.tryParse(readStr)?.toUtc() : null;
           if (parsed == null) continue;
           if (readAtByCounterparty == null || parsed.isAfter(readAtByCounterparty!)) {
             readAtByCounterparty = parsed;
           }
         }
+        final messageId =
+            _LedgerConsoleScreenState._dbString(row['id']).trim();
+        if (messageId.isEmpty) {
+          throw StateError('Message row missing id');
+        }
         return _ExpectationMessageVm(
-          id: r['id'] as String,
-          senderPersonId: senderId.isNotEmpty ? senderId : (r['sender_person_id'] as String? ?? ''),
+          id: messageId,
+          senderPersonId: senderId,
           senderLabel: senderLabel,
-          messageText: normalizeLoadedMessageText(r['message_text']),
-          createdAt: DateTime.tryParse((r['created_at'] as String?) ?? '') ??
+          messageText: normalizeLoadedMessageText(row['message_text']),
+          createdAt: DateTime.tryParse(
+                _LedgerConsoleScreenState._dbString(row['created_at']),
+              ) ??
               DateTime.now().toUtc(),
           attachments: attachments,
           messageType: messageType,
