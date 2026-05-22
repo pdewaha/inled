@@ -1,6 +1,6 @@
 # Morning unhealthy-expectations digest
 
-Daily email to each **logged-in team member** listing **open expectations** they are involved in that are **unhealthy** (same rules as Home **Urgent** / outbox warning icon).
+Daily email to each **receiver** listing **published open expectations** assigned to them that are **unhealthy** (same rules as Home **Urgent** / outbox warning icon). **Authors do not** get a digest for expectations they sent to someone else.
 
 ## Unhealthy means (expectations only)
 
@@ -16,11 +16,16 @@ Talking points are **not** included.
 ## Who gets mail
 
 - People with `auth_user_id` + email in `people`
-- Involved as **author** (any visibility) or **receiver** (published / echo only: `target_person_id` or `expectation_mentions`)
+- **Receiver only** on **published** (`echo`) expectations — **both**:
+  - **Primary receiver** (`expectations.target_person_id` — first `@` on the expectation)
+  - **Co-receivers** (every other `@person` row in `expectation_mentions`)
+- Each person gets **their own** morning email listing every unhealthy published expectation where they are primary **or** co-receiver (not one shared mail to primary only).
+- **Not** the author unless they are also a named receiver (e.g. self-assigned).
+- Private drafts (`shadow`) are excluded — nothing to act on until published
 
 ## Deploy
 
-1. Apply migration `017_morning_unhealthy_digest.sql` on the DB.
+1. Apply migrations `017` and `018_morning_unhealthy_digest_receivers_only.sql` on the DB.
 2. Deploy edge function:
 
 ```bash

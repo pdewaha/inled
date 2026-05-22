@@ -1,4 +1,4 @@
-// Morning digest: open unhealthy expectations per involved user.
+// Morning digest: unhealthy published expectations — email receivers only (not authors).
 // Deploy: volumes/functions/send-unhealthy-digest/index.ts
 // Invoke: POST .../send-unhealthy-digest  { "run": true }  (service role)
 // Cron: scripts/install-morning-unhealthy-digest-cron-beacon.sh
@@ -31,6 +31,8 @@ type DigestRow = {
   deadline_label: string | null;
   deadline_at: string | null;
   involvement: string;
+  sender_handle?: string;
+  sender_label?: string;
   issues: string[];
 };
 
@@ -190,14 +192,14 @@ function buildDigestEmail(
   const base = appUrl.replace(/\/$/, "");
   const count = recipient.items.length;
   const subject = count === 1
-    ? "[Exled] Morning summary: 1 open expectation needs attention"
-    : `[Exled] Morning summary: ${count} open expectations need attention`;
+    ? "[Exled] Morning reminder: 1 expectation needs your action"
+    : `[Exled] Morning reminder: ${count} expectations need your action`;
 
   const intro = [
     `Hi${recipient.name ? ` ${recipient.name}` : ""},`,
     "",
-    "The following open expectations need your attention as soon as possible.",
-    "They are unhealthy in Exled: not accepted yet, no progress defined, at risk, off track, and/or no deadline set.",
+    "The following expectations assigned to you are still open and unhealthy in Exled.",
+    "Please accept them, define progress, set a deadline where missing, or update status — as soon as possible.",
     "",
   ];
 
@@ -209,16 +211,18 @@ function buildDigestEmail(
     const snip = clip(row.summary, 120);
     const issueText = (row.issues ?? []).filter(Boolean).join(" · ") ||
       "Needs attention";
-    const role = row.involvement === "author" ? "You sent" : "With you";
+    const from = (row.sender_handle ?? "").trim();
+    const fromLine = from ? `From @${from.replace(/^@/, "")}` : "Assigned to you";
     const openUrl = `${base}/?expectation=${row.expectation_id}`;
     lines.push(
-      `${i + 1}. ${role}: ${snip}`,
+      `${i + 1}. ${snip}`,
+      `   ${fromLine}`,
       `   Issues: ${issueText}`,
       `   Open: ${openUrl}`,
       "",
     );
     htmlItems.push(
-      `<li style="margin-bottom:12px"><strong>${escapeHtml(role)}:</strong> ${escapeHtml(snip)}<br><span style="color:#555">${escapeHtml(issueText)}</span><br><a href="${escapeHtml(openUrl)}">Open in Exled</a></li>`,
+      `<li style="margin-bottom:12px">${escapeHtml(snip)}<br><span style="color:#555">${escapeHtml(fromLine)} · ${escapeHtml(issueText)}</span><br><a href="${escapeHtml(openUrl)}">Open in Exled</a></li>`,
     );
   }
   if (recipient.items.length > MAX_ITEMS_PER_EMAIL) {
@@ -236,7 +240,7 @@ function buildDigestEmail(
   const html = `<!DOCTYPE html>
 <html><body style="font-family:system-ui,sans-serif;line-height:1.5;max-width:600px">
   <p>${greeting}</p>
-  <p>The following open expectations need your attention <strong>as soon as possible</strong>. They are unhealthy in Exled (not accepted, no progress defined, at risk, off track, and/or no deadline set):</p>
+  <p>The following expectations <strong>assigned to you</strong> are open and unhealthy (not accepted, no progress, at risk, off track, and/or no deadline). Please take action <strong>as soon as possible</strong>:</p>
   <ul>${htmlItems.join("")}</ul>
   <p>Please address these ASAP.</p>
   <p style="color:#666">— Exled</p>
