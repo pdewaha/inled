@@ -101,14 +101,31 @@ List<String> expectationReceiverHandleList({
 String talkingPointMentionWhoLabel(
   String summary, {
   Iterable<String> persistedMentionHandles = const [],
+  Iterable<String> persistedMentionPersonIds = const [],
+  Map<String, Person> peopleById = const {},
   String fallback = kLedgerAllMentionLabel,
 }) {
-  final handles = talkingPointMentionHandleList(
+  final seen = <String>{};
+  final out = <String>[];
+  void addHandle(String raw) {
+    final h = raw.trim();
+    if (h.isEmpty) return;
+    final k = h.toLowerCase();
+    if (seen.add(k)) out.add(h);
+  }
+
+  for (final h in talkingPointMentionHandleList(
     summary: summary,
     persistedMentionHandles: persistedMentionHandles,
-  );
-  if (handles.isEmpty) return fallback;
-  return handles.map((h) => '@$h').join(' ');
+  )) {
+    addHandle(h);
+  }
+  for (final id in persistedMentionPersonIds) {
+    final h = peopleById[id.trim()]?.handle.trim() ?? '';
+    if (h.isNotEmpty) addHandle(h);
+  }
+  if (out.isEmpty) return fallback;
+  return out.map((h) => '@$h').join(' ');
 }
 
 /// Expectation list/detail receivers: linked person, co-@mentions, or [@All].

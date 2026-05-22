@@ -7,6 +7,7 @@
 | Public API | `https://leam.tauworks.org` | `https://be.exled.app` |
 | App links in email | `https://leam.tauworks.org` | `https://be.exled.app` |
 | Activity email function (internal) | `http://leam-kong:8000/functions/v1/send-activity-email` | `http://exled-kong:8000/functions/v1/send-activity-email` |
+| Morning unhealthy digest | `…/send-unhealthy-digest` | `…/send-unhealthy-digest` |
 | Edge functions container | `leam-edge-functions` | `exled-edge-functions` |
 | Postgres container | `leam-db` | `exled-db` |
 | `docker compose exec` service | `db`, `functions` | `db`, `functions` |

@@ -36,6 +36,8 @@ CREATE INDEX IF NOT EXISTS idx_activity_email_outbox_pending
 
 ALTER TABLE activity_email_outbox ENABLE ROW LEVEL SECURITY;
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.activity_email_outbox TO service_role;
+
 -- Resolve party recipients with email (service role / triggers only).
 CREATE OR REPLACE FUNCTION inled_activity_email_recipients(
   p_expectation_id uuid,

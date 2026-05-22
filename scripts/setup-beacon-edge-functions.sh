@@ -40,7 +40,7 @@ else
   echo "==> Copy from: (none — using files already in $VOL)"
 fi
 
-mkdir -p "$VOL/main" "$VOL/hello" "$VOL/send-activity-email"
+mkdir -p "$VOL/main" "$VOL/hello" "$VOL/send-activity-email" "$VOL/send-unhealthy-digest"
 
 install_fn() {
   local name="$1"
@@ -84,6 +84,7 @@ install_fn() {
 install_fn main yes
 install_fn hello no
 install_fn send-activity-email yes
+install_fn send-unhealthy-digest yes
 
 # Self-hosted: single index.ts only. Extra files often cause
 # "could not find an appropriate entrypoint" on edge-runtime v1.71+.
@@ -104,7 +105,7 @@ find "$VOL" -type f -name '*.ts' -exec chmod 644 {} +
 
 echo "==> Layout:"
 ls -la "$VOL"
-ls -la "$VOL/main" "$VOL/send-activity-email" 2>/dev/null || true
+ls -la "$VOL/main" "$VOL/send-activity-email" "$VOL/send-unhealthy-digest" 2>/dev/null || true
 
 cd "$COMPOSE_DIR"
 docker compose up -d --force-recreate functions

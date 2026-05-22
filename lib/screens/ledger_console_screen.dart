@@ -810,9 +810,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             .limit(1);
         if ((meRows as List).isNotEmpty) {
           final meRow = meRows.first as Map<String, dynamic>;
+          final cachedHandles =
+              _mentionHandlesByExpectationId[expectation.id] ?? const [];
           final mentionLine = [
-            ...(_mentionHandlesByExpectationId[expectation.id] ??
-                    const [])
+            ...cachedHandles.map((h) => '@$h'),
+            ...extractMentionHandlesFromText(expectation.summary)
+                .where((h) => !cachedHandles
+                    .any((c) => c.toLowerCase() == h.toLowerCase()))
                 .map((h) => '@$h'),
             expectation.summary,
           ].join(' ');
@@ -2735,9 +2739,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         _releaseSubmitInFlight();
         return;
       }
-      visibility = mode == _ExpectationSubmitMode.draft
-          ? ExpectationVisibility.shadow
-          : ExpectationVisibility.echo;
+      final wantsEcho = mode == _ExpectationSubmitMode.inform;
+      if (entryType == ExpectationType.topic &&
+          wantsEcho &&
+          !_hashTagRegex.hasMatch(captureBody)) {
+        visibility = ExpectationVisibility.shadow;
+      } else {
+        visibility = wantsEcho
+            ? ExpectationVisibility.echo
+            : ExpectationVisibility.shadow;
+      }
     }
 
     final persistTarget = entryType == ExpectationType.topic ? null : person;
@@ -3503,8 +3514,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final mentionLine = (mentionSourceText ?? text).trim();
     // Sync @mentions before changelog so activity-email triggers see recipients.
     // Talking points never set target_person_id; recipients come from expectation_mentions only.
-    if (type == ExpectationType.topic &&
-        visibility == ExpectationVisibility.echo) {
+    // Shadow + echo: summary strips leading @, so rows must be persisted for every save.
+    if (type == ExpectationType.topic) {
       await syncTalkingPointMentions(
         client: client,
         companyId: companyId,
@@ -3524,7 +3535,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
         replaceExisting: true,
       );
-    } else if (type != ExpectationType.topic) {
+    } else {
       await syncExpectationCoReceiverMentions(
         client: client,
         companyId: companyId,
@@ -5002,6 +5013,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
               composerRecentListing: true,
               talkingPointPersistedMentions: _persistedMentionHandles(x),
+              peopleById: peopleById,
+              coReceiverPersonIds:
+                  _mentionPersonIdsByExpectationId[x.id] ?? const {},
             ),
           );
         }
@@ -8360,11 +8374,16 @@ String _timeLabel(DateTime t, Locale locale) {
   return formatDisplayDateTime(t, locale);
 }
 
+/// Shown in listing deadline rails when [Expectation.deadlineAt] is unset (TBD).
+const String kNoDeadlineListingSymbol = '\u221E'; // ∞ (not the digit 8)
+
 String _deadlineDistanceLabel(Expectation e) {
   final due = e.deadlineAt;
   if (due == null) {
     final label = e.deadlineLabel.trim();
-    if (label.isEmpty || label.toUpperCase() == 'TBD') return '8';
+    if (label.isEmpty || label.toUpperCase() == 'TBD') {
+      return kNoDeadlineListingSymbol;
+    }
     return label;
   }
   final now = DateTime.now();
@@ -9070,6 +9089,7 @@ class _ExpectationsOthersSection extends StatelessWidget {
                   talkingPointsBrowseListing: talkingPointsBrowseListing,
                   talkingPointPersistedMentions:
                       talkingPointMentionHandlesById?[e.id] ?? const [],
+                  peopleById: peopleById,
                   onArchiveTalkingPoint: onArchiveTalkingPoint,
                   onPublishTalkingPoint: onPublishTalkingPoint,
                 );
@@ -9283,6 +9303,7 @@ class _ExpectationOthersTile extends StatefulWidget {
     this.composerRecentListing = false,
     this.talkingPointsBrowseListing = false,
     this.talkingPointPersistedMentions = const [],
+    this.peopleById = const {},
     this.onArchiveTalkingPoint,
     this.onPublishTalkingPoint,
   });
@@ -9309,6 +9330,7 @@ class _ExpectationOthersTile extends StatefulWidget {
   /// Tags pillar talking-point lists: hover Archive (non-terminal) + Delete when author.
   final bool talkingPointsBrowseListing;
   final List<String> talkingPointPersistedMentions;
+  final Map<String, Person> peopleById;
   final Future<void> Function(Expectation expectation)? onArchiveTalkingPoint;
   /// Shadow talking points only: publish to echo when [Expectation.personId] is empty (no @-addressee).
   final Future<void> Function(Expectation expectation)? onPublishTalkingPoint;
@@ -9367,6 +9389,8 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         ? talkingPointMentionWhoLabel(
             widget.expectation.summary,
             persistedMentionHandles: widget.talkingPointPersistedMentions,
+            persistedMentionPersonIds: widget.coReceiverPersonIds,
+            peopleById: widget.peopleById,
           )
         : expectationReceiverWhoLabel(
             summary: widget.expectation.summary,
@@ -11501,10 +11525,16 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
+    final receiverPeopleById = <String, Person>{
+      for (final p in widget.receiverPeople) p.id: p,
+      if (widget.person != null) widget.person!.id: widget.person!,
+    };
     final receiverLabel = isDiscussionPoint
         ? talkingPointMentionWhoLabel(
             widget.expectation.summary,
             persistedMentionHandles: widget.talkingPointPersistedMentions,
+            persistedMentionPersonIds: widget.coReceiverPersonIds,
+            peopleById: receiverPeopleById,
           )
         : expectationReceiverWhoLabel(
             summary: widget.expectation.summary,
@@ -11680,6 +11710,8 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             widget.expectation.summary,
                             persistedMentionHandles:
                                 widget.talkingPointPersistedMentions,
+                            persistedMentionPersonIds: widget.coReceiverPersonIds,
+                            peopleById: receiverPeopleById,
                           ),
                         ),
                       if (widget.expectation.seenAt != null)
