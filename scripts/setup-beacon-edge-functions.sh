@@ -40,7 +40,7 @@ else
   echo "==> Copy from: (none — using files already in $VOL)"
 fi
 
-mkdir -p "$VOL/main" "$VOL/hello" "$VOL/send-activity-email" "$VOL/send-unhealthy-digest"
+mkdir -p "$VOL/main" "$VOL/hello" "$VOL/send-activity-email" "$VOL/send-unhealthy-digest" "$VOL/send-invite-email"
 
 install_fn() {
   local name="$1"
@@ -85,6 +85,7 @@ install_fn main yes
 install_fn hello no
 install_fn send-activity-email yes
 install_fn send-unhealthy-digest yes
+install_fn send-invite-email yes
 
 # Self-hosted: single index.ts only. Extra files often cause
 # "could not find an appropriate entrypoint" on edge-runtime v1.71+.

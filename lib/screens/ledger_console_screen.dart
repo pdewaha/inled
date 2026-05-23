@@ -18,10 +18,12 @@ import 'package:exled/models/expectation_visibility.dart';
 import 'package:exled/services/expectation_activity_feed.dart';
 import 'package:exled/services/expectation_chat_changelog.dart';
 import 'package:exled/services/expectation_mentions.dart';
+import 'package:exled/services/send_invite_email.dart';
 import 'package:exled/supabase_config.dart';
 import 'package:exled/theme.dart';
 import 'package:exled/utils/capture_parser.dart';
 import 'package:exled/utils/display_date_format.dart';
+import 'package:exled/utils/hashtag_normalize.dart';
 import 'package:exled/utils/person_display.dart';
 import 'package:exled/widgets/command_capture_bar.dart';
 import 'package:exled/widgets/expectation_changelog_message_body.dart';
@@ -445,8 +447,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final out = <String>[];
     for (final e in pool) {
       for (final tag in _extractInlineTags(e.summary)) {
-        final k = tag.toLowerCase();
-        if (seen.add(k)) out.add(tag);
+        if (seen.add(tag)) out.add(tag);
         if (out.length >= max) return out;
       }
     }
@@ -478,8 +479,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final seen = <String>{};
     final out = <String>[];
     void addDisplay(String tag) {
-      final k = tag.toLowerCase();
-      if (seen.add(k)) out.add(tag);
+      final k = normalizeHashtagToken(tag);
+      if (k.isEmpty) return;
+      if (seen.add(k)) out.add(k);
     }
     final pool = _publicEchoTalkingPoints().toList()
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
@@ -501,9 +503,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final seen = <String>{};
     final out = <String>[];
     void add(String t) {
-      if (t.trim().isEmpty) return;
-      final k = t.toLowerCase();
-      if (seen.add(k)) out.add(t);
+      final k = normalizeHashtagToken(t);
+      if (k.isEmpty) return;
+      if (seen.add(k)) out.add(k);
     }
 
     for (final t in _recentTags) {
@@ -1186,8 +1188,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         final summary = ((row['summary'] as String?) ?? '').trim();
         if (summary.isEmpty) continue;
         for (final tag in _extractInlineTags(summary)) {
-          final key = tag.toLowerCase();
-          if (seen.add(key)) {
+          if (seen.add(tag)) {
             tags.add(tag);
           }
           if (tags.length > 20) break;
@@ -1826,9 +1827,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (start == null || end == null) return;
     final value = _captureController.value;
     if (start < 0 || end < start || end > value.text.length) return;
+    final canonical = normalizeHashtagToken(tag);
+    if (canonical.isEmpty) return;
     final prefix = value.text.substring(0, start);
     final suffix = value.text.substring(end);
-    final replacement = '#$tag';
+    final replacement = '#$canonical';
     final spacer = suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' ';
     final nextText = '$prefix$replacement$spacer$suffix';
     final nextCaret = (prefix + replacement + spacer).length;
@@ -3193,7 +3196,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return meRows.first['company_id'] as String;
   }
 
-  Future<void> _createInviteForPerson({
+  Future<String> _createInviteForPerson({
     required String companyId,
     required Person? person,
     required String email,
@@ -3211,7 +3214,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final inviteKind = person == null ? 'generic' : 'personalized:${person.id}';
     final tokenHash =
         '$inviteKind:${DateTime.now().microsecondsSinceEpoch}-${user.id}-${email.toLowerCase()}';
-    await client.from('invites').insert({
+    final row = await client.from('invites').insert({
       'company_id': companyId,
       'email': email,
       'role': 0,
@@ -3219,7 +3222,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       'token_hash': tokenHash,
       'invited_by_user_id': user.id,
       'expires_at': expiresAt,
-    });
+    }).select('id').single();
+    return row['id'] as String;
+  }
+
+  Future<bool> _dispatchInviteEmail(String inviteId) async {
+    return sendInviteEmailForInviteId(
+      client: Supabase.instance.client,
+      inviteId: inviteId,
+    );
   }
 
   Future<void> _openInviteFlow({String? personId}) async {
@@ -3240,20 +3251,27 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (email == null || !_emailRegex.hasMatch(email)) return;
     try {
       final companyId = await _inviteCompanyIdForCurrentUser();
-      await _createInviteForPerson(
+      final inviteId = await _createInviteForPerson(
         companyId: companyId,
         person: person,
         email: email,
       );
+      final emailed = await _dispatchInviteEmail(inviteId);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            person == null
-                ? 'Generic invite created for $email.'
-                : 'Personalized invite created for @${
-                    person.handle
-                  } ($email).',
+            emailed
+                ? (person == null
+                    ? 'Invite email sent to $email.'
+                    : 'Invite email sent to @${
+                        person.handle
+                      } ($email).')
+                : (person == null
+                    ? 'Invite saved for $email, but the email could not be sent.'
+                    : 'Invite saved for @${
+                        person.handle
+                      }, but the email could not be sent.'),
           ),
         ),
       );
@@ -3299,14 +3317,17 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     try {
       final companyId = await _inviteCompanyIdForCurrentUser();
       final sent = <String>[];
+      var emailFailures = 0;
       for (final p in pending) {
         final email = emailsByPersonId[p.id]?.trim() ?? '';
         if (!_emailRegex.hasMatch(email)) continue;
-        await _createInviteForPerson(
+        final inviteId = await _createInviteForPerson(
           companyId: companyId,
           person: p,
           email: email,
         );
+        final emailed = await _dispatchInviteEmail(inviteId);
+        if (!emailed) emailFailures++;
         sent.add('@${p.handle}');
       }
       if (!mounted) return;
@@ -3316,12 +3337,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         );
         return;
       }
+      final base = sent.length == 1
+          ? 'Invite email sent to ${sent.first}.'
+          : 'Invite emails sent to ${sent.join(', ')}.';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            sent.length == 1
-                ? 'Invite sent to ${sent.first}.'
-                : 'Invites sent to ${sent.join(', ')}.',
+            emailFailures == 0
+                ? base
+                : '$base ${emailFailures} email(s) could not be delivered.',
           ),
         ),
       );
@@ -3395,7 +3419,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (first != upperFirst) {
       normalized = '$upperFirst${normalized.substring(1)}';
     }
-    return normalized;
+    return normalizeHashtagsInText(normalized);
   }
 
   /// Talking points: strip leading @mention burst (stored in [expectation_mentions]); keep other @/# in body.
@@ -3411,7 +3435,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (first != upperFirst) {
       normalized = '$upperFirst${normalized.substring(1)}';
     }
-    return normalized;
+    return normalizeHashtagsInText(normalized);
   }
 
   Future<String> _persistExpectationToSupabase({
@@ -3473,7 +3497,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final expectationId = inserted['id'] as String;
     final rawTags = _allHashTagsRegex
         .allMatches(text)
-        .map((m) => (m.group(1) ?? '').trim().toLowerCase())
+        .map((m) => normalizeHashtagToken(m.group(1) ?? ''))
         .where((t) => t.isNotEmpty)
         .toSet();
 
@@ -3494,7 +3518,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             .from('expectation_tags')
             .select('id')
             .eq('company_id', companyId)
-            .ilike('name', tag)
+            .eq('name', tag)
             .limit(1);
         if ((existingTag as List).isEmpty) {
           rethrow;
@@ -3841,13 +3865,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
 
     if (normalizedEmail != null) {
+      final personId = personRow['id'] as String;
       final expiresAt = DateTime.now()
           .toUtc()
           .add(const Duration(days: 14))
           .toIso8601String();
       final tokenHash =
-          '${DateTime.now().microsecondsSinceEpoch}-${user.id}-${normalized.toLowerCase()}';
-      await client.from('invites').insert({
+          'personalized:$personId:${DateTime.now().microsecondsSinceEpoch}-${user.id}-${normalized.toLowerCase()}';
+      final inviteRow = await client.from('invites').insert({
         'company_id': companyId,
         'email': normalizedEmail,
         'role': 0,
@@ -3855,7 +3880,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         'token_hash': tokenHash,
         'invited_by_user_id': user.id,
         'expires_at': expiresAt,
-      });
+      }).select('id').single();
+      unawaited(
+        _dispatchInviteEmail(inviteRow['id'] as String),
+      );
     }
 
     final person = Person(
@@ -8867,12 +8895,13 @@ final RegExp _privateTalkingInlineTokenRegex =
     RegExp(r'(@[a-zA-Z0-9._-]+|#[a-zA-Z0-9._-]+)');
 
 List<String> _extractInlineTags(String input) {
-  return _inlineTagRegex
-      .allMatches(input)
-      .map((m) => (m.group(1) ?? '').trim())
-      .where((t) => t.isNotEmpty)
-      .toSet()
-      .toList();
+  final seen = <String>{};
+  final out = <String>[];
+  for (final m in _inlineTagRegex.allMatches(input)) {
+    final k = normalizeHashtagToken(m.group(1) ?? '');
+    if (k.isNotEmpty && seen.add(k)) out.add(k);
+  }
+  return out;
 }
 
 /// Lowercase needle for matching summary #tags (null = no filter).
@@ -10881,7 +10910,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     if (isReceiverActor && _status == ExpectationStatus.pending) {
       _status = ExpectationStatus.accepted;
     }
-    final summary = _descriptionController.text.trim();
+    final summary = normalizeHashtagsInText(_descriptionController.text.trim());
     final nextVisibility = publish ? ExpectationVisibility.echo : _visibility;
     final nextFinishedAt = _status == ExpectationStatus.finished
         ? (widget.expectation.finishedAt ?? DateTime.now().toUtc())

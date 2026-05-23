@@ -2,6 +2,7 @@ import 'package:exled/models/expectation.dart';
 import 'package:exled/models/expectation_type.dart';
 import 'package:exled/models/expectation_visibility.dart';
 import 'package:exled/models/expectation_changelog_payload.dart';
+import 'package:exled/utils/hashtag_normalize.dart';
 import 'package:exled/services/expectation_chat_changelog.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -92,14 +93,12 @@ String _snippet(String summary, {int maxLen = 72}) {
   return '${t.substring(0, maxLen)}…';
 }
 
-final RegExp _activityFeedHashTagRe = RegExp(r'#([a-zA-Z0-9._-]+)');
-
 /// Distinct hashtags from [summary], first occurrence order, lowercase body (no `#`).
 List<String> activityFeedHashtagsFromSummary(String summary, {int max = 6}) {
   final seen = <String>{};
   final out = <String>[];
-  for (final m in _activityFeedHashTagRe.allMatches(summary)) {
-    final t = (m.group(1) ?? '').trim().toLowerCase();
+  for (final m in kHashtagInTextRegex.allMatches(summary)) {
+    final t = normalizeHashtagToken(m.group(1) ?? '');
     if (t.isEmpty || seen.contains(t)) continue;
     seen.add(t);
     out.add(t);
