@@ -1,0 +1,22 @@
+---
+description: Shell scripts must use LF line endings (beacon/Linux bash)
+globs: scripts/**/*.sh,**/*.sh
+alwaysApply: true
+---
+
+# Shell scripts — LF only
+
+All `.sh` files run on **beacon (Linux)**. **CRLF breaks bash** (`bash\r: No such file or directory`).
+
+When creating or editing shell scripts:
+
+1. Use **Unix LF (`\n`) only** — never CRLF (`\r\n`).
+2. **After every write** to a `.sh` file, normalize line endings before finishing the task:
+   - **Git Bash / Linux / macOS:** `sed -i 's/\r$//' path/to/script.sh`
+   - **PowerShell (Windows):** rewrite with LF-only bytes or run the sed command above in Git Bash.
+3. Do not rely on `./script.sh` on Windows to validate line endings — verify on disk.
+4. Shebang must be exactly `#!/usr/bin/env bash` with no trailing `\r`.
+
+Repo safeguards: `.gitattributes` (`*.sh text eol=lf`), `.editorconfig`, pre-commit hook (`.githooks/pre-commit`). Run once: `bash scripts/install-git-hooks.sh`.
+
+On beacon after manual copy: `bash scripts/fix-scripts-on-beacon.sh`

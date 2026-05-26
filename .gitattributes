@@ -1,3 +1,5 @@
 # Shell scripts must stay LF — CRLF breaks bash on Linux (beacon).
 *.sh text eol=lf
+*.bash text eol=lf
 scripts/** text eol=lf
+.githooks/** text eol=lf

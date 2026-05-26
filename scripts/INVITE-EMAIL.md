@@ -7,9 +7,11 @@ When someone taps **Invite** (or adds an email for an @mentioned placeholder), t
 
 Personalized invites (`token_hash` prefix `personalized:<person_id>:`) include open expectations and talking points already assigned to that person.
 
+While a colleague has a **pending invite**, the activity-email trigger skips redundant **“Created a new expectation/talking point”** mail (migration `021`) — the invite email is the single onboarding notification.
+
 ## Deploy (beacon)
 
-1. Apply migration `020_invite_pending_items.sql` on the target DB.
+1. Apply migrations `020_invite_pending_items.sql` and `021_activity_email_skip_pending_invite.sql` on the target DB.
 2. Copy function and restart:
 
 ```bash

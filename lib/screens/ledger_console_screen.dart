@@ -2954,6 +2954,56 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _uuidRegex.hasMatch(id.trim());
   static final RegExp _emailRegex = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
 
+  void _disposeAfterDialogClosed(TextEditingController controller) {
+    _disposeAfterDialogClosedAll([controller]);
+  }
+
+  /// [showDialog] completes before the route finishes its close animation; disposing
+  /// controllers immediately makes the closing [TextField] rebuild on a dead controller.
+  void _disposeAfterDialogClosedAll(Iterable<TextEditingController> controllers) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        for (final c in controllers) {
+          c.dispose();
+        }
+      });
+    });
+  }
+
+  void _popDialogWithResult<T>(BuildContext dialogContext, T? result) {
+    FocusScope.of(dialogContext).unfocus();
+    final navigator = Navigator.of(dialogContext, rootNavigator: true);
+    if (navigator.canPop()) {
+      navigator.pop(result);
+    }
+  }
+
+  /// Enter on a dialog [TextField] can hang if [Navigator.pop] runs in the key handler.
+  void _popDialogFromFieldSubmit<T>(BuildContext dialogContext, T? result) {
+    FocusScope.of(dialogContext).unfocus();
+    Future.microtask(() {
+      if (!dialogContext.mounted) return;
+      final navigator = Navigator.of(dialogContext, rootNavigator: true);
+      if (navigator.canPop()) {
+        navigator.pop(result);
+      }
+    });
+  }
+
+  void _queueInviteEmail(String inviteId) {
+    unawaited(
+      _dispatchInviteEmail(inviteId).then((sent) {
+        if (!mounted || !sent) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Invite email delivered.'),
+            duration: Duration(seconds: 4),
+          ),
+        );
+      }),
+    );
+  }
+
   Future<String?> _askInviteEmailDialog({Person? person}) async {
     final handle = person?.handle.trim();
     final initialEmail = (person?.email ?? '').trim();
@@ -2962,9 +3012,31 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final result = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (context) {
+      builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setLocalState) {
+            void submitFromButton() {
+              final value = controller.text.trim();
+              if (_emailRegex.hasMatch(value)) {
+                _popDialogWithResult(dialogContext, value);
+              } else {
+                setLocalState(() {
+                  error = 'Please enter a valid email address.';
+                });
+              }
+            }
+
+            void submitFromField() {
+              final value = controller.text.trim();
+              if (_emailRegex.hasMatch(value)) {
+                _popDialogFromFieldSubmit(dialogContext, value);
+              } else {
+                setLocalState(() {
+                  error = 'Please enter a valid email address.';
+                });
+              }
+            }
+
             return AlertDialog(
               title: Text(
                 (handle != null && handle.isNotEmpty)
@@ -2984,6 +3056,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   TextField(
                     controller: controller,
                     autofocus: true,
+                    keyboardType: TextInputType.emailAddress,
+                    textInputAction: TextInputAction.done,
                     decoration: InputDecoration(
                       labelText: person != null
                           ? _inviteEmailFieldLabel(person)
@@ -2991,35 +3065,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       hintText: 'name@company.com',
                       errorText: error,
                     ),
-                    onSubmitted: (_) {
-                      final value = controller.text.trim();
-                      if (_emailRegex.hasMatch(value)) {
-                        Navigator.of(context).pop(value);
-                      } else {
-                        setLocalState(() {
-                          error = 'Please enter a valid email address.';
-                        });
-                      }
-                    },
+                    onSubmitted: (_) => submitFromField(),
                   ),
                 ],
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.of(context).pop(_cancelToken),
+                  onPressed: () =>
+                      _popDialogWithResult(dialogContext, _cancelToken),
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
-                  onPressed: () {
-                    final value = controller.text.trim();
-                    if (_emailRegex.hasMatch(value)) {
-                      Navigator.of(context).pop(value);
-                    } else {
-                      setLocalState(() {
-                        error = 'Please enter a valid email address.';
-                      });
-                    }
-                  },
+                  onPressed: submitFromButton,
                   child: const Text('Send invite'),
                 ),
               ],
@@ -3028,13 +3085,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         );
       },
     );
-    if (!context.mounted) {
-      controller.dispose();
-    } else {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        controller.dispose();
-      });
-    }
+    _disposeAfterDialogClosed(controller);
     if (result == _cancelToken) return null;
     return result?.trim();
   }
@@ -3130,13 +3181,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             hintText: 'name@company.com (optional)',
                             errorText: errors[p.id],
                           ),
+                          keyboardType: TextInputType.emailAddress,
                           textInputAction: people.last.id == p.id
                               ? TextInputAction.done
                               : TextInputAction.next,
                           onSubmitted: (_) {
                             final out = <String, String>{};
                             if (validateAndCollect(out)) {
-                              Navigator.of(dialogContext).pop(out);
+                              _popDialogFromFieldSubmit(dialogContext, out);
                             } else {
                               setLocalState(() {});
                             }
@@ -3150,14 +3202,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  onPressed: () =>
+                      _popDialogWithResult<Map<String, String>?>(
+                    dialogContext,
+                    null,
+                  ),
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
                   onPressed: () {
                     final out = <String, String>{};
                     if (validateAndCollect(out)) {
-                      Navigator.of(dialogContext).pop(out);
+                      _popDialogWithResult(dialogContext, out);
                     } else {
                       setLocalState(() {});
                     }
@@ -3173,9 +3229,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       },
     );
 
-    for (final c in controllers.values) {
-      c.dispose();
-    }
+    _disposeAfterDialogClosedAll(controllers.values);
     return result;
   }
 
@@ -3256,22 +3310,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         person: person,
         email: email,
       );
-      final emailed = await _dispatchInviteEmail(inviteId);
+      _queueInviteEmail(inviteId);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            emailed
-                ? (person == null
-                    ? 'Invite email sent to $email.'
-                    : 'Invite email sent to @${
-                        person.handle
-                      } ($email).')
-                : (person == null
-                    ? 'Invite saved for $email, but the email could not be sent.'
-                    : 'Invite saved for @${
-                        person.handle
-                      }, but the email could not be sent.'),
+            person == null
+                ? 'Invite saved for $email. Sending email…'
+                : 'Invite saved for @${
+                    person.handle
+                  } ($email). Sending email…',
           ),
         ),
       );
@@ -3317,7 +3365,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     try {
       final companyId = await _inviteCompanyIdForCurrentUser();
       final sent = <String>[];
-      var emailFailures = 0;
       for (final p in pending) {
         final email = emailsByPersonId[p.id]?.trim() ?? '';
         if (!_emailRegex.hasMatch(email)) continue;
@@ -3326,8 +3373,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           person: p,
           email: email,
         );
-        final emailed = await _dispatchInviteEmail(inviteId);
-        if (!emailed) emailFailures++;
+        _queueInviteEmail(inviteId);
         sent.add('@${p.handle}');
       }
       if (!mounted) return;
@@ -3337,15 +3383,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         );
         return;
       }
-      final base = sent.length == 1
-          ? 'Invite email sent to ${sent.first}.'
-          : 'Invite emails sent to ${sent.join(', ')}.';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            emailFailures == 0
-                ? base
-                : '$base ${emailFailures} email(s) could not be delivered.',
+            sent.length == 1
+                ? 'Invite saved for ${sent.first}. Sending email…'
+                : 'Invites saved for ${sent.join(', ')}. Sending emails…',
           ),
         ),
       );
@@ -3881,9 +3924,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         'invited_by_user_id': user.id,
         'expires_at': expiresAt,
       }).select('id').single();
-      unawaited(
-        _dispatchInviteEmail(inviteRow['id'] as String),
-      );
+      _queueInviteEmail(inviteRow['id'] as String);
     }
 
     final person = Person(
@@ -4052,9 +4093,31 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final result = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (context) {
+      builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setLocalState) {
+            void submitFromButton() {
+              final value = controller.text.trim();
+              if (value.isEmpty || _emailRegex.hasMatch(value)) {
+                _popDialogWithResult(dialogContext, value);
+              } else {
+                setLocalState(() {
+                  error = 'Please enter a valid email or leave empty.';
+                });
+              }
+            }
+
+            void submitFromField() {
+              final value = controller.text.trim();
+              if (value.isEmpty || _emailRegex.hasMatch(value)) {
+                _popDialogFromFieldSubmit(dialogContext, value);
+              } else {
+                setLocalState(() {
+                  error = 'Please enter a valid email or leave empty.';
+                });
+              }
+            }
+
             return AlertDialog(
               title: Text('Create @$handle'),
               content: Column(
@@ -4068,39 +4131,24 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   TextField(
                     controller: controller,
                     autofocus: true,
+                    keyboardType: TextInputType.emailAddress,
+                    textInputAction: TextInputAction.done,
                     decoration: InputDecoration(
                       hintText: 'name@company.com (optional)',
                       errorText: error,
                     ),
-                    onSubmitted: (_) {
-                      final value = controller.text.trim();
-                      if (value.isEmpty || _emailRegex.hasMatch(value)) {
-                        Navigator.of(context).pop(value);
-                      } else {
-                        setLocalState(() {
-                          error = 'Please enter a valid email or leave empty.';
-                        });
-                      }
-                    },
+                    onSubmitted: (_) => submitFromField(),
                   ),
                 ],
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.of(context).pop(_cancelToken),
+                  onPressed: () =>
+                      _popDialogWithResult(dialogContext, _cancelToken),
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
-                  onPressed: () {
-                    final value = controller.text.trim();
-                    if (value.isEmpty || _emailRegex.hasMatch(value)) {
-                      Navigator.of(context).pop(value);
-                    } else {
-                      setLocalState(() {
-                        error = 'Please enter a valid email or leave empty.';
-                      });
-                    }
-                  },
+                  onPressed: submitFromButton,
                   child: const Text('Continue anyway'),
                 ),
               ],
@@ -4109,13 +4157,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         );
       },
     );
-    if (!context.mounted) {
-      controller.dispose();
-    } else {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        controller.dispose();
-      });
-    }
+    _disposeAfterDialogClosed(controller);
     return result;
   }
 

@@ -135,6 +135,20 @@ String expectationChangelogActivityFeedLine({
   if (parsed == null) {
     final t = messageText.trim();
     if (t.isEmpty) return 'Activity update (no stored text).';
+    final lower = t.toLowerCase();
+    // Title lives in expectationSummarySnippet below the row; keep intro short.
+    if (lower.startsWith('created a new expectation:')) {
+      return 'Created a new expectation.';
+    }
+    if (lower.startsWith('created a new talking point:')) {
+      return 'Created a new talking point.';
+    }
+    if (lower.startsWith('published this expectation:')) {
+      return 'Published this expectation.';
+    }
+    if (lower.startsWith('published this talking point:')) {
+      return 'Published this talking point.';
+    }
     return t;
   }
   switch (parsed['kind']) {

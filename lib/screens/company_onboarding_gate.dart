@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:exled/screens/ledger_console_screen.dart';
 import 'package:exled/theme.dart';
+import 'package:exled/utils/email_domain.dart';
 import 'package:exled/widgets/debug_menu_button.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -106,6 +107,7 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
       }
 
       if (!mounted) return;
+      _companyNameController.text = companyNameFromEmailDomain(domain);
       setState(() => _state = _OnboardingState.needsCreate);
     } on PostgrestException catch (e) {
       if (!mounted) return;
@@ -420,6 +422,8 @@ class _CreatePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final errColor = Theme.of(context).colorScheme.error;
+    final domain = domainController.text.trim();
+    final suggestedName = companyNameFromEmailDomain(domain);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -446,9 +450,9 @@ class _CreatePanel extends StatelessWidget {
         const SizedBox(height: 12),
         TextField(
           controller: companyNameController,
-          decoration: const InputDecoration(
+          decoration: InputDecoration(
             labelText: 'Company name',
-            hintText: 'CMCM',
+            hintText: suggestedName.isEmpty ? 'Your company' : suggestedName,
           ),
         ),
         const SizedBox(height: 12),

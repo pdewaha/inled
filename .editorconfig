@@ -1,0 +1,13 @@
+# https://editorconfig.org — Cursor/VS Code respect this on save.
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.sh]
+end_of_line = lf
+
+[scripts/**]
+end_of_line = lf

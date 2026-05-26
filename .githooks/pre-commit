@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Reject CRLF in shell scripts (breaks bash on beacon).
+set -euo pipefail
+
+fixed=0
+while IFS= read -r -d '' f; do
+  if grep -q $'\r' "$f" 2>/dev/null; then
+    tmp="$(mktemp)"
+    tr -d '\r' < "$f" > "$tmp"
+    mv "$tmp" "$f"
+    git add "$f"
+    echo "pre-commit: fixed CRLF → LF in $f"
+    fixed=1
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACM | grep -zE '\.sh$' || true)
+
+if [[ "$fixed" -eq 1 ]]; then
+  echo "pre-commit: shell scripts normalized to LF (re-staged)."
+fi
+
+exit 0
