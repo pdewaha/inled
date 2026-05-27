@@ -112,9 +112,11 @@ async function sendSmtpMail(
   text: string,
   html: string,
 ): Promise<void> {
+  const historyBcc = activityEmailHistoryBccForRecipient(to);
   trace("smtp_send_begin", {
     to,
     subjectLen: subject.length,
+    historyBcc: historyBcc ?? null,
     ...smtpDiag(cfg),
   });
   const nodemailer = await loadNodemailer();
@@ -138,6 +140,7 @@ async function sendSmtpMail(
       transporter.sendMail({
         from: cfg.from,
         to,
+        ...(historyBcc ? { bcc: historyBcc } : {}),
         subject,
         text,
         html,
@@ -354,6 +357,43 @@ function readSmtpConfig(): SmtpConfig | { error: string } {
   const cfg = { host, port, secure, user, pass, from: fromHeader };
   trace("smtp_config_ready", smtpDiag(cfg));
   return cfg;
+}
+
+const _historyBccDisabled = new Set([
+  "0",
+  "false",
+  "off",
+  "no",
+  "disabled",
+]);
+
+/** BCC archive for every activity email (recipients do not see it). Prefer ACTIVITY_EMAIL_HISTORY_BCC; ACTIVITY_EMAIL_HISTORY_CC is a legacy alias. Set to off/false/0 to disable. */
+function activityEmailHistoryBccAddress(): string | undefined {
+  const rawEnv =
+    Deno.env.get("ACTIVITY_EMAIL_HISTORY_BCC") ??
+    Deno.env.get("ACTIVITY_EMAIL_HISTORY_CC");
+  if (rawEnv === undefined) {
+    return "history@exled.app";
+  }
+  const raw = rawEnv.trim();
+  if (raw === "") {
+    return "history@exled.app";
+  }
+  if (_historyBccDisabled.has(raw.toLowerCase())) {
+    return undefined;
+  }
+  if (raw.includes("@")) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)) return undefined;
+    return raw;
+  }
+  return "history@exled.app";
+}
+
+function activityEmailHistoryBccForRecipient(to: string): string | undefined {
+  const bcc = activityEmailHistoryBccAddress();
+  if (!bcc) return undefined;
+  if (bcc.toLowerCase() === to.trim().toLowerCase()) return undefined;
+  return bcc;
 }
 
 function escapeHtml(s: string): string {

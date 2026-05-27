@@ -40,3 +40,32 @@ FROM people
 WHERE email IS NOT NULL AND trim(email) <> ''
 ORDER BY created_at DESC
 LIMIT 20;
+
+-- 6) Dashboard: counts by status (simple “did mail fire?” view)
+SELECT status, count(*) AS n
+FROM activity_email_outbox
+GROUP BY status
+ORDER BY status;
+
+-- 7) Dashboard: changelog vs mention rows, by status
+SELECT source_type, status, count(*) AS n
+FROM activity_email_outbox
+GROUP BY source_type, status
+ORDER BY source_type, status;
+
+-- 8) Dashboard: emails sent in the last 24 hours (uses sent_at)
+SELECT count(*) AS sent_last_24h
+FROM activity_email_outbox
+WHERE status = 'sent'
+  AND sent_at IS NOT NULL
+  AND sent_at >= now() - interval '24 hours';
+
+-- 9) Dashboard: sent per calendar day (last 14 days)
+SELECT date_trunc('day', sent_at AT TIME ZONE 'UTC')::date AS day_utc,
+       count(*) AS sent_n
+FROM activity_email_outbox
+WHERE status = 'sent'
+  AND sent_at IS NOT NULL
+  AND sent_at >= now() - interval '14 days'
+GROUP BY 1
+ORDER BY 1 DESC;

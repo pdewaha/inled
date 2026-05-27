@@ -53,6 +53,8 @@ The database enqueues `activity_email_outbox` (migration `010`). The **`send-act
 
    `EXLED_APP_URL` is for **links in emails** (can stay prod even if you debug API on leam). EHLO uses the mailbox domain (`exled.app` from `a@exled.app`) unless you set `SMTP_EHLO_NAME`. `ALLOW_DEBUG_TEST_EMAIL` enables the debug menu test send.
 
+   **Activity email archive (BCC):** each mail is **BCC’d to `history@exled.app`** by default (recipients do not see this address). Set **`ACTIVITY_EMAIL_HISTORY_BCC`** to override, or to **`off`**, **`false`**, or **`0`** to disable. Legacy env **`ACTIVITY_EMAIL_HISTORY_CC`** is read as the same setting if `ACTIVITY_EMAIL_HISTORY_BCC` is unset.
+
 ### `[smtp] connect` fails in `docker compose logs functions`
 
 Login OTP uses **auth** (GoTrue); activity email uses **functions** — separate containers.
@@ -153,6 +155,17 @@ If that works, the full `index.ts` from your PC is stale or corrupt (re-scp). If
 supabase functions deploy send-activity-email --no-verify-jwt
 supabase secrets set SMTP_HOSTNAME=... SMTP_PORT=587 ...
 ```
+
+Optional: **`ACTIVITY_EMAIL_HISTORY_BCC`** — default BCC is **`history@exled.app`** (built in). Set to **`off`** / **`false`** / **`0`** to disable, or to another email to override. Legacy secret **`ACTIVITY_EMAIL_HISTORY_CC`** is still honored if **`ACTIVITY_EMAIL_HISTORY_BCC`** is not set.
+
+## Metrics (“did activity email work?”)
+
+Every enqueue is a row in **`activity_email_outbox`**. After **`send-activity-email`** runs, **`status`** is **`sent`**, **`failed`**, or **`skipped`**; successful sends set **`sent_at`**.
+
+- **Supabase SQL Editor** (or psql as `postgres`): run the queries in **`supabase-db/scripts/test_activity_email.sql`** — especially sections **6–9** (counts by `status`, by `source_type` + `status`, sent in last 24h, sent per day).
+- **Self-hosted shell:** from the compose dir with `.env` loaded, **`bash scripts/show-activity-email-queue.sh`** prints recent rows, counts by **`status`**, **`source_type` × `status`**, and **`sent_last_24h`**.
+
+The **Flutter app does not read this table** (RLS: no policy for authenticated users). A future in-app dashboard would need a **`SECURITY DEFINER`** RPC restricted to admins, or reuse the SQL editor / Grafana / Metabase on Postgres.
 
 ## Optional fallback
 
