@@ -97,6 +97,67 @@ List<String> expectationReceiverHandleList({
   return out;
 }
 
+/// @-mention line for [syncExpectationCoReceiverMentions]: existing receivers plus
+/// new handles in [additionalMentionText], deduped (order preserved: existing then new).
+String mergeExpectationReceiverMentionSourceLine({
+  required String summary,
+  String? primaryPersonHandle,
+  Iterable<String> persistedMentionHandles = const [],
+  required String additionalMentionText,
+}) {
+  final existing = expectationReceiverHandleList(
+    summary: summary,
+    primaryPersonHandle: primaryPersonHandle,
+    persistedMentionHandles: persistedMentionHandles,
+  );
+  final extra = extractMentionHandlesFromText(additionalMentionText);
+  final seen = <String>{};
+  final ordered = <String>[];
+  void add(String raw) {
+    final h = raw.trim();
+    if (h.isEmpty) return;
+    final k = h.toLowerCase();
+    if (seen.add(k)) ordered.add(h);
+  }
+
+  for (final h in existing) {
+    add(h);
+  }
+  for (final h in extra) {
+    add(h);
+  }
+  return ordered.map((h) => '@$h').join(' ');
+}
+
+/// Same for [syncTalkingPointMentions].
+String mergeTalkingPointMentionSourceLine({
+  required String summary,
+  Iterable<String> persistedMentionHandles = const [],
+  required String additionalMentionText,
+}) {
+  final existing = talkingPointMentionHandleList(
+    summary: summary,
+    persistedMentionHandles: persistedMentionHandles,
+  );
+  final extra = extractMentionHandlesFromText(additionalMentionText);
+  final seen = <String>{};
+  final ordered = <String>[];
+  void add(String raw) {
+    final h = raw.trim();
+    if (h.isEmpty) return;
+    final k = h.toLowerCase();
+    if (seen.add(k)) ordered.add(h);
+  }
+
+  for (final h in existing) {
+    add(h);
+  }
+  for (final h in extra) {
+    add(h);
+  }
+  return ordered.map((h) => '@$h').join(' ');
+}
+
 /// List-tile header for talking points: `@a @b` when cited, else [fallback].
 String talkingPointMentionWhoLabel(
   String summary, {
@@ -128,6 +189,126 @@ String talkingPointMentionWhoLabel(
   return out.map((h) => '@$h').join(' ');
 }
 
+const int kListingMaxExtraReceivers = 3;
+
+/// Primary @receiver plus up to [kListingMaxExtraReceivers] co-receivers for list tiles.
+class ListingReceiverParts {
+  const ListingReceiverParts({
+    required this.primaryLabel,
+    this.extraLabels = const [],
+    this.hasMoreExtras = false,
+  });
+
+  final String primaryLabel;
+  final List<String> extraLabels;
+  final bool hasMoreExtras;
+
+  bool get hasExtras => extraLabels.isNotEmpty || hasMoreExtras;
+}
+
+List<String> _receiverHandlesWithPersistedPeople({
+  required List<String> baseHandles,
+  Iterable<String> persistedMentionPersonIds = const [],
+  Map<String, Person> peopleById = const {},
+}) {
+  final seen = <String>{};
+  final out = <String>[];
+  void add(String raw) {
+    final h = raw.trim();
+    if (h.isEmpty) return;
+    final k = h.toLowerCase();
+    if (seen.add(k)) out.add(h);
+  }
+
+  for (final h in baseHandles) {
+    add(h);
+  }
+  for (final id in persistedMentionPersonIds) {
+    final h = peopleById[id.trim()]?.handle.trim() ?? '';
+    if (h.isNotEmpty) add(h);
+  }
+  return out;
+}
+
+/// Ordered handles for expectation listings (primary first).
+List<String> expectationListingReceiverHandles({
+  required String summary,
+  String? primaryPersonHandle,
+  Iterable<String> persistedMentionHandles = const [],
+  Iterable<String> persistedMentionPersonIds = const [],
+  Map<String, Person> peopleById = const {},
+}) {
+  return _receiverHandlesWithPersistedPeople(
+    baseHandles: expectationReceiverHandleList(
+      summary: summary,
+      primaryPersonHandle: primaryPersonHandle,
+      persistedMentionHandles: persistedMentionHandles,
+    ),
+    persistedMentionPersonIds: persistedMentionPersonIds,
+    peopleById: peopleById,
+  );
+}
+
+/// Ordered handles for talking-point listings.
+List<String> talkingPointListingReceiverHandles({
+  required String summary,
+  Iterable<String> persistedMentionHandles = const [],
+  Iterable<String> persistedMentionPersonIds = const {},
+  Map<String, Person> peopleById = const {},
+}) {
+  return _receiverHandlesWithPersistedPeople(
+    baseHandles: talkingPointMentionHandleList(
+      summary: summary,
+      persistedMentionHandles: persistedMentionHandles,
+    ),
+    persistedMentionPersonIds: persistedMentionPersonIds,
+    peopleById: peopleById,
+  );
+}
+
+ListingReceiverParts buildListingReceiverParts({
+  required List<String> handlesInOrder,
+  String? primaryDisplayNameFallback,
+  int maxExtraReceivers = kListingMaxExtraReceivers,
+}) {
+  if (handlesInOrder.isEmpty) {
+    final name = (primaryDisplayNameFallback ?? '').trim();
+    if (name.isNotEmpty) {
+      return ListingReceiverParts(
+        primaryLabel: ledgerAtMentionLine(name),
+      );
+    }
+    return const ListingReceiverParts(primaryLabel: kLedgerAllMentionLabel);
+  }
+
+  String labelForHandle(String handle) => '@${handle.trim()}';
+
+  final primary = labelForHandle(handlesInOrder.first);
+  final rest = handlesInOrder.sublist(1);
+  final shown = rest.take(maxExtraReceivers).map(labelForHandle).toList();
+  final hasMore = rest.length > maxExtraReceivers;
+  return ListingReceiverParts(
+    primaryLabel: primary,
+    extraLabels: shown,
+    hasMoreExtras: hasMore,
+  );
+}
+
+String listingReceiverPartsPlainText(ListingReceiverParts parts) {
+  if (!parts.hasExtras) {
+    return ledgerAtMentionLine(parts.primaryLabel);
+  }
+  final buf = StringBuffer(ledgerAtMentionLine(parts.primaryLabel));
+  for (final extra in parts.extraLabels) {
+    buf.write(' ');
+    buf.write(ledgerAtMentionLine(extra));
+  }
+  if (parts.hasMoreExtras) {
+    buf.write(' …');
+  }
+  return buf.toString();
+}
+
 /// Expectation list/detail receivers: linked person, co-@mentions, or [@All].
 String expectationReceiverWhoLabel({
   required String summary,
@@ -135,14 +316,23 @@ String expectationReceiverWhoLabel({
   String? personHandle,
   String personId = '',
   Iterable<String> persistedMentionHandles = const [],
+  Iterable<String> persistedMentionPersonIds = const [],
+  Map<String, Person> peopleById = const {},
 }) {
-  final handles = expectationReceiverHandleList(
+  final handles = expectationListingReceiverHandles(
     summary: summary,
     primaryPersonHandle: personHandle,
     persistedMentionHandles: persistedMentionHandles,
+    persistedMentionPersonIds: persistedMentionPersonIds,
+    peopleById: peopleById,
   );
   if (handles.isNotEmpty) {
-    return handles.map((h) => '@$h').join(' ');
+    return listingReceiverPartsPlainText(
+      buildListingReceiverParts(
+        handlesInOrder: handles,
+        primaryDisplayNameFallback: personDisplayName,
+      ),
+    );
   }
   final name = (personDisplayName ?? '').trim();
   if (name.isNotEmpty) return name;
@@ -157,18 +347,19 @@ bool expectationAppliesToPerson({
   required String myPersonId,
   ExpectationMentionsIndex? mentionsIndex,
 }) {
-  if (e.personId.trim() == myPersonId) return true;
-  // Private prep talking points: @mentions are not receivers until published (echo).
-  if (e.type == ExpectationType.topic &&
-      e.visibility == ExpectationVisibility.shadow) {
+  // Shadow (private/draft): only the writer sees it in listings until published (echo).
+  if (e.visibility == ExpectationVisibility.shadow) {
     return false;
   }
+  if (e.personId.trim() == myPersonId) return true;
   final co = mentionsIndex?.personIdsByExpectationId[e.id];
   if (co != null && co.contains(myPersonId)) return true;
   return false;
 }
 
 /// Record @mentions from the **capture line** (before leading @ is stripped from summary).
+/// Stored for all talking points (private + published). Notifications stay off for
+/// shadow rows — enforced in DB triggers and activity-feed loaders.
 Future<void> syncTalkingPointMentions({
   required SupabaseClient client,
   required String companyId,
@@ -246,15 +437,14 @@ Future<void> syncExpectationCoReceiverMentions({
     }
   }
 
-  final coReceiverIds = <String>{};
-  for (var i = 1; i < resolved.length; i++) {
-    final p = resolved[i];
+  // All @receivers (including primary) get mention rows — activity + future add-receiver flows.
+  final receiverIds = <String>{};
+  for (final p in resolved) {
     if (p.id == authorPersonId) continue;
-    if (p.id == primary.id) continue;
-    coReceiverIds.add(p.id);
+    receiverIds.add(p.id);
   }
 
-  for (final personId in coReceiverIds) {
+  for (final personId in receiverIds) {
     try {
       await client.from('expectation_mentions').insert({
         'company_id': companyId,
@@ -412,6 +602,7 @@ Future<List<Expectation>> fetchExpectationsMentioningPerson({
       final type = _mentionDbInt(expMap['expectation_type']);
       final visibility = _mentionDbInt(expMap['expectation_visibility']);
       if (type == ExpectationType.topic.index) {
+        if (visibility == ExpectationVisibility.shadow.index) continue;
         if (visibility != ExpectationVisibility.echo.index) continue;
       } else if (type == ExpectationType.expectation.index) {
         if (visibility != ExpectationVisibility.echo.index) continue;
@@ -481,6 +672,7 @@ Future<List<ExpectationActivityFeedItem>> loadTalkingPointMentionActivityFeed({
       if (exp == null) continue;
       final type = _mentionDbInt(exp['expectation_type']);
       final visibility = _mentionDbInt(exp['expectation_visibility']);
+      if (visibility == ExpectationVisibility.shadow.index) continue;
       if (visibility != ExpectationVisibility.echo.index) continue;
       final e = byId[expId];
       if (e == null) continue;

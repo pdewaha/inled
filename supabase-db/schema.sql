@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS expectation_messages (
   expectation_id uuid NOT NULL REFERENCES expectations(id) ON DELETE CASCADE,
   sender_person_id uuid NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
   -- 0 = chat (plain text), 2 = chat with file attachment(s); non-zero otherwise = changelog / activity:
-  -- 1 = legacy plain text; 10–15 = structured JSON in message_text (see app expectation_changelog_payload.dart; 15 = update requested).
+  -- 1 = legacy plain text; 10–16 = structured JSON in message_text (see app expectation_changelog_payload.dart; 15 = update requested, 16 = receivers added).
   type smallint NOT NULL DEFAULT 0,
   message_text text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),

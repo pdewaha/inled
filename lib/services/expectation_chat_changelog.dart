@@ -18,6 +18,10 @@ const int kExpectationMessageTypeChangelogVisibility = 13;
 const int kExpectationMessageTypeChangelogPublished = 14;
 const int kExpectationMessageTypeChangelogUpdateRequested = 15;
 
+/// Structured: receivers added from detail view ([encodeChangelogPayloadReceiversAdded]).
+/// History-only: activity email trigger skips this type (migration 030).
+const int kExpectationMessageTypeChangelogReceiversAdded = 16;
+
 /// Backwards-compatible name for [kExpectationMessageTypeChangelogPlain].
 const int kExpectationMessageTypeChangelog = kExpectationMessageTypeChangelogPlain;
 

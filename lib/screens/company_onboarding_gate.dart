@@ -34,6 +34,7 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
   String? _error;
   Map<String, dynamic>? _matchedCompany;
   bool _saving = false;
+  bool _signingOut = false;
 
   @override
   void initState() {
@@ -157,6 +158,25 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
     }
   }
 
+  /// Clears Supabase session (local + remote refresh token) so [ExledApp] shows sign-in again.
+  Future<void> _signOutToAuthWelcome() async {
+    if (_signingOut || _saving) return;
+    setState(() {
+      _signingOut = true;
+      _error = null;
+    });
+    try {
+      await Supabase.instance.client.auth.signOut(scope: SignOutScope.global);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Could not sign out: $e';
+      });
+    } finally {
+      if (mounted) setState(() => _signingOut = false);
+    }
+  }
+
   Future<void> _createCompanyAndJoin() async {
     final user = Supabase.instance.client.auth.currentUser;
     if (user == null) return;
@@ -238,47 +258,14 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
     if (email.isEmpty) {
       throw Exception('Signed-in user has no email.');
     }
-    final localPart = email.split('@').first;
-    final defaultHandle =
-        localPart.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '').toLowerCase();
-    final displayName = localPart.isEmpty
-        ? email
-        : '${localPart[0].toUpperCase()}${localPart.substring(1)}';
 
-    final existing = await Supabase.instance.client
-        .from('people')
-        .select('id')
-        .eq('company_id', companyId)
-        .eq('email', email)
-        .limit(1);
-
-    if ((existing as List).isNotEmpty) {
-      final personId = existing.first['id'] as String;
-      final updatePayload = <String, dynamic>{
-        'auth_user_id': user.id,
-        'updated_at': DateTime.now().toUtc().toIso8601String(),
-      };
-      final cleanedTitle = title?.trim();
-      if (cleanedTitle != null && cleanedTitle.isNotEmpty) {
-        updatePayload['title'] = cleanedTitle;
-      }
-      await Supabase.instance.client
-          .from('people')
-          .update(updatePayload)
-          .eq('id', personId);
-      return;
-    }
-
-    await Supabase.instance.client.from('people').insert({
-      'company_id': companyId,
-      'email': email,
-      'display_name': displayName,
-      'handle': defaultHandle.isEmpty ? 'user' : defaultHandle,
-      'title': (title?.trim().isNotEmpty ?? false) ? title!.trim() : null,
-      'auth_user_id': user.id,
-      'role': 0,
-      'status': 1,
-    });
+    await Supabase.instance.client.rpc(
+      'inled_claim_person_for_domain_join',
+      params: {
+        'p_company_id': companyId,
+        'p_title': title,
+      },
+    );
   }
 
   @override
@@ -315,7 +302,9 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
                   _OnboardingState.needsJoin => _JoinPanel(
                       company: _matchedCompany,
                       onJoin: _joinMatchedCompany,
+                      onCancel: _signOutToAuthWelcome,
                       saving: _saving,
+                      signingOut: _signingOut,
                       error: _error,
                     ),
                   _OnboardingState.needsCreate => _CreatePanel(
@@ -323,12 +312,16 @@ class _CompanyOnboardingGateState extends State<CompanyOnboardingGate> {
                       companyNameController: _companyNameController,
                       titleController: _titleController,
                       onCreate: _createCompanyAndJoin,
+                      onCancel: _signOutToAuthWelcome,
                       saving: _saving,
+                      signingOut: _signingOut,
                       error: _error,
                     ),
                   _OnboardingState.error => _ErrorPanel(
                       error: _error ?? 'Unknown onboarding error.',
                       onRetry: _bootstrap,
+                      onCancel: _signOutToAuthWelcome,
+                      signingOut: _signingOut,
                     ),
                   _OnboardingState.ready => const SizedBox.shrink(),
                 },
@@ -361,13 +354,17 @@ class _JoinPanel extends StatelessWidget {
   const _JoinPanel({
     required this.company,
     required this.onJoin,
+    required this.onCancel,
     required this.saving,
+    required this.signingOut,
     required this.error,
   });
 
   final Map<String, dynamic>? company;
   final VoidCallback onJoin;
+  final Future<void> Function() onCancel;
   final bool saving;
+  final bool signingOut;
   final String? error;
 
   @override
@@ -375,6 +372,7 @@ class _JoinPanel extends StatelessWidget {
     final name = company?['name']?.toString() ?? 'your company';
     final domain = company?['domain']?.toString() ?? 'your domain';
     final errColor = Theme.of(context).colorScheme.error;
+    final busy = saving || signingOut;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -393,9 +391,33 @@ class _JoinPanel extends StatelessWidget {
           Text(error!, style: TextStyle(color: errColor)),
         ],
         const SizedBox(height: 16),
-        FilledButton(
-          onPressed: saving ? null : onJoin,
-          child: Text(saving ? 'Joining...' : 'Join workspace'),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        await onCancel();
+                      },
+                child: Text(signingOut ? 'Signing out…' : 'Cancel'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton(
+                onPressed: busy ? null : onJoin,
+                child: Text(saving ? 'Joining…' : 'Join workspace'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Cancel signs you out so you can use a different account.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
         ),
       ],
     );
@@ -408,7 +430,9 @@ class _CreatePanel extends StatelessWidget {
     required this.companyNameController,
     required this.titleController,
     required this.onCreate,
+    required this.onCancel,
     required this.saving,
+    required this.signingOut,
     required this.error,
   });
 
@@ -416,7 +440,9 @@ class _CreatePanel extends StatelessWidget {
   final TextEditingController companyNameController;
   final TextEditingController titleController;
   final VoidCallback onCreate;
+  final Future<void> Function() onCancel;
   final bool saving;
+  final bool signingOut;
   final String? error;
 
   @override
@@ -424,6 +450,7 @@ class _CreatePanel extends StatelessWidget {
     final errColor = Theme.of(context).colorScheme.error;
     final domain = domainController.text.trim();
     final suggestedName = companyNameFromEmailDomain(domain);
+    final busy = saving || signingOut;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -468,9 +495,33 @@ class _CreatePanel extends StatelessWidget {
           Text(error!, style: TextStyle(color: errColor)),
         ],
         const SizedBox(height: 16),
-        FilledButton(
-          onPressed: saving ? null : onCreate,
-          child: Text(saving ? 'Creating...' : 'Create workspace'),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        await onCancel();
+                      },
+                child: Text(signingOut ? 'Signing out…' : 'Cancel'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton(
+                onPressed: busy ? null : onCreate,
+                child: Text(saving ? 'Creating…' : 'Create workspace'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Cancel signs you out so you can use a different account.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
         ),
       ],
     );
@@ -481,10 +532,14 @@ class _ErrorPanel extends StatelessWidget {
   const _ErrorPanel({
     required this.error,
     required this.onRetry,
+    required this.onCancel,
+    required this.signingOut,
   });
 
   final String error;
   final VoidCallback onRetry;
+  final Future<void> Function() onCancel;
+  final bool signingOut;
 
   @override
   Widget build(BuildContext context) {
@@ -500,7 +555,34 @@ class _ErrorPanel extends StatelessWidget {
         const SizedBox(height: 10),
         Text(error, style: TextStyle(color: errColor)),
         const SizedBox(height: 16),
-        FilledButton(onPressed: onRetry, child: const Text('Retry')),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: signingOut
+                    ? null
+                    : () async {
+                        await onCancel();
+                      },
+                child: Text(signingOut ? 'Signing out…' : 'Cancel'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton(
+                onPressed: signingOut ? null : onRetry,
+                child: const Text('Retry'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Cancel signs you out so you can use a different account.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+        ),
       ],
     );
   }

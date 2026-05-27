@@ -226,6 +226,34 @@ class ExpectationChangelogMessageBody extends StatelessWidget {
             ],
           ),
         );
+      case 'receivers_added':
+        final raw = parsed['handles'];
+        final hs = <String>[];
+        if (raw is List) {
+          for (final e in raw) {
+            if (e is String && e.trim().isNotEmpty) hs.add(e.trim());
+          }
+        }
+        if (hs.isEmpty) {
+          return SelectableText(
+            'Added receiver(s).',
+            textAlign: textAlign,
+            style: base,
+          );
+        }
+        final spans = <InlineSpan>[
+          const TextSpan(text: 'Added '),
+        ];
+        for (var i = 0; i < hs.length; i++) {
+          if (i > 0) {
+            spans.add(TextSpan(text: ', ', style: base));
+          }
+          final t = hs[i].trim();
+          final at = t.startsWith('@') ? t : '@$t';
+          spans.add(TextSpan(text: at, style: accent));
+        }
+        spans.add(const TextSpan(text: '.'));
+        return _rich(TextSpan(style: base, children: spans));
       default:
         final fallback = expectationChangelogActivityFeedLine(
           messageType: messageType,

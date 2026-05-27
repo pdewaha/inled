@@ -33,6 +33,16 @@ import 'package:exled/widgets/responsive_centered_body.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+/// Thrown when an invite email is already linked to another person in the company.
+class _InviteEmailAlreadyInUse implements Exception {
+  const _InviteEmailAlreadyInUse(this.existing);
+
+  final Person existing;
+
+  String get userMessage =>
+      'User already exists as @${existing.handle.trim()} with that email.';
+}
+
 /// Single-column command thread with persistent pillar rail; Home uses Quick Capture
 /// in a sheet, other capture pillars keep an inline composer.
 class LedgerConsoleScreen extends StatefulWidget {
@@ -84,8 +94,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   /// Outbox: show published (echo) vs draft (shadow) expectations only.
   _OutboxListingTab _outboxListingTab = _OutboxListingTab.published;
 
-  /// Inbox: from other people vs self-authored (you as writer, you as receiver).
-  _InboxListingTab _inboxListingTab = _InboxListingTab.fromOthers;
+  /// Inbox: primary receiver vs co-receiver related items.
+  _InboxListingTab _inboxListingTab = _InboxListingTab.responsible;
 
   LedgerPillar _pillar = LedgerPillar.home;
   final List<FeedEntry> _homeRecent = [];
@@ -122,7 +132,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   bool _submitInFlight = false;
   bool _refreshInFlight = false;
   _ComposerEntryMode _composerMode = _composerDefaultMode;
-  /// Home only: after "Save as Talking Point" / "Save as Expectation", pick visibility inline.
+  /// Home only: after "Save as Expectation", pick draft vs send inline.
   _ComposerEntryMode? _homePendingEntry;
   _ExpectationPillarQuickChoice _expectationPillarQuickChoice =
       _ExpectationPillarQuickChoice.draft;
@@ -153,7 +163,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   String? _tagsSelectedTag;
   /// Public talking-points list: filter by @handle in summary (not [Expectation.personId]).
   String? _publicMentionFilterHandle;
-  _TalkingPointsSubView _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
+  // Talking points are private-only until the public lane ships.
+  static const bool _talkingPointPublicSaveEnabled = false;
+  _TalkingPointsSubView _talkingPointsSubView = _TalkingPointsSubView.colleagues;
   /// Private view: filter talking points that @mention this handle (author-only).
   String? _colleagueMentionFilterHandle;
   ExpectationStatus? _othersStatusFilter;
@@ -161,6 +173,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   String? _othersPersonFilter;
   ExpectationStatus? _inboxStatusFilter;
   String? _inboxTagFilter;
+  ExpectationStatus? _personalStatusFilter;
+  String? _personalTagFilter;
+  bool _personalOngoingCollapsed = false;
+  bool _personalFinishedCollapsed = false;
+  bool _personalArchiveCollapsed = true;
   /// @handles from [expectation_mentions] (includes leading @ stripped from summary).
   Map<String, List<String>> _mentionHandlesByExpectationId = {};
   Map<String, Set<String>> _mentionPersonIdsByExpectationId = {};
@@ -246,7 +263,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.tags;
-      _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
+      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
       _tagsSelectedTag = tag.trim().toLowerCase();
       _publicMentionFilterHandle = null;
       _colleagueMentionFilterHandle = null;
@@ -258,10 +275,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.tags;
-      _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
-      _publicMentionFilterHandle = handle.trim().toLowerCase();
+      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
+      _publicMentionFilterHandle = null;
       _tagsSelectedTag = null;
-      _colleagueMentionFilterHandle = null;
+      _colleagueMentionFilterHandle = handle.trim().toLowerCase();
     });
     _captureFocus.unfocus();
   }
@@ -270,6 +287,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   void _openPrivateMentionColleagues(String handle) {
     final needle = handle.trim().toLowerCase();
     if (needle.isEmpty) return;
+    final expandArchive = _notepadFilterMatchesOnlyInArchive(
+      mentionFilterHandle: needle,
+    );
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.tags;
@@ -277,6 +297,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       _colleagueMentionFilterHandle = needle;
       _tagsSelectedTag = null;
       _publicMentionFilterHandle = null;
+      if (expandArchive) _colleagueArchiveCollapsed = false;
     });
     _captureFocus.unfocus();
   }
@@ -392,6 +413,44 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (_summaryMentionsHandle(e.summary, handleLower)) return true;
     return _persistedMentionHandles(e)
         .any((h) => h.toLowerCase() == handleLower);
+  }
+
+  /// Sidebar #/@ filters: expand Archive when matches exist only there.
+  bool _notepadFilterMatchesOnlyInArchive({
+    String? mentionFilterHandle,
+    String? tagFilterStored,
+  }) {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return false;
+    final mentionFilter = mentionFilterHandle?.trim().toLowerCase();
+    final tagNeedle = _tagFilterNeedle(tagFilterStored);
+    var pool = _expectations.where(
+      (x) =>
+          x.type == ExpectationType.topic &&
+          x.writerUserId == uid &&
+          x.visibility == ExpectationVisibility.shadow,
+    );
+    if (mentionFilter != null && mentionFilter.isNotEmpty) {
+      pool = pool.where((x) => _talkingPointMentionsHandle(x, mentionFilter));
+    }
+    if (tagNeedle != null) {
+      pool = pool.where(
+        (x) => _extractInlineTags(x.summary)
+            .map((t) => t.toLowerCase())
+            .contains(tagNeedle),
+      );
+    }
+    var active = 0;
+    var archive = 0;
+    for (final x in pool) {
+      if (x.status == ExpectationStatus.finished ||
+          x.status == ExpectationStatus.abandoned) {
+        archive++;
+      } else {
+        active++;
+      }
+    }
+    return active == 0 && archive > 0;
   }
 
   /// Outbox only: filter the current list by #tag without leaving the pillar.
@@ -517,28 +576,47 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return out;
   }
 
+  void _applyNotepadMixedFilter(String? key) {
+    if (key == null) {
+      _tagsSelectedTag = null;
+      _colleagueMentionFilterHandle = null;
+      return;
+    }
+    if (key.startsWith(_kNotepadFilterMentionPrefix)) {
+      _colleagueMentionFilterHandle =
+          key.substring(_kNotepadFilterMentionPrefix.length);
+      _tagsSelectedTag = null;
+    } else if (key.startsWith(_kNotepadFilterTagPrefix)) {
+      _tagsSelectedTag = key.substring(_kNotepadFilterTagPrefix.length);
+      _colleagueMentionFilterHandle = null;
+    }
+  }
+
   void _onPrivateRailTagSelect(String tag) {
+    final tagStored = tag.trim().toLowerCase();
+    final expandArchive = _notepadFilterMatchesOnlyInArchive(
+      tagFilterStored: tagStored,
+    );
     setState(() {
       _pillar = LedgerPillar.tags;
       _talkingPointsSubView = _TalkingPointsSubView.colleagues;
-      _tagsSelectedTag = tag.trim().toLowerCase();
+      _tagsSelectedTag = tagStored;
       _publicMentionFilterHandle = null;
       _colleagueMentionFilterHandle = null;
+      if (expandArchive) _colleagueArchiveCollapsed = false;
     });
+    _captureFocus.unfocus();
   }
 
   void _openTalkingPointsSubView(_TalkingPointsSubView view) {
     setState(() {
       _homePendingEntry = null;
       _pillar = LedgerPillar.tags;
-      _talkingPointsSubView = view;
-      if (view == _TalkingPointsSubView.colleagues) {
-        _tagsSelectedTag = null;
-        _publicMentionFilterHandle = null;
-      } else {
-        _colleagueMentionFilterHandle = null;
-        _publicMentionFilterHandle = null;
-      }
+      // Force private-only browse for now. Public lane will be added later.
+      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
+      _tagsSelectedTag = null;
+      _publicMentionFilterHandle = null;
+      _colleagueMentionFilterHandle = null;
     });
     _captureFocus.unfocus();
   }
@@ -563,14 +641,59 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     setState(() => _inboxListingTab = selection.first);
   }
 
-  bool _inboxTabMatchesWriter(Expectation x, String? currentUserId) {
-    if (currentUserId == null) {
-      return _inboxListingTab == _InboxListingTab.fromOthers;
-    }
-    final selfAuthored = x.writerUserId == currentUserId;
-    return _inboxListingTab == _InboxListingTab.personal
-        ? selfAuthored
-        : !selfAuthored;
+  bool _isUltimateExpectationReceiver(Expectation e, String myPersonId) {
+    return e.personId.trim() == myPersonId;
+  }
+
+  /// Co-@receiver (in [expectation_mentions]), not [Expectation.personId].
+  bool _isExpectationCoReceiverOnly(Expectation e, String myPersonId) {
+    if (_isUltimateExpectationReceiver(e, myPersonId)) return false;
+    final co = _mentionPersonIdsByExpectationId[e.id];
+    if (co != null && co.contains(myPersonId)) return true;
+    return expectationAppliesToPerson(
+      e: e,
+      myPersonId: myPersonId,
+      mentionsIndex: ExpectationMentionsIndex(
+        handlesByExpectationId: _mentionHandlesByExpectationId,
+        personIdsByExpectationId: _mentionPersonIdsByExpectationId,
+      ),
+    );
+  }
+
+  List<Expectation> _inboxExpectationsForTab({
+    required List<Expectation> expectations,
+    required String myPersonId,
+    required String? currentUserId,
+  }) {
+    return expectations.where((x) {
+      if (x.type != ExpectationType.expectation) return false;
+      switch (_inboxListingTab) {
+        case _InboxListingTab.responsible:
+          if (currentUserId != null && x.writerUserId == currentUserId) {
+            return false;
+          }
+          return _isUltimateExpectationReceiver(x, myPersonId);
+        case _InboxListingTab.related:
+          if (currentUserId != null && x.writerUserId == currentUserId) {
+            return false;
+          }
+          return _isExpectationCoReceiverOnly(x, myPersonId);
+      }
+    }).toList();
+  }
+
+  List<Expectation> _personalAuthoredExpectations({
+    required List<Expectation> expectations,
+    required String? currentUserId,
+  }) {
+    if (currentUserId == null) return const [];
+    return expectations
+        .where(
+          (x) =>
+              x.type == ExpectationType.expectation &&
+              x.writerUserId == currentUserId,
+        )
+        .toList();
   }
 
   Future<void> _deleteExpectationFromList(Expectation expectation) async {
@@ -598,6 +721,67 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         context,
       ).showSnackBar(const SnackBar(content: Text('Failed to delete expectation.')));
     }
+  }
+
+  /// After draft → echo: re-sync @receivers so mention notification triggers fire.
+  Future<void> _syncExpectationMentionsAfterPublish(Expectation expectation) async {
+    if (expectation.type != ExpectationType.expectation) return;
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) return;
+
+    final meRows = await client
+        .from('people')
+        .select('id,company_id,display_name,handle')
+        .eq('auth_user_id', user.id)
+        .limit(1);
+    if ((meRows as List).isEmpty) return;
+    final me = meRows.first as Map;
+    final companyId = me['company_id'] as String;
+    final mePersonId = me['id'] as String;
+
+    final parts = <String>[];
+    final seen = <String>{};
+    void addHandle(String? raw) {
+      var t = (raw ?? '').trim();
+      if (t.startsWith('@')) t = t.substring(1);
+      if (t.isEmpty) return;
+      if (!seen.add(t.toLowerCase())) return;
+      parts.add('@$t');
+    }
+    for (final p in _people) {
+      if (p.id == expectation.personId) addHandle(p.handle);
+    }
+    for (final h in _mentionHandlesByExpectationId[expectation.id] ?? const <String>[]) {
+      addHandle(h);
+    }
+    final mentionLine = parts.isEmpty
+        ? expectation.summary
+        : '${parts.join(' ')} ${expectation.summary}';
+
+    try {
+      await syncExpectationCoReceiverMentions(
+        client: client,
+        companyId: companyId,
+        expectationId: expectation.id,
+        mentionSourceText: mentionLine,
+        authorPersonId: mePersonId,
+        people: _people,
+        resolveMe: (_) async {
+          return Person(
+            id: mePersonId,
+            createdAt: DateTime.now().toUtc(),
+            displayName: (me['display_name'] as String?) ?? '',
+            handle: (me['handle'] as String?) ?? 'me',
+            authUserId: user.id,
+          );
+        },
+        createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
+        replaceExisting: true,
+      );
+    } on PostgrestException {
+      // Mentions table / policy not deployed.
+    } catch (_) {}
   }
 
   /// Outbox draft ? published (visible to receiver): echo visibility + published_at.
@@ -649,19 +833,32 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           _outboxListingTab = _OutboxListingTab.published;
         }
       });
+      if (expectation.type == ExpectationType.expectation) {
+        await _syncExpectationMentionsAfterPublish(expectation);
+      }
+      final client = Supabase.instance.client;
+      final ctx = await fetchExpectationChangelogActorContext(client);
+      if (ctx != null) {
+        final isTopic = expectation.type == ExpectationType.topic;
+        await insertExpectationAppMessage(
+          client: client,
+          companyId: ctx.companyId,
+          expectationId: expectation.id,
+          senderPersonId: ctx.personId,
+          messageText: encodeChangelogPayloadPublished(isTopic: isTopic),
+          type: kExpectationMessageTypeChangelogPublished,
+        );
+        await touchExpectationChatActivityForAuthUser(
+          client: client,
+          expectationId: expectation.id,
+          expectationWriterUserId: expectation.writerUserId,
+        );
+      }
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Published — now visible to your receiver.')),
       );
-      await appendExpectationChangelogForSignedInUser(
-        client: Supabase.instance.client,
-        expectationId: expectation.id,
-        expectationWriterUserId: expectation.writerUserId,
-        messageBuilder: (_) {
-          final noun =
-              expectation.type == ExpectationType.topic ? 'talking point' : 'expectation';
-          return 'Published this $noun.';
-        },
-      );
+      unawaited(_loadExpectationsFromSupabase());
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -721,6 +918,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     setState(() {
       if (_pillar == LedgerPillar.expectationsMe) {
         _meArchiveCollapsed = false;
+      } else if (_pillar == LedgerPillar.expectationsPersonal) {
+        _personalArchiveCollapsed = false;
       }
     });
     ScaffoldMessenger.of(context).showSnackBar(
@@ -1428,11 +1627,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final t = _captureController.text;
     switch (_pillar) {
       case LedgerPillar.home:
-        if (_homePendingEntry == _ComposerEntryMode.topic) {
-          final priv = _talkingPointPrivateSubmittable(t) && !busy;
-          final pub = _talkingPointPublicSubmittable(t) && !busy;
-          return (priv, pub);
-        }
         if (_homePendingEntry == _ComposerEntryMode.expectation) {
           final e = _expectationCaptureTextIsSubmittable(t) && !busy;
           return (e, e);
@@ -1444,7 +1638,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       case LedgerPillar.addTopic:
         return (
           _talkingPointPrivateSubmittable(t) && !busy,
-          _talkingPointPublicSubmittable(t) && !busy,
+          _talkingPointPublicSaveEnabled &&
+              _talkingPointPublicSubmittable(t) &&
+              !busy,
         );
       case LedgerPillar.addExpectation:
         final e = _expectationCaptureTextIsSubmittable(t) && !busy;
@@ -1556,6 +1752,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         if (mode == null) return true;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
+          if (mode == _ComposerEntryMode.topic) {
+            setState(() => _composerMode = _ComposerEntryMode.topic);
+            unawaited(
+              _submitCapture(
+                forcedTalkingPointVisibility: ExpectationVisibility.shadow,
+              ),
+            );
+            return;
+          }
           setState(() {
             _composerMode = mode;
             _homePendingEntry = mode;
@@ -2043,58 +2248,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   ],
                 );
               }
-              if (homePending == _ComposerEntryMode.topic) {
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    ExcludeFocus(
-                      child: IconButton(
-                        tooltip: 'Choose capture type again',
-                        onPressed: busy
-                            ? null
-                            : () {
-                                setState(() {
-                                  _homePendingEntry = null;
-                                  _composerMode = _composerDefaultMode;
-                                });
-                                _homeComposerUiRevision.value++;
-                              },
-                        icon: const Icon(Icons.arrow_back_rounded),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Expanded(
-                      child: _PairedSaveAction(
-                        focusNode: _homeVisSaveFocusA,
-                        enabled: enA,
-                        autofocus: true,
-                        onPressed: () => unawaited(
-                          _submitCapture(
-                            forcedTalkingPointVisibility:
-                                ExpectationVisibility.shadow,
-                          ),
-                        ),
-                        label: 'Save privately',
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _PairedSaveAction(
-                        focusNode: _homeVisSaveFocusB,
-                        enabled: enB,
-                        onPressed: () => unawaited(
-                          _submitCapture(
-                            forcedTalkingPointVisibility:
-                                ExpectationVisibility.echo,
-                          ),
-                        ),
-                        label: 'Save publicly',
-                      ),
-                    ),
-                  ],
-                );
-              }
               return Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -2284,12 +2437,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       return 'Example: @Alex please review the budget #finance — add +7d at the end for a due date.';
     }
     if (_pillar == LedgerPillar.addTopic) {
-      return 'Example: #weeklymeeting notes @Sam @Alex — or @Sam only for a private note.';
+      return 'Example: #weeklymeeting notes @Sam — or @Sam only for a private note.';
     }
     if (_pillar == LedgerPillar.home) {
-      if (_homePendingEntry == _ComposerEntryMode.topic) {
-        return 'Choose Save privately or Save publicly (back arrow to re-pick type).';
-      }
       if (_homePendingEntry == _ComposerEntryMode.expectation) {
         return 'Choose Save as Draft or Send immediately (back arrow to re-pick type).';
       }
@@ -2405,12 +2555,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   }
 
   void _submitHomeAsTalkingPoint() {
-    setState(() {
-      _composerMode = _ComposerEntryMode.topic;
-      _homePendingEntry = _ComposerEntryMode.topic;
-    });
-    _homeComposerUiRevision.value++;
-    _scheduleFocusFirstHomeVisibilitySaveButton();
+    if (_submitInFlight) return;
+    final text = _captureController.text;
+    if (!_talkingPointPrivateSubmittable(text)) return;
+    setState(() => _composerMode = _ComposerEntryMode.topic);
+    unawaited(
+      _submitCapture(
+        forcedTalkingPointVisibility: ExpectationVisibility.shadow,
+      ),
+    );
   }
 
   void _submitHomeAsExpectation() {
@@ -2422,10 +2575,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     _scheduleFocusFirstHomeVisibilitySaveButton();
   }
 
-  /// Focus the left home visibility action ([_homeVisSaveFocusA]) after the row is shown.
+  /// Focus draft/send after choosing Save as Expectation on Home.
   void _scheduleFocusFirstHomeVisibilitySaveButton() {
     final pending = _homePendingEntry;
-    if (pending == null) return;
+    if (pending != _ComposerEntryMode.expectation) return;
     void applyLeftFocus() {
       if (!mounted) return;
       if (_homePendingEntry != pending) return;
@@ -2495,10 +2648,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   /// Talking point can be saved **publicly**: needs at least one # ( @mentions stay in the text only).
   bool _talkingPointPublicSubmittable(String text) {
-    final t = text.trim();
-    if (t.isEmpty) return false;
-    if (!_hashTagRegex.hasMatch(t)) return false;
-    return _hasContentWord(t);
+    // Public talking points will be re-enabled in a later version.
+    return false;
   }
 
   /// True when the line has an @mention.
@@ -2604,7 +2755,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               _hasContentWord(text);
       if (!colleagueShadowOk) {
         _showComposerToast(
-          'Talking points need at least one #hashtag to publish publicly, or @person for a private colleague note.',
+          'Talking points need at least one #hashtag or @person in the line.',
         );
         return;
       }
@@ -2732,6 +2883,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     } else if (forcedExpectationVisibility != null &&
         entryType == ExpectationType.expectation) {
       visibility = forcedExpectationVisibility;
+    } else if (entryType == ExpectationType.topic &&
+        !_talkingPointPublicSaveEnabled) {
+      visibility = ExpectationVisibility.shadow;
     } else {
       final askSubmitDialog = entryType == ExpectationType.expectation ||
           shouldAskSubmitMode;
@@ -3233,6 +3387,74 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return result;
   }
 
+  bool _isPeopleCompanyEmailUniqueViolation(PostgrestException e) {
+    if (e.code != '23505') return false;
+    return e.message.contains('uq_people_company_email');
+  }
+
+  String _inviteFlowErrorMessage(Object e) {
+    if (e is _InviteEmailAlreadyInUse) return e.userMessage;
+    if (e is PostgrestException && _isPeopleCompanyEmailUniqueViolation(e)) {
+      return 'That email is already used by someone in your company.';
+    }
+    return 'Failed to create invite. Please try again.';
+  }
+
+  Person? _personWithCompanyEmailInMemory({
+    required String email,
+    String? exceptPersonId,
+  }) {
+    final normalized = email.trim().toLowerCase();
+    if (normalized.isEmpty) return null;
+    for (final p in _people) {
+      if (exceptPersonId != null && p.id == exceptPersonId) continue;
+      if ((p.email ?? '').trim().toLowerCase() == normalized) return p;
+    }
+    return null;
+  }
+
+  Future<Person?> _findPersonWithCompanyEmail({
+    required String companyId,
+    required String email,
+    String? exceptPersonId,
+  }) async {
+    final inMemory = _personWithCompanyEmailInMemory(
+      email: email,
+      exceptPersonId: exceptPersonId,
+    );
+    if (inMemory != null) return inMemory;
+
+    final normalized = email.trim().toLowerCase();
+    if (normalized.isEmpty) return null;
+
+    final rows = await Supabase.instance.client
+        .from('people')
+        .select('id,created_at,display_name,handle,auth_user_id,email,title')
+        .eq('company_id', companyId)
+        .ilike('email', email.trim())
+        .limit(10);
+    for (final raw in rows as List) {
+      final r = raw as Map;
+      final id = r['id'] as String;
+      if (exceptPersonId != null && id == exceptPersonId) continue;
+      final rowEmail = ((r['email'] as String?) ?? '').trim().toLowerCase();
+      if (rowEmail != normalized) continue;
+      return Person(
+        id: id,
+        createdAt: DateTime.tryParse(r['created_at'] as String? ?? '') ??
+            DateTime.now().toUtc(),
+        displayName: (r['display_name'] as String?)?.trim().isNotEmpty == true
+            ? (r['display_name'] as String).trim()
+            : ((r['handle'] as String?) ?? '').trim(),
+        handle: ((r['handle'] as String?) ?? '').trim(),
+        authUserId: (r['auth_user_id'] as String?)?.trim(),
+        email: (r['email'] as String?)?.trim(),
+        title: (r['title'] as String?)?.trim(),
+      );
+    }
+    return null;
+  }
+
   Future<String> _inviteCompanyIdForCurrentUser() async {
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
@@ -3261,7 +3483,26 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       throw Exception('No authenticated user.');
     }
     if (person != null) {
-      await client.from('people').update({'email': email}).eq('id', person.id);
+      final emailOwner = await _findPersonWithCompanyEmail(
+        companyId: companyId,
+        email: email,
+        exceptPersonId: person.id,
+      );
+      if (emailOwner != null) {
+        throw _InviteEmailAlreadyInUse(emailOwner);
+      }
+      try {
+        await client.from('people').update({'email': email}).eq('id', person.id);
+      } on PostgrestException catch (e) {
+        if (!_isPeopleCompanyEmailUniqueViolation(e)) rethrow;
+        final owner = await _findPersonWithCompanyEmail(
+          companyId: companyId,
+          email: email,
+          exceptPersonId: person.id,
+        );
+        if (owner != null) throw _InviteEmailAlreadyInUse(owner);
+        rethrow;
+      }
     }
     final expiresAt =
         DateTime.now().toUtc().add(const Duration(days: 14)).toIso8601String();
@@ -3327,7 +3568,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to create invite: $e')),
+        SnackBar(content: Text(_inviteFlowErrorMessage(e))),
       );
     }
   }
@@ -3396,7 +3637,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to create invite: $e')),
+        SnackBar(content: Text(_inviteFlowErrorMessage(e))),
       );
     }
   }
@@ -3511,8 +3752,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     final targetPersonId = (target != null && _uuidRegex.hasMatch(target.id))
         ? target.id
         : null;
-    final isPublicTalkingPoint = type == ExpectationType.topic &&
-        visibility == ExpectationVisibility.echo;
     final title = text.length > 80 ? '${text.substring(0, 80)}...' : text;
 
     final labelTrimmed = deadlineLabel.trim();
@@ -3579,9 +3818,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       }
     }
     final mentionLine = (mentionSourceText ?? text).trim();
-    // Sync @mentions before changelog so activity-email triggers see recipients.
-    // Talking points never set target_person_id; recipients come from expectation_mentions only.
-    // Shadow + echo: summary strips leading @, so rows must be persisted for every save.
+    // @mentions persisted for listing UI; shadow rows do not notify (server-side).
     if (type == ExpectationType.topic) {
       await syncTalkingPointMentions(
         client: client,
@@ -3602,7 +3839,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         createPlaceholder: (handle) => _createPersonFromHandleInSupabase(handle),
         replaceExisting: true,
       );
-    } else {
+    } else if (type != ExpectationType.topic) {
       await syncExpectationCoReceiverMentions(
         client: client,
         companyId: companyId,
@@ -3693,6 +3930,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         case LedgerPillar.home:
         case LedgerPillar.addExpectation:
         case LedgerPillar.addTopic:
+        case LedgerPillar.expectationsPersonal:
         case LedgerPillar.expectationsMe:
         case LedgerPillar.expectationsOthers:
           // Expectations views depend on both people + expectations + recent tags.
@@ -3967,17 +4205,26 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         return StatefulBuilder(
           builder: (context, setLocalState) {
             void confirmSelection() {
+              if (talkingPoint && !_talkingPointPublicSaveEnabled) {
+                Navigator.of(context).pop(_ExpectationSubmitMode.draft);
+                return;
+              }
               Navigator.of(context).pop(
-                selectedIndex == 0
+                talkingPoint
                     ? _ExpectationSubmitMode.draft
-                    : _ExpectationSubmitMode.inform,
+                    : selectedIndex == 0
+                        ? _ExpectationSubmitMode.draft
+                        : _ExpectationSubmitMode.inform,
               );
             }
 
-            final primaryLabel =
-                talkingPoint ? 'Keep private' : 'Save as Draft';
+            final primaryLabel = talkingPoint
+                ? (_talkingPointPublicSaveEnabled ? 'Keep private' : 'Save')
+                : 'Save as Draft';
             final secondaryLabel =
-                talkingPoint ? 'Publish' : 'Send immediately';
+                talkingPoint ? 'Public (later)' : 'Send immediately';
+            final showSecondary =
+                !talkingPoint || _talkingPointPublicSaveEnabled;
 
             return Focus(
               autofocus: true,
@@ -3987,7 +4234,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 if (event is! KeyDownEvent) {
                   return KeyEventResult.ignored;
                 }
-                if (event.logicalKey == LogicalKeyboardKey.tab) {
+                if (event.logicalKey == LogicalKeyboardKey.tab && showSecondary) {
                   final shiftDown = HardwareKeyboard.instance.logicalKeysPressed
                           .contains(LogicalKeyboardKey.shiftLeft) ||
                       HardwareKeyboard.instance.logicalKeysPressed
@@ -4013,8 +4260,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 ),
                 content: Text(
                   talkingPoint
-                      ? 'Keep this private while you refine it, or publish so it '
-                          'appears under Public for others.'
+                      ? 'Keep this private while you refine it.'
                       : 'Save as a draft to keep refining it yourself, or send '
                           'immediately so others can see it.',
                 ),
@@ -4053,24 +4299,30 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                                           child: Text(primaryLabel),
                                         ),
                                 ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: selectedIndex == 1
-                                      ? FilledButton(
-                                          onPressed: () =>
-                                              Navigator.of(context).pop(
-                                            _ExpectationSubmitMode.inform,
+                                if (showSecondary) ...[
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: selectedIndex == 1
+                                        ? FilledButton(
+                                            onPressed: talkingPoint
+                                                ? null
+                                                : () => Navigator.of(context)
+                                                    .pop(
+                                                  _ExpectationSubmitMode.inform,
+                                                ),
+                                            child: Text(secondaryLabel),
+                                          )
+                                        : FilledButton.tonal(
+                                            onPressed: talkingPoint
+                                                ? null
+                                                : () => Navigator.of(context)
+                                                    .pop(
+                                                  _ExpectationSubmitMode.inform,
+                                                ),
+                                            child: Text(secondaryLabel),
                                           ),
-                                          child: Text(secondaryLabel),
-                                        )
-                                      : FilledButton.tonal(
-                                          onPressed: () =>
-                                              Navigator.of(context).pop(
-                                            _ExpectationSubmitMode.inform,
-                                          ),
-                                          child: Text(secondaryLabel),
-                                        ),
-                                ),
+                                  ),
+                                ],
                               ],
                             ),
                           ),
@@ -4198,6 +4450,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         authUserId: uid,
         readerPersonId: me,
         partyExpectations: party,
+        bellClearedExpectationIds: _changelogBellClearedIds,
       );
       if (!mounted) return;
       setState(() {
@@ -4271,11 +4524,22 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
       setState(() {
         _changelogBellClearedIds.add(expectationId);
         _expectationIdsWithChangelogUnread.remove(expectationId);
+        if (_activityUnreadCount > 0) {
+          _activityUnreadCount -= 1;
+        }
       });
-    }
-    _activityFeedOverlayEntry?.markNeedsBuild();
-    if (mounted) {
-      _scheduleChangelogUnreadSnapshotRefresh();
+      _activityFeedOverlayEntry?.markNeedsBuild();
+      if (mounted) {
+        unawaited(_refreshActivityUnreadCount());
+      }
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not save read state — apply migration 002 (expectation_changelog_reads) in Supabase.',
+          ),
+        ),
+      );
     }
     return synced;
   }
@@ -4574,6 +4838,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               coReceiverPersonIds:
                   _mentionPersonIdsByExpectationId[e.id] ?? const {},
               receiverPeople: _receiverPeopleForExpectation(e),
+              mentionAutocompletePeople: _people,
+              onCreatePlaceholderPerson: _createPersonFromHandleInSupabase,
               canEdit: _canEditExpectationForUser(
                 e,
                 uid,
@@ -4713,10 +4979,11 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               child: _PillarRail(
                 expanded: _railExpanded,
                 selected: _pillar,
-                recentTags: _mergedPublicRailTags(),
+                // Private speaking points only (no public echo chips yet).
+                recentTags: const [],
                 recentTagsHasMore: _recentTagsHasMore,
-                publicRailMentions: _publicRailMentionHandlesFromExpectations(),
-                onPublicRailMention: _openPublicMentionPillar,
+                publicRailMentions: const [],
+                onPublicRailMention: (_) {},
                 privateRailTags: _privateRailTagsFromExpectations(),
                 onPrivateRailTag: _onPrivateRailTagSelect,
                 privateRailMentions: _privateRailMentionHandlesFromExpectations(),
@@ -4745,7 +5012,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     _homePendingEntry = null;
                     _pillar = p;
                     if (p == LedgerPillar.tags) {
-                      _talkingPointsSubView = _TalkingPointsSubView.meetingsOrTags;
+                      _talkingPointsSubView = _TalkingPointsSubView.colleagues;
                       _colleagueMentionFilterHandle = null;
                     }
                     if (p == LedgerPillar.addExpectation) {
@@ -4789,7 +5056,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                         Padding(
                           padding: EdgeInsets.symmetric(
                             horizontal:
-                                (_pillar == LedgerPillar.expectationsMe ||
+                                (_pillar == LedgerPillar.expectationsPersonal ||
+                                        _pillar == LedgerPillar.expectationsMe ||
                                         _pillar ==
                                             LedgerPillar.expectationsOthers)
                                     ? 24
@@ -4823,11 +5091,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                               final value = _captureController.value;
                               final personalOk =
                                   _talkingPointPrivateSubmittable(value.text);
-                              final publicOk =
-                                  _talkingPointPublicSubmittable(value.text);
                               final busy = _submitInFlight;
                               final personalEnabled = personalOk && !busy;
-                              final publicEnabled = publicOk && !busy;
+                              final publicEnabled =
+                                  _talkingPointPublicSaveEnabled &&
+                                      _talkingPointPublicSubmittable(
+                                        value.text,
+                                      ) &&
+                                      !busy;
                               final fieldFocused = _captureFocus.hasFocus;
                               return Row(
                                 children: [
@@ -4841,21 +5112,23 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                                         forcedTalkingPointVisibility:
                                             ExpectationVisibility.shadow,
                                       ),
-                                      label: 'Save privately',
+                                      label: 'Save',
                                     ),
                                   ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: _PairedSaveAction(
-                                      focusNode: _composerSavePairFocusB,
-                                      enabled: publicEnabled,
-                                      onPressed: () => _submitCapture(
-                                        forcedTalkingPointVisibility:
-                                            ExpectationVisibility.echo,
+                                  if (_talkingPointPublicSaveEnabled) ...[
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: _PairedSaveAction(
+                                        focusNode: _composerSavePairFocusB,
+                                        enabled: publicEnabled,
+                                        onPressed: () => _submitCapture(
+                                          forcedTalkingPointVisibility:
+                                              ExpectationVisibility.echo,
+                                        ),
+                                        label: 'Public (later)',
                                       ),
-                                      label: 'Save publicly',
                                     ),
-                                  ),
+                                  ],
                                 ],
                               );
                             },
@@ -4958,7 +5231,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                             controller: _scrollController,
                             padding: _pillar == LedgerPillar.home
                                 ? const EdgeInsets.fromLTRB(28, 24, 28, 52)
-                                : (_pillar == LedgerPillar.expectationsMe ||
+                                : (_pillar == LedgerPillar.expectationsPersonal ||
+                                        _pillar == LedgerPillar.expectationsMe ||
                                         _pillar ==
                                             LedgerPillar.expectationsOthers)
                                     ? const EdgeInsets.fromLTRB(24, 8, 24, 32)
@@ -5066,10 +5340,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               (x) =>
                   x.type == wantType &&
                   currentUserId != null &&
-                  x.writerUserId == currentUserId,
+                  x.writerUserId == currentUserId &&
+                  (wantType != ExpectationType.topic ||
+                      (x.status != ExpectationStatus.finished &&
+                          x.status != ExpectationStatus.abandoned)),
             )
             .toList()
           ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        final topicCaptureListing = wantType == ExpectationType.topic;
         for (final x in authored) {
           out.add(
             _ExpectationOthersTile(
@@ -5081,11 +5359,18 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               onTagPressed: _openTagPillar,
               onDelete: () => _deleteExpectationFromList(x),
               onOpenDetails: () => onOpenExpectationDetails(x, peopleById[x.personId]),
-              composerRecentListing: true,
+              composerRecentListing: !topicCaptureListing,
+              talkingPointsBrowseListing: topicCaptureListing,
               talkingPointPersistedMentions: _persistedMentionHandles(x),
               peopleById: peopleById,
               coReceiverPersonIds:
                   _mentionPersonIdsByExpectationId[x.id] ?? const {},
+              onArchiveTalkingPoint: topicCaptureListing
+                  ? _archiveTalkingPointBrowse
+                  : null,
+              onPublishTalkingPoint: topicCaptureListing
+                  ? _publishTalkingPointBrowse
+                  : null,
             ),
           );
         }
@@ -5189,10 +5474,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             .toList()
           ..sort();
         final privateTagNeedle = _tagFilterNeedle(_tagsSelectedTag);
-        final privateTagDropdownValue =
-            _tagFilterDropdownValue(_tagsSelectedTag, availablePrivateTags);
-        final privateTagDropdownItems =
-            _tagFilterDropdownItems(availablePrivateTags, _tagsSelectedTag);
 
         if (_talkingPointsSubView == _TalkingPointsSubView.meetingsOrTags) {
           out.add(
@@ -5230,7 +5511,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
 
         if (_talkingPointsSubView == _TalkingPointsSubView.colleagues) {
-          if (availablePrivateTags.isNotEmpty) {
+          final availablePrivateMentions =
+              _privateRailMentionHandlesFromExpectations(max: 100);
+          final notepadFilterItems = _notepadMixedFilterDropdownItems(
+            tags: availablePrivateTags,
+            mentions: availablePrivateMentions,
+            tagStored: _tagsSelectedTag,
+            mentionStored: _colleagueMentionFilterHandle,
+          );
+          final notepadFilterValue = _selectedNotepadMixedFilterKey(
+            tagStored: _tagsSelectedTag,
+            mentionStored: _colleagueMentionFilterHandle,
+          );
+          if (notepadFilterItems.isNotEmpty) {
             out.add(
               Padding(
                 padding: _listingToolbarPadding,
@@ -5243,18 +5536,33 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                       showTag: true,
                       showPerson: false,
                       selectedStatus: null,
-                      selectedTag: privateTagDropdownValue,
+                      selectedTag: notepadFilterValue,
                       selectedPersonId: null,
-                      tags: privateTagDropdownItems,
+                      tags: notepadFilterItems,
                       people: const [],
                       tagFieldWidth: 240,
+                      tagDropdownLabel: 'Filter',
+                      tagDropdownAllLabel: 'All',
+                      tagDropdownItemLabel: _notepadMixedFilterDisplayLabel,
                       onStatusChanged: (_) {},
                       onTagChanged: (v) {
+                        final expandArchive = _notepadFilterMatchesOnlyInArchive(
+                          tagFilterStored: v != null &&
+                                  v.startsWith(_kNotepadFilterTagPrefix)
+                              ? v.substring(_kNotepadFilterTagPrefix.length)
+                              : null,
+                          mentionFilterHandle: v != null &&
+                                  v.startsWith(_kNotepadFilterMentionPrefix)
+                              ? v.substring(_kNotepadFilterMentionPrefix.length)
+                              : null,
+                        );
                         setState(() {
-                          _tagsSelectedTag = v;
-                          _colleagueMentionFilterHandle = null;
+                          _applyNotepadMixedFilter(v);
                           _talkingPointsSubView =
                               _TalkingPointsSubView.colleagues;
+                          if (expandArchive) {
+                            _colleagueArchiveCollapsed = false;
+                          }
                         });
                       },
                       onPersonChanged: (_) {},
@@ -5265,6 +5573,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             );
           }
             final mentionFilter = _colleagueMentionFilterHandle?.trim().toLowerCase();
+            final notepadFilterActive = _notepadFilterLabel(
+              tagStored: _tagsSelectedTag,
+              mentionStored: _colleagueMentionFilterHandle,
+            );
             var filtered = mentionFilter != null && mentionFilter.isNotEmpty
                 ? colleagueTopics
                     .where((x) => _talkingPointMentionsHandle(x, mentionFilter))
@@ -5296,9 +5608,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             out.add(
               _ExpectationsOthersSection(
                 title: 'Active',
-                emptyText: mentionFilter == null
-                    ? 'No active private talking points yet.'
-                    : 'No active private talking points mentioning @$mentionFilter.',
+              emptyText: notepadFilterActive == null
+                  ? 'Nothing in your notepad yet.'
+                  : 'No active notepad items for $notepadFilterActive.',
                 items: activeColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -5314,16 +5626,16 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 talkingPointMentionHandlesById:
                     _mentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
-                onPublishTalkingPoint: _publishTalkingPointBrowse,
+                onPublishTalkingPoint: null,
               ),
             );
             out.add(const SizedBox(height: 12));
             out.add(
               _ExpectationsOthersSection(
                 title: 'Archive',
-                emptyText: mentionFilter == null
-                    ? 'No archived private talking points yet.'
-                    : 'No archived private talking points mentioning @$mentionFilter.',
+              emptyText: notepadFilterActive == null
+                  ? 'No archived notepad items yet.'
+                  : 'No archived notepad items for $notepadFilterActive.',
                 items: archiveColleague,
                 peopleById: peopleById,
                 theme: theme,
@@ -5343,7 +5655,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 talkingPointMentionHandlesById:
                     _mentionHandlesByExpectationId,
                 onArchiveTalkingPoint: _archiveTalkingPointBrowse,
-                onPublishTalkingPoint: _publishTalkingPointBrowse,
+                onPublishTalkingPoint: null,
               ),
             );
           break;
@@ -5442,6 +5754,176 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
         break;
 
+      case LedgerPillar.expectationsPersonal:
+        if (_expectationsLoading) {
+          out.add(const _ExpectationsLoadingCard());
+          break;
+        }
+        if (_expectationsLoadError != null) {
+          out.add(
+            _ExpectationsErrorCard(
+              message: _expectationsLoadError!,
+              onRetry: _loadExpectationsFromSupabase,
+            ),
+          );
+          break;
+        }
+        if (mePerson != null) {
+          final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+          final personalPool = _personalAuthoredExpectations(
+            expectations: expectations,
+            currentUserId: currentUserId,
+          );
+          final availableTags = personalPool
+              .expand((e) => _extractInlineTags(e.summary))
+              .toSet()
+              .toList()
+            ..sort();
+          final personalTagNeedle = _tagFilterNeedle(_personalTagFilter);
+          final personalTagDropdownValue =
+              _tagFilterDropdownValue(_personalTagFilter, availableTags);
+          final personalTagDropdownItems =
+              _tagFilterDropdownItems(availableTags, _personalTagFilter);
+          final filteredPersonal = personalPool.where((x) {
+            final statusMatch = _personalStatusFilter == null ||
+                x.status == _personalStatusFilter;
+            final tagMatch = personalTagNeedle == null
+                ? true
+                : _extractInlineTags(x.summary)
+                      .map((t) => t.toLowerCase())
+                      .contains(personalTagNeedle);
+            return statusMatch && tagMatch;
+          }).toList();
+          out.add(
+            Padding(
+              padding: _listingToolbarPadding,
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  reverse: true,
+                  child: _ExpectationsOthersFiltersBar(
+                    showPerson: false,
+                    selectedStatus: _personalStatusFilter,
+                    selectedTag: personalTagDropdownValue,
+                    selectedPersonId: null,
+                    tags: personalTagDropdownItems,
+                    people: const [],
+                    onStatusChanged: (v) {
+                      setState(() => _personalStatusFilter = v);
+                    },
+                    onTagChanged: (v) {
+                      setState(() => _personalTagFilter = v);
+                    },
+                    onPersonChanged: (_) {},
+                  ),
+                ),
+              ),
+            ),
+          );
+          final now = DateTime.now().toUtc();
+          final twoWeeksAgo = now.subtract(const Duration(days: 14));
+          final isTerminal = (Expectation x) =>
+              x.status == ExpectationStatus.finished ||
+              x.status == ExpectationStatus.abandoned;
+          final publishedPersonal = filteredPersonal
+              .where((x) => x.visibility == ExpectationVisibility.echo)
+              .toList();
+          final ongoing = publishedPersonal.where((x) => !isTerminal(x)).toList();
+          final recentlyFinished = publishedPersonal
+              .where(
+                (x) =>
+                    x.status == ExpectationStatus.finished &&
+                    _finishedReferenceAt(x).isAfter(twoWeeksAgo),
+              )
+              .toList();
+          final archive = filteredPersonal.where(isTerminal).toList();
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Active',
+              emptyText: 'No personal expectations yet.',
+              infoTooltip:
+                  'Expectations you authored (including @me), published and in progress.',
+              items: ongoing,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _personalOngoingCollapsed,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _openTagPillar,
+              personForItem: (e) => _writerPersonForExpectation(e, people),
+              onOpenDetails: (e, p) =>
+                  _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(
+                  () => _personalOngoingCollapsed = !_personalOngoingCollapsed,
+                );
+              },
+              inboxHoverListing: true,
+              inboxHoverIncludeDelete: true,
+              inboxReceiverPersonId: mePerson.id,
+              mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
+              onArchiveInbox: _archiveInboxExpectation,
+            ),
+          );
+          if (recentlyFinished.isNotEmpty) {
+            out.add(const SizedBox(height: 12));
+            out.add(
+              _ExpectationsOthersSection(
+                title: 'Finished',
+                emptyText: 'No recently finished expectations (last 2 weeks).',
+                items: recentlyFinished,
+                peopleById: peopleById,
+                theme: theme,
+                scheme: scheme,
+                collapsed: _personalFinishedCollapsed,
+                hasUnreadChat: _hasUnreadListingIndicator,
+                onTagPressed: _openTagPillar,
+                personForItem: (e) => _writerPersonForExpectation(e, people),
+                onOpenDetails: (e, p) =>
+                    _openExpectationDetails(e: e, person: p),
+                onDeleteExpectation: _deleteExpectationFromList,
+                onToggleCollapsed: () {
+                  setState(
+                    () => _personalFinishedCollapsed = !_personalFinishedCollapsed,
+                  );
+                },
+                inboxHoverListing: true,
+                inboxHoverIncludeDelete: true,
+                inboxReceiverPersonId: mePerson.id,
+                mentionPersonIdsByExpectationId:
+                    _mentionPersonIdsByExpectationId,
+                onArchiveInbox: _archiveInboxExpectation,
+              ),
+            );
+          }
+          out.add(const SizedBox(height: 12));
+          out.add(
+            _ExpectationsOthersSection(
+              title: 'Archive',
+              emptyText: 'No archived expectations.',
+              items: archive,
+              peopleById: peopleById,
+              theme: theme,
+              scheme: scheme,
+              collapsed: _personalArchiveCollapsed,
+              hasUnreadChat: _hasUnreadListingIndicator,
+              onTagPressed: _openTagPillar,
+              personForItem: (e) => _writerPersonForExpectation(e, people),
+              onOpenDetails: (e, p) =>
+                  _openExpectationDetails(e: e, person: p),
+              onDeleteExpectation: _deleteExpectationFromList,
+              onToggleCollapsed: () {
+                setState(
+                  () => _personalArchiveCollapsed = !_personalArchiveCollapsed,
+                );
+              },
+            ),
+          );
+        }
+        break;
+
       case LedgerPillar.expectationsMe:
         if (_expectationsLoading) {
           out.add(const _ExpectationsLoadingCard());
@@ -5458,17 +5940,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         }
         if (mePerson != null) {
           final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-          final towardsMe = expectations
-              .where(
-                (x) =>
-                    x.type == ExpectationType.expectation &&
-                    _isExpectationReceiver(x, mePerson.id),
-              )
-              .toList();
-          final towardsMeForTab = towardsMe
-              .where((x) => _inboxTabMatchesWriter(x, currentUserId))
-              .toList();
-          final availableTags = towardsMeForTab
+          final inboxForTab = _inboxExpectationsForTab(
+            expectations: expectations,
+            myPersonId: mePerson.id,
+            currentUserId: currentUserId,
+          );
+          final availableTags = inboxForTab
               .expand((e) => _extractInlineTags(e.summary))
               .toSet()
               .toList()
@@ -5478,7 +5955,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
               _tagFilterDropdownValue(_inboxTagFilter, availableTags);
           final inboxTagDropdownItems =
               _tagFilterDropdownItems(availableTags, _inboxTagFilter);
-          final filteredTowardsMe = towardsMeForTab.where((x) {
+          final filteredTowardsMe = inboxForTab.where((x) {
             final statusMatch =
                 _inboxStatusFilter == null || x.status == _inboxStatusFilter;
             final tagMatch = inboxTagNeedle == null
@@ -5516,14 +5993,14 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                     ),
                     segments: const [
                       ButtonSegment<_InboxListingTab>(
-                        value: _InboxListingTab.fromOthers,
-                        label: Text('From Others'),
+                        value: _InboxListingTab.responsible,
+                        label: Text('Responsible'),
                         icon: Icon(Icons.group_outlined, size: 18),
                       ),
                       ButtonSegment<_InboxListingTab>(
-                        value: _InboxListingTab.personal,
-                        label: Text('Personal'),
-                        icon: Icon(Icons.person_outlined, size: 18),
+                        value: _InboxListingTab.related,
+                        label: Text('Related'),
+                        icon: Icon(Icons.link_outlined, size: 18),
                       ),
                     ],
                     selected: {_inboxListingTab},
@@ -5566,20 +6043,9 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           final inboundPublished = filteredTowardsMe
               .where((x) => x.visibility == ExpectationVisibility.echo)
               .toList();
-          final shadowIncoming = filteredTowardsMe
-              .where(
-                (x) =>
-                    x.visibility == ExpectationVisibility.shadow &&
-                    !isTerminal(x),
-              )
-              .toList();
           final echoOngoing =
               inboundPublished.where((x) => !isTerminal(x)).toList();
-          final ongoingIds = <String>{};
-          final ongoing = <Expectation>[];
-          for (final e in [...shadowIncoming, ...echoOngoing]) {
-            if (ongoingIds.add(e.id)) ongoing.add(e);
-          }
+          final ongoing = echoOngoing;
           final recentlyFinished = inboundPublished
               .where(
                 (x) =>
@@ -5591,9 +6057,12 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           out.add(
             _ExpectationsOthersSection(
               title: 'Active',
-              emptyText: 'No active expectations in your inbox yet.',
-              infoTooltip:
-                  'Active items include unpublished incoming drafts and published expectations that are still active.',
+              emptyText: _inboxListingTab == _InboxListingTab.related
+                  ? 'No related expectations yet.'
+                  : 'No expectations where you are responsible yet.',
+              infoTooltip: _inboxListingTab == _InboxListingTab.related
+                  ? 'Published expectations where you are @mentioned as a co-receiver, not the primary addressee.'
+                  : 'Published expectations where you are the primary receiver (responsible).',
               items: ongoing,
               peopleById: peopleById,
               theme: theme,
@@ -5609,8 +6078,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                 setState(() => _meOngoingCollapsed = !_meOngoingCollapsed);
               },
               inboxHoverListing: true,
-              inboxHoverIncludeDelete:
-                  _inboxListingTab == _InboxListingTab.personal,
               inboxReceiverPersonId: mePerson.id,
               mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
               onArchiveInbox: _archiveInboxExpectation,
@@ -5637,8 +6104,6 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
                   setState(() => _meFinishedCollapsed = !_meFinishedCollapsed);
                 },
                 inboxHoverListing: true,
-                inboxHoverIncludeDelete:
-                    _inboxListingTab == _InboxListingTab.personal,
                 inboxReceiverPersonId: mePerson.id,
                 mentionPersonIdsByExpectationId: _mentionPersonIdsByExpectationId,
                 onArchiveInbox: _archiveInboxExpectation,
@@ -5987,8 +6452,8 @@ enum _OutboxListingTab {
 }
 
 enum _InboxListingTab {
-  fromOthers,
-  personal,
+  responsible,
+  related,
 }
 
 enum _ComposerEntryMode {
@@ -6049,7 +6514,9 @@ class _PillarRail extends StatelessWidget {
   /// Trailing Invite / Logout share this width so their right edges align.
   static const double _footerActionSlotWidth = 96;
 
-  static const List<LedgerPillar> _sidebarOrder = [
+  static const LedgerPillar _expectationsPersonalPillar =
+      LedgerPillar.expectationsPersonal;
+  static const List<LedgerPillar> _expectationsCollaborativePillars = [
     LedgerPillar.expectationsMe,
     LedgerPillar.expectationsOthers,
   ];
@@ -6143,7 +6610,14 @@ class _PillarRail extends StatelessWidget {
                         fillColor: LedgerPillar.addExpectation.captureAccent,
                       ),
                     ),
-                    for (final p in _sidebarOrder)
+                    _expandedPillarTile(
+                      context,
+                      p: _expectationsPersonalPillar,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    _expectationsCollaborativeRailLabel(context),
+                    for (final p in _expectationsCollaborativePillars)
                       _expandedPillarTile(
                         context,
                         p: p,
@@ -6169,13 +6643,21 @@ class _PillarRail extends StatelessWidget {
                     const SizedBox(height: 4),
                     ListTile(
                       dense: true,
-                      contentPadding: const EdgeInsets.fromLTRB(20, 10, 12, 6),
+                      visualDensity: VisualDensity.compact,
+                      minVerticalPadding: 0,
+                      contentPadding: const EdgeInsets.fromLTRB(16, 2, 16, 2),
                       leading: Icon(
-                        Icons.lock_outline,
+                        Icons.edit_note_outlined,
                         size: 20,
                         color: LedgerListingAccents.topic,
                       ),
-                      title: const Text('Private'),
+                      title: Text(
+                        'Personal Notepad',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          height: 1.15,
+                        ),
+                      ),
                       selected: selected == LedgerPillar.tags &&
                           talkingPointsSubView ==
                               _TalkingPointsSubView.colleagues,
@@ -6212,23 +6694,8 @@ class _PillarRail extends StatelessWidget {
                           ],
                         ),
                       ),
-                    ListTile(
-                      dense: true,
-                      contentPadding: const EdgeInsets.fromLTRB(20, 8, 12, 6),
-                      leading: Icon(
-                        Icons.public_outlined,
-                        size: 20,
-                        color: LedgerListingAccents.topic,
-                      ),
-                      title: const Text('Public'),
-                      selected: selected == LedgerPillar.tags &&
-                          talkingPointsSubView ==
-                              _TalkingPointsSubView.meetingsOrTags,
-                      selectedTileColor:
-                          LedgerListingAccents.topic.withValues(alpha: 0.12),
-                      onTap: () =>
-                          onTalkingPointsBrowse(_TalkingPointsSubView.meetingsOrTags),
-                    ),
+                    // Public talking points are disabled for the first version.
+                    const SizedBox.shrink(),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(12, 6, 12, 14),
                       child: tagsLoading
@@ -6294,7 +6761,26 @@ class _PillarRail extends StatelessWidget {
                       onSelect: onSelect,
                     ),
                     const SizedBox(height: 14),
-                    for (final p in _sidebarOrder)
+                    _collapsedPillarDot(
+                      context,
+                      p: _expectationsPersonalPillar,
+                      selected: selected,
+                      onSelect: onSelect,
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Center(
+                        child: SizedBox(
+                          width: 24,
+                          child: Divider(
+                            height: 1,
+                            thickness: 1,
+                            color: scheme.outlineVariant.withValues(alpha: 0.5),
+                          ),
+                        ),
+                      ),
+                    ),
+                    for (final p in _expectationsCollaborativePillars)
                       _collapsedPillarDot(
                         context,
                         p: p,
@@ -6589,6 +7075,35 @@ class _PillarRail extends StatelessWidget {
     );
   }
 
+  Widget _expectationsCollaborativeRailLabel(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Divider(
+            height: 1,
+            thickness: 1,
+            color: scheme.outlineVariant.withValues(alpha: 0.32),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Collaborative',
+            style: theme.textTheme.labelSmall?.copyWith(
+              letterSpacing: 0.4,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurfaceVariant.withValues(alpha: 0.72),
+              fontSize: (theme.textTheme.labelSmall?.fontSize ?? 11) * 0.95,
+            ),
+          ),
+          const SizedBox(height: 2),
+        ],
+      ),
+    );
+  }
+
   /// Filled circle with —+—; used for Expectations and Talking points headings.
   Widget _railHomeCaptureCircle(
     ColorScheme scheme,
@@ -6624,6 +7139,11 @@ class _PillarRail extends StatelessWidget {
     );
   }
 
+  bool _expectationsRailPillar(LedgerPillar p) =>
+      p == LedgerPillar.expectationsPersonal ||
+      p == LedgerPillar.expectationsMe ||
+      p == LedgerPillar.expectationsOthers;
+
   Widget _expandedPillarTile(
     BuildContext context, {
     required LedgerPillar p,
@@ -6631,32 +7151,64 @@ class _PillarRail extends StatelessWidget {
     required ValueChanged<LedgerPillar> onSelect,
   }) {
     final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final railExpect = _expectationsRailPillar(p);
     final icon = switch (p) {
       LedgerPillar.home => Icons.home_outlined,
       LedgerPillar.addExpectation => Icons.flag_outlined,
       LedgerPillar.addTopic => Icons.forum_outlined,
+      LedgerPillar.expectationsPersonal => Icons.edit_note_outlined,
       LedgerPillar.expectationsMe => Icons.south_west_outlined,
       LedgerPillar.expectationsOthers => Icons.north_east_outlined,
       LedgerPillar.people => Icons.group_outlined,
       LedgerPillar.tags => Icons.tag_outlined,
     };
-    return ListTile(
-      leading: Icon(icon, size: 18, color: p.accent),
-      title: Text(p.title),
-      subtitle: p == LedgerPillar.home ||
-              p == LedgerPillar.addExpectation ||
-              p == LedgerPillar.addTopic
-          ? null
-          : Text(
-              p.description,
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodySmall,
-            ),
+    final iconColor = railExpect
+        ? Color.lerp(p.accent, scheme.onSurface, 0.12)!
+        : p.accent;
+    final Widget? subtitle = p == LedgerPillar.home ||
+            p == LedgerPillar.addExpectation ||
+            p == LedgerPillar.addTopic
+        ? null
+        : railExpect
+            ? null
+            : Text(
+                p.description,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall,
+              );
+    final tile = ListTile(
+      dense: railExpect,
+      visualDensity:
+          railExpect ? VisualDensity.compact : VisualDensity.standard,
+      minVerticalPadding: railExpect ? 0 : null,
+      contentPadding: railExpect
+          ? const EdgeInsets.fromLTRB(16, 2, 16, 2)
+          : null,
+      leading: Icon(icon, size: railExpect ? 20 : 18, color: iconColor),
+      title: Text(
+        p.title,
+        style: railExpect
+            ? theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+                height: 1.15,
+              )
+            : null,
+      ),
+      subtitle: subtitle,
       selected: p == selected,
-      selectedTileColor: p.accent.withValues(alpha: 0.12),
+      selectedTileColor: p.accent.withValues(alpha: railExpect ? 0.07 : 0.12),
       onTap: () => onSelect(p),
     );
+    if (railExpect && p.description.trim().isNotEmpty) {
+      return Tooltip(
+        message: '${p.title}: ${p.description}',
+        waitDuration: const Duration(milliseconds: 450),
+        child: tile,
+      );
+    }
+    return tile;
   }
 
   Widget _collapsedPillarDot(
@@ -6672,19 +7224,21 @@ class _PillarRail extends StatelessWidget {
       LedgerPillar.home => Icons.home_outlined,
       LedgerPillar.addExpectation => Icons.flag_outlined,
       LedgerPillar.addTopic => Icons.forum_outlined,
+      LedgerPillar.expectationsPersonal => Icons.edit_note_outlined,
       LedgerPillar.expectationsMe => Icons.south_west_outlined,
       LedgerPillar.expectationsOthers => Icons.north_east_outlined,
       LedgerPillar.people => Icons.group_outlined,
       LedgerPillar.tags => Icons.tag_outlined,
     };
     final desc = p.description.trim();
+    final railExpect = _expectationsRailPillar(p);
     return Tooltip(
       message: desc.isEmpty ? tipTitle : '$tipTitle\n$desc',
       waitDuration: const Duration(milliseconds: 400),
       child: InkWell(
         onTap: () => onSelect(p),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
+          padding: EdgeInsets.symmetric(vertical: railExpect ? 8 : 10),
           child: Center(
             child: Container(
               width: 30,
@@ -6692,7 +7246,7 @@ class _PillarRail extends StatelessWidget {
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(8),
                 color: p == selected
-                    ? p.accent.withValues(alpha: 0.2)
+                    ? p.accent.withValues(alpha: railExpect ? 0.14 : 0.2)
                     : Colors.transparent,
                 border: Border.all(
                   color: p == selected
@@ -6700,7 +7254,13 @@ class _PillarRail extends StatelessWidget {
                       : Colors.transparent,
                 ),
               ),
-              child: Icon(icon, size: 16, color: p.accent),
+              child: Icon(
+                icon,
+                size: 16,
+                color: railExpect
+                    ? Color.lerp(p.accent, scheme.onSurface, 0.12)!
+                    : p.accent,
+              ),
             ),
           ),
         ),
@@ -7056,8 +7616,10 @@ class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> 
         authorLabel: widget.authorLabelForExpectation,
         limit: 40,
       );
-      final merged = [...changelog, ...mentions]
-        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      final merged = mergeActivityFeedChangelogAndMentions(
+        changelog: changelog,
+        mentions: mentions,
+      );
       if (!mounted) return;
       setState(() {
         _items = merged.take(80).toList();
@@ -8578,6 +9140,9 @@ String? _homeActivitySubline(
       personId: e.personId,
       persistedMentionHandles:
           mentionHandlesByExpectationId[e.id] ?? const [],
+      persistedMentionPersonIds:
+          mentionPersonIdsByExpectationId[e.id] ?? const {},
+      peopleById: peopleById,
     );
     if (receivers == kLedgerAllMentionLabel) return null;
     return 'With ${ledgerAtMentionLine(receivers)}';
@@ -8619,6 +9184,21 @@ int? _calendarDaysUntilDeadlineUtc(Expectation e) {
   return deadlineDay.difference(today).inDays;
 }
 
+/// Compact deadline distance label for one-line talking point listings.
+/// Examples: `3d`, `today`, `tomorrow`, `2d late`, or a non-TBD [deadlineLabel]; empty when none.
+String _compactDeadlineShortLabel(Expectation e) {
+  final diff = _calendarDaysUntilDeadlineUtc(e);
+  if (diff != null) {
+    if (diff < 0) return '${-diff}d late';
+    if (diff == 0) return 'today';
+    if (diff == 1) return 'tomorrow';
+    return '${diff}d';
+  }
+  final label = e.deadlineLabel.trim();
+  if (label.isEmpty || label.toUpperCase() == 'TBD') return '';
+  return label;
+}
+
 bool _deadlineApproachingOrPast(Expectation e) {
   final diff = _calendarDaysUntilDeadlineUtc(e);
   if (diff == null) return false;
@@ -8645,6 +9225,13 @@ bool _expectationQualifiesForHomeUrgent(Expectation e) {
   if (e.status == ExpectationStatus.finished ||
       e.status == ExpectationStatus.abandoned) {
     return false;
+  }
+  // Talking points don't have meaningful status/health in v1; drive "urgent" via
+  // deadline proximity only.
+  if (e.type == ExpectationType.topic) {
+    final diff = _calendarDaysUntilDeadlineUtc(e);
+    // Include overdue and upcoming within the next 3 days.
+    return diff != null && diff <= 3;
   }
   return _expectationHomeUrgentAttentionRisk(e) || _deadlineApproachingOrPast(e);
 }
@@ -8702,12 +9289,14 @@ bool _homeUrgentWaitingOnCounterparty(
   );
 }
 
-IconData _homeUrgentRoleIcon(
+IconData? _homeUrgentRoleIcon(
   Expectation e,
   String? currentUserId,
   Person? mePerson, {
   Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
 }) {
+  // Talking points don't have an Inbox/Outbox "whose move" concept.
+  if (e.type == ExpectationType.topic) return null;
   if (_homeUrgentNeedsMyAction(
     e,
     currentUserId,
@@ -8742,6 +9331,7 @@ String _homeUrgentRoleTooltip(
   Person? mePerson, {
   Map<String, Set<String>> mentionPersonIdsByExpectationId = const {},
 }) {
+  if (e.type == ExpectationType.topic) return '';
   if (_homeUrgentNeedsMyAction(
     e,
     currentUserId,
@@ -8764,24 +9354,35 @@ String _homeUrgentRoleTooltip(
 String _homeUrgentTrailingLabel(Expectation e, ColorScheme scheme) {
   final parts = <String>[];
   final diff = _calendarDaysUntilDeadlineUtc(e);
-  if (diff != null && diff <= 7) {
-    if (diff < 0) {
-      parts.add('Overdue ${-diff}d');
-    } else if (diff == 0) {
-      parts.add('Due today');
-    } else if (diff == 1) {
-      parts.add('Due tomorrow');
-    } else {
-      parts.add('Due in ${diff}d');
+  if (e.type == ExpectationType.topic) {
+    // For talking points, use deadline proximity label (avoid "At risk").
+    if (diff != null) {
+      if (diff < 0) {
+        parts.add('Overdue ${-diff}d');
+      } else {
+        parts.add('Upcoming');
+      }
     }
-  }
-  if (_expectationHealthIsUnhealthy(e)) {
-    parts.add(_healthMeta(e.health, scheme).$1);
-  } else if (e.type == ExpectationType.expectation) {
-    if (e.status == ExpectationStatus.pending) {
-      parts.add(_statusMeta(e.status, scheme).$1);
-    } else if (e.health == ExpectationHealth.unknown) {
+  } else {
+    if (diff != null && diff <= 7) {
+      if (diff < 0) {
+        parts.add('Overdue ${-diff}d');
+      } else if (diff == 0) {
+        parts.add('Due today');
+      } else if (diff == 1) {
+        parts.add('Due tomorrow');
+      } else {
+        parts.add('Due in ${diff}d');
+      }
+    }
+    if (_expectationHealthIsUnhealthy(e)) {
       parts.add(_healthMeta(e.health, scheme).$1);
+    } else if (e.type == ExpectationType.expectation) {
+      if (e.status == ExpectationStatus.pending) {
+        parts.add(_statusMeta(e.status, scheme).$1);
+      } else if (e.health == ExpectationHealth.unknown) {
+        parts.add(_healthMeta(e.health, scheme).$1);
+      }
     }
   }
   return parts.join(' · ');
@@ -8790,13 +9391,7 @@ String _homeUrgentTrailingLabel(Expectation e, ColorScheme scheme) {
 void _sortHomeUrgentExpectations(List<Expectation> list) {
   /// Lower = more urgent (aligned with [_expectationHomeUrgentAttentionRisk]).
   int attentionRank(Expectation e) {
-    if (e.type == ExpectationType.topic) {
-      return switch (e.health) {
-        ExpectationHealth.offTrack => 0,
-        ExpectationHealth.atRisk => 1,
-        _ => 4,
-      };
-    }
+    if (e.type == ExpectationType.topic) return 4;
     if (e.health == ExpectationHealth.offTrack) return 0;
     if (e.health == ExpectationHealth.atRisk) return 1;
     if (e.status == ExpectationStatus.pending) return 2;
@@ -8822,6 +9417,12 @@ void _sortHomeUrgentExpectations(List<Expectation> list) {
 Color _homeUrgentTrailingColor(Expectation e, ColorScheme scheme) {
   final diff = _calendarDaysUntilDeadlineUtc(e);
   if (diff != null && diff < 0) return scheme.error;
+  if (e.type == ExpectationType.topic) {
+    // "Upcoming" for talking points: clearer yellow/amber than tertiary.
+    return scheme.brightness == Brightness.dark
+        ? Colors.amberAccent.shade200
+        : Colors.amber.shade700;
+  }
   if (_expectationHomeUrgentAttentionRisk(e)) return scheme.error;
   if (diff != null && diff <= 7) return scheme.tertiary;
   return scheme.tertiary;
@@ -8971,6 +9572,75 @@ List<String> _tagFilterDropdownItems(List<String> available, String? stored) {
   final list = merged.toList();
   list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
   return list;
+}
+
+const _kNotepadFilterTagPrefix = 'tag:';
+const _kNotepadFilterMentionPrefix = 'mention:';
+
+String _encodeNotepadFilterTag(String tag) =>
+    '$_kNotepadFilterTagPrefix${tag.trim().toLowerCase()}';
+
+String _encodeNotepadFilterMention(String handle) =>
+    '$_kNotepadFilterMentionPrefix${handle.trim().toLowerCase()}';
+
+String _notepadMixedFilterDisplayLabel(String key) {
+  if (key.startsWith(_kNotepadFilterTagPrefix)) {
+    return '#${key.substring(_kNotepadFilterTagPrefix.length)}';
+  }
+  if (key.startsWith(_kNotepadFilterMentionPrefix)) {
+    return '@${key.substring(_kNotepadFilterMentionPrefix.length)}';
+  }
+  return key;
+}
+
+String? _selectedNotepadMixedFilterKey({
+  String? tagStored,
+  String? mentionStored,
+}) {
+  final mention = mentionStored?.trim().toLowerCase();
+  if (mention != null && mention.isNotEmpty) {
+    return _encodeNotepadFilterMention(mention);
+  }
+  final needle = _tagFilterNeedle(tagStored);
+  if (needle != null) return _encodeNotepadFilterTag(needle);
+  return null;
+}
+
+List<String> _notepadMixedFilterDropdownItems({
+  required List<String> tags,
+  required List<String> mentions,
+  String? tagStored,
+  String? mentionStored,
+}) {
+  final merged = <String>{
+    for (final t in tags) _encodeNotepadFilterTag(t),
+    for (final m in mentions) _encodeNotepadFilterMention(m),
+  };
+  final selected = _selectedNotepadMixedFilterKey(
+    tagStored: tagStored,
+    mentionStored: mentionStored,
+  );
+  if (selected != null) merged.add(selected);
+  final list = merged.toList()
+    ..sort(
+      (a, b) => _notepadMixedFilterDisplayLabel(a)
+          .toLowerCase()
+          .compareTo(_notepadMixedFilterDisplayLabel(b).toLowerCase()),
+    );
+  return list;
+}
+
+/// Human-readable active notepad filter (`#tag` or `@handle`), or null.
+String? _notepadFilterLabel({
+  String? tagStored,
+  String? mentionStored,
+}) {
+  final key = _selectedNotepadMixedFilterKey(
+    tagStored: tagStored,
+    mentionStored: mentionStored,
+  );
+  if (key == null) return null;
+  return _notepadMixedFilterDisplayLabel(key);
 }
 
 TextSpan _richPrivateTalkingSummarySpan({
@@ -9189,6 +9859,9 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
     this.personFieldWidth,
     /// Wider Tag field when Status/Person are hidden (e.g. Public). Defaults to 220.
     this.tagFieldWidth,
+    this.tagDropdownLabel,
+    this.tagDropdownAllLabel,
+    this.tagDropdownItemLabel,
   });
 
   final ExpectationStatus? selectedStatus;
@@ -9204,6 +9877,9 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
   final bool showPerson;
   final double? personFieldWidth;
   final double? tagFieldWidth;
+  final String? tagDropdownLabel;
+  final String? tagDropdownAllLabel;
+  final String Function(String value)? tagDropdownItemLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -9295,18 +9971,22 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
               isExpanded: true,
               style: theme.textTheme.bodySmall,
               decoration: deco(
-                label: 'Tag',
+                label: tagDropdownLabel ?? 'Tag',
                 active: selectedTag != null,
               ),
               items: [
-                const DropdownMenuItem<String?>(
+                DropdownMenuItem<String?>(
                   value: null,
-                  child: Text('All tags'),
+                  child: Text(tagDropdownAllLabel ?? 'All tags'),
                 ),
                 ...tags.map(
                   (t) => DropdownMenuItem<String?>(
                     value: t,
-                    child: Text('#$t'),
+                    child: Text(
+                      tagDropdownItemLabel != null
+                          ? tagDropdownItemLabel!(t)
+                          : '#$t',
+                    ),
                   ),
                 ),
               ],
@@ -9348,6 +10028,57 @@ class _ExpectationsOthersFiltersBar extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+/// List tile header: primary receiver normal weight; co-receivers muted (max 3 + …).
+class _ListingReceiverWhoLine extends StatelessWidget {
+  const _ListingReceiverWhoLine({
+    required this.parts,
+    required this.theme,
+    required this.scheme,
+  });
+
+  final ListingReceiverParts parts;
+  final ThemeData theme;
+  final ColorScheme scheme;
+
+  @override
+  Widget build(BuildContext context) {
+    final primaryStyle = theme.textTheme.titleSmall?.copyWith(
+      fontWeight: FontWeight.w700,
+      color: scheme.onSurface,
+    );
+    final extraStyle = theme.textTheme.titleSmall?.copyWith(
+      fontWeight: FontWeight.w500,
+      color: scheme.onSurfaceVariant.withValues(alpha: 0.72),
+    );
+    if (!parts.hasExtras) {
+      return Text(
+        ledgerAtMentionLine(parts.primaryLabel),
+        style: primaryStyle,
+      );
+    }
+    return Text.rich(
+      TextSpan(
+        style: primaryStyle,
+        children: [
+          TextSpan(text: ledgerAtMentionLine(parts.primaryLabel)),
+          if (parts.extraLabels.isNotEmpty) ...[
+            const TextSpan(text: ' '),
+            for (var i = 0; i < parts.extraLabels.length; i++) ...[
+              if (i > 0) const TextSpan(text: ' '),
+              TextSpan(
+                text: ledgerAtMentionLine(parts.extraLabels[i]),
+                style: extraStyle,
+              ),
+            ],
+          ],
+          if (parts.hasMoreExtras)
+            TextSpan(text: ' …', style: extraStyle),
+        ],
+      ),
     );
   }
 }
@@ -9456,28 +10187,73 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   Widget build(BuildContext context) {
     final locale = Localizations.localeOf(context);
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
-    final baseWho = isDiscussionPoint
-        ? talkingPointMentionWhoLabel(
-            widget.expectation.summary,
-            persistedMentionHandles: widget.talkingPointPersistedMentions,
-            persistedMentionPersonIds: widget.coReceiverPersonIds,
-            peopleById: widget.peopleById,
+    final listingReceiverParts = isDiscussionPoint
+        ? buildListingReceiverParts(
+            handlesInOrder: talkingPointListingReceiverHandles(
+              summary: widget.expectation.summary,
+              persistedMentionHandles: widget.talkingPointPersistedMentions,
+              persistedMentionPersonIds: widget.coReceiverPersonIds,
+              peopleById: widget.peopleById,
+            ),
+            primaryDisplayNameFallback: widget.person?.displayName,
           )
-        : expectationReceiverWhoLabel(
-            summary: widget.expectation.summary,
-            personDisplayName: widget.person?.displayName,
-            personHandle: widget.person?.handle,
-            personId: widget.expectation.personId,
-            persistedMentionHandles: widget.talkingPointPersistedMentions,
+        : buildListingReceiverParts(
+            handlesInOrder: expectationListingReceiverHandles(
+              summary: widget.expectation.summary,
+              primaryPersonHandle: widget.person?.handle,
+              persistedMentionHandles: widget.talkingPointPersistedMentions,
+              persistedMentionPersonIds: widget.coReceiverPersonIds,
+              peopleById: widget.peopleById,
+            ),
+            primaryDisplayNameFallback: widget.person?.displayName,
           );
-    final who =
-        isDiscussionPoint ? baseWho : ledgerAtMentionLine(baseWho);
-    final initials = ledgerPersonInitialLetter(who);
+    final initials =
+        ledgerPersonInitialLetter(listingReceiverParts.primaryLabel);
     final summaryStyle = widget.theme.textTheme.bodyMedium?.copyWith(
       color: widget.scheme.onSurfaceVariant,
       height: 1.35,
     );
     final tags = _extractInlineTags(widget.expectation.summary);
+    final compactPrivateTalkingPoint =
+        widget.talkingPointsBrowseListing && isDiscussionPoint;
+    String? firstMeaningfulMentionToken() {
+      final labels = <String>[
+        listingReceiverParts.primaryLabel,
+        ...listingReceiverParts.extraLabels,
+      ];
+      for (final raw in labels) {
+        final clean = raw.trim();
+        if (clean.isEmpty) continue;
+        final lower = clean.toLowerCase();
+        if (lower == 'all' || lower == '@all') continue;
+        return ledgerAtMentionLine(clean);
+      }
+      return null;
+    }
+
+    final compactLeadToken = firstMeaningfulMentionToken() ??
+        (tags.isNotEmpty ? '#${tags.first}' : null);
+    var compactSummary = widget.expectation.summary
+        .replaceAll('\n', ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (compactLeadToken != null && compactSummary.isNotEmpty) {
+      compactSummary = compactSummary
+          .replaceFirst(
+            RegExp(
+              '^${RegExp.escape(compactLeadToken)}\\b\\s*',
+              caseSensitive: false,
+            ),
+            '',
+          )
+          .trim();
+    }
+    if (compactSummary.isEmpty) {
+      compactSummary = widget.expectation.summary
+          .replaceAll('\n', ' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+    }
     final (healthLabel, healthColor) =
         _healthMeta(widget.expectation.health, widget.scheme);
     final colorTalkingSummaryTokens =
@@ -9551,7 +10327,161 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
     final showTalkingPointsBrowseHoverBar = widget.talkingPointsBrowseListing &&
         _hoverTalkingPointsBrowseRow &&
         (canTpBrowsePublish || canTpBrowseArchive || canDelete);
-    Widget card = Material(
+    Widget card;
+    if (compactPrivateTalkingPoint) {
+      final compactDeadlineLabel = _compactDeadlineShortLabel(
+        widget.expectation,
+      );
+      card = Material(
+        color: rowBackground,
+        borderRadius: BorderRadius.circular(10),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: widget.onOpenDetails,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border(
+                left: BorderSide(width: listingStripeWidth, color: listingStripeColor),
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: SizedBox(
+                height: _kPrivateTalkingPointRowHeight,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: _kPrivateTalkingPointLeadSlotWidth,
+                      child: compactLeadToken == null
+                          ? const SizedBox.shrink()
+                          : Align(
+                              alignment: Alignment.centerLeft,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(999),
+                                  color: widget.scheme.surfaceContainerHigh
+                                      .withValues(alpha: 0.6),
+                                ),
+                                child: Text(
+                                  compactLeadToken,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style:
+                                      widget.theme.textTheme.labelSmall?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: widget.scheme.onSurface,
+                                    height: 1.15,
+                                  ),
+                                ),
+                              ),
+                            ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        compactSummary,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: widget.theme.textTheme.bodyMedium?.copyWith(
+                          color: widget.scheme.onSurfaceVariant,
+                          height: 1.25,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: _kPrivateTalkingPointActionsSlotWidth,
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: showTalkingPointsBrowseHoverBar &&
+                                (canTpBrowseArchive || canDelete)
+                            ? Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (canTpBrowseArchive)
+                                    _compactListingHoverTextButton(
+                                      theme: widget.theme,
+                                      scheme: widget.scheme,
+                                      label: 'Archive',
+                                      busy: _archiving,
+                                      onPressed: (_publishing ||
+                                              _archiving ||
+                                              _deleting)
+                                          ? null
+                                          : () async {
+                                              setState(() => _archiving = true);
+                                              try {
+                                                await widget
+                                                    .onArchiveTalkingPoint!(
+                                                  widget.expectation,
+                                                );
+                                              } finally {
+                                                if (mounted) {
+                                                  setState(
+                                                    () => _archiving = false,
+                                                  );
+                                                }
+                                              }
+                                            },
+                                    ),
+                                  if (canDelete)
+                                    _compactListingHoverTextButton(
+                                      theme: widget.theme,
+                                      scheme: widget.scheme,
+                                      label: 'Delete',
+                                      busy: _deleting,
+                                      foregroundColor: widget.scheme.error,
+                                      onPressed: (_publishing ||
+                                              _archiving ||
+                                              _deleting)
+                                          ? null
+                                          : () async {
+                                              setState(() => _deleting = true);
+                                              try {
+                                                await widget.onDelete!.call();
+                                              } finally {
+                                                if (mounted) {
+                                                  setState(
+                                                    () => _deleting = false,
+                                                  );
+                                                }
+                                              }
+                                            },
+                                    ),
+                                ],
+                              )
+                            : compactDeadlineLabel.isEmpty
+                                ? const SizedBox.shrink()
+                                : Text(
+                                    compactDeadlineLabel,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    textAlign: TextAlign.right,
+                                    style: widget.theme.textTheme.labelSmall
+                                        ?.copyWith(
+                                      color: widget.scheme.onSurfaceVariant
+                                          .withValues(alpha: 0.9),
+                                      fontWeight: FontWeight.w600,
+                                      height: 1.15,
+                                    ),
+                                  ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      card = Material(
       color: rowBackground,
       borderRadius: BorderRadius.circular(10),
       clipBehavior: Clip.antiAlias,
@@ -9633,12 +10563,10 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          who,
-                          style: widget.theme.textTheme.titleSmall?.copyWith(
-                            fontWeight: FontWeight.w700,
-                            color: widget.scheme.onSurface,
-                          ),
+                        _ListingReceiverWhoLine(
+                          parts: listingReceiverParts,
+                          theme: widget.theme,
+                          scheme: widget.scheme,
                         ),
                         const SizedBox(height: 6),
                         LayoutBuilder(
@@ -9831,6 +10759,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
         ),
       ),
     );
+    }
     if (widget.hasUnreadChat) {
       card = Tooltip(
         message: 'Unread chat or activity',
@@ -9839,7 +10768,9 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
     }
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 8),
+      margin: EdgeInsets.only(
+        bottom: compactPrivateTalkingPoint ? 10 : 8,
+      ),
       child: MouseRegion(
         onEnter: (_) {
           if (widget.outboxDraftsListing) {
@@ -10193,7 +11124,7 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
                   ),
                 ),
               ),
-            if (showTalkingPointsBrowseHoverBar)
+            if (showTalkingPointsBrowseHoverBar && !compactPrivateTalkingPoint)
               Positioned(
                 top: 4,
                 right: 8,
@@ -10317,6 +11248,52 @@ class _ExpectationOthersTileState extends State<_ExpectationOthersTile> {
   }
 }
 
+/// Fixed lead column so @mention / #tag chips do not shift summary text.
+const double _kPrivateTalkingPointLeadSlotWidth = 96;
+
+/// Reserved action column + fixed inner row height prevent hover layout bounce.
+const double _kPrivateTalkingPointActionsSlotWidth = 118;
+const double _kPrivateTalkingPointRowHeight = 22;
+
+/// Inline Archive/Delete for compact private talking-point rows (stays one line tall).
+Widget _compactListingHoverTextButton({
+  required ThemeData theme,
+  required ColorScheme scheme,
+  required String label,
+  required bool busy,
+  required VoidCallback? onPressed,
+  Color? foregroundColor,
+}) {
+  final color = foregroundColor ?? scheme.onSurfaceVariant;
+  return TextButton(
+    style: TextButton.styleFrom(
+      visualDensity: VisualDensity.compact,
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 0),
+      minimumSize: const Size(0, 22),
+      maximumSize: const Size(double.infinity, 22),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    ),
+    onPressed: onPressed,
+    child: busy
+        ? SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: color,
+            ),
+          )
+        : Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: color,
+              height: 1.1,
+            ),
+          ),
+  );
+}
+
 Color _ledgerListingRowSurface({
   required ColorScheme scheme,
 }) {
@@ -10359,6 +11336,320 @@ class _ExpectationMessageVm {
 
 enum _UnsavedDetailsCloseChoice { keepEditing, discard, save }
 
+/// Add @receivers on an expectation or talking point; @ autocomplete matches Home capture.
+class _AddReceiversDialog extends StatefulWidget {
+  const _AddReceiversDialog({
+    required this.people,
+    required this.onSubmit,
+  });
+
+  final List<Person> people;
+  final Future<bool> Function(String additionalText) onSubmit;
+
+  @override
+  State<_AddReceiversDialog> createState() => _AddReceiversDialogState();
+}
+
+class _AddReceiversDialogState extends State<_AddReceiversDialog> {
+  static final TextStyle _mentionChipStyle = TextStyle(
+    fontFamily: 'monospace',
+    fontWeight: FontWeight.w500,
+    fontSize: 15,
+    height: 1.35,
+  );
+
+  final TextEditingController _controller = TextEditingController();
+  final FocusNode _focus = FocusNode();
+  Person? _uniqueMentionSuggestion;
+  List<Person> _mentionInlineCandidates = [];
+  String? _mentionDisambiguationHint;
+  int _mentionStart = 0;
+  int _mentionEnd = 0;
+  int _pickIndex = 0;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onTextChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onTextChanged);
+    _controller.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _clearMentionAutocomplete() {
+    setState(() {
+      _uniqueMentionSuggestion = null;
+      _mentionInlineCandidates = [];
+      _mentionDisambiguationHint = null;
+      _pickIndex = 0;
+    });
+  }
+
+  void _onTextChanged() {
+    final value = _controller.value;
+    final caret =
+        value.selection.isValid ? value.selection.extentOffset : value.text.length;
+    if (caret < 0 || caret > value.text.length) {
+      _clearMentionAutocomplete();
+      return;
+    }
+    final beforeCaret = value.text.substring(0, caret);
+    final match = RegExp(r'@([a-zA-Z0-9._-]*)$').firstMatch(beforeCaret);
+    if (match == null) {
+      _clearMentionAutocomplete();
+      return;
+    }
+    final query = (match.group(1) ?? '').toLowerCase();
+    final start = match.start;
+    final end = caret;
+    final handleHits = query.isEmpty
+        ? <Person>[]
+        : widget.people
+            .where((p) => p.handle.toLowerCase().startsWith(query))
+            .toList();
+    final broadHits = widget.people.where((p) {
+      final handle = p.handle.toLowerCase();
+      final display = p.displayName.toLowerCase();
+      return query.isEmpty || handle.startsWith(query) || display.startsWith(query);
+    }).toList();
+    String? disambiguation;
+    Person? unique;
+    if (query.isEmpty) {
+      unique = null;
+      if (widget.people.isNotEmpty) {
+        disambiguation = 'Type after @ to narrow people';
+      }
+    } else if (handleHits.length == 1) {
+      unique = handleHits.single;
+    } else if (handleHits.isEmpty && broadHits.length == 1) {
+      unique = broadHits.single;
+    } else {
+      unique = null;
+    }
+    final alreadyComplete =
+        unique != null && unique.handle.toLowerCase() == query;
+    setState(() {
+      _mentionStart = start;
+      _mentionEnd = end;
+      _uniqueMentionSuggestion = alreadyComplete ? null : unique;
+      _mentionDisambiguationHint = disambiguation;
+      _mentionInlineCandidates = handleHits.length > 1
+          ? (List<Person>.from(handleHits)
+            ..sort(
+              (a, b) => a.handle.toLowerCase().compareTo(b.handle.toLowerCase()),
+            ))
+          : <Person>[];
+      _pickIndex = 0;
+    });
+  }
+
+  void _insertMention(Person person) {
+    final start = _mentionStart;
+    final end = _mentionEnd;
+    final value = _controller.value;
+    if (start < 0 || end < start || end > value.text.length) return;
+    final prefix = value.text.substring(0, start);
+    final suffix = value.text.substring(end);
+    final replacement = '@${person.handle}';
+    final spacer = suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' ';
+    final nextText = '$prefix$replacement$spacer$suffix';
+    final nextCaret = (prefix + replacement + spacer).length;
+    _controller.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextCaret),
+    );
+    _clearMentionAutocomplete();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
+  }
+
+  bool _inlineMentionPickActive() =>
+      _uniqueMentionSuggestion != null || _mentionInlineCandidates.length > 1;
+
+  void _confirmInlineMentionPick() {
+    if (_mentionInlineCandidates.length > 1) {
+      final n = _mentionInlineCandidates.length;
+      final p = _mentionInlineCandidates[_pickIndex % n];
+      _insertMention(p);
+      return;
+    }
+    final u = _uniqueMentionSuggestion;
+    if (u != null) {
+      _insertMention(u);
+    }
+  }
+
+  void _cycleMentionPick({required bool reverse}) {
+    if (_mentionInlineCandidates.length <= 1) return;
+    final n = _mentionInlineCandidates.length;
+    setState(() {
+      _pickIndex = reverse ? (_pickIndex - 1 + n) % n : (_pickIndex + 1) % n;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
+  }
+
+  Future<void> _onSave() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final ok = await widget.onSubmit(_controller.text.trim());
+      if (ok && mounted) Navigator.of(context).pop();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return AlertDialog(
+      title: const Text('Add receivers'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Type @handles for people to add. Unknown handles can create placeholders (same as capture).',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Builder(
+              builder: (context) {
+                final bindings = <ShortcutActivator, VoidCallback>{};
+                if (_inlineMentionPickActive()) {
+                  bindings[const SingleActivator(LogicalKeyboardKey.enter)] =
+                      _confirmInlineMentionPick;
+                }
+                if (_uniqueMentionSuggestion != null) {
+                  bindings[const SingleActivator(LogicalKeyboardKey.tab)] = () {
+                    final u = _uniqueMentionSuggestion;
+                    if (u != null) _insertMention(u);
+                  };
+                } else if (_mentionInlineCandidates.length > 1) {
+                  bindings[const SingleActivator(LogicalKeyboardKey.tab)] =
+                      () => _cycleMentionPick(reverse: false);
+                  bindings[const SingleActivator(
+                    LogicalKeyboardKey.tab,
+                    shift: true,
+                  )] = () => _cycleMentionPick(reverse: true);
+                }
+                return CallbackShortcuts(
+                  bindings: bindings,
+                  child: TextField(
+                    controller: _controller,
+                    focusNode: _focus,
+                    minLines: 2,
+                    maxLines: 4,
+                    style: _mentionChipStyle.copyWith(
+                      color: theme.colorScheme.onSurface,
+                    ),
+                    textInputAction: TextInputAction.newline,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      hintText: '@alex @sam',
+                    ),
+                  ),
+                );
+              },
+            ),
+            if (_mentionDisambiguationHint != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _mentionDisambiguationHint!,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+            if (_uniqueMentionSuggestion != null) ...[
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: ActionChip(
+                  label: Text(
+                    '@${_uniqueMentionSuggestion!.handle}',
+                    style: _mentionChipStyle,
+                  ),
+                  onPressed: () => _insertMention(_uniqueMentionSuggestion!),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  'Enter, Tab, or click to insert',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: scheme.onSurfaceVariant.withValues(alpha: 0.78),
+                  ),
+                ),
+              ),
+            ],
+            if (_mentionInlineCandidates.length > 1) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (var i = 0; i < _mentionInlineCandidates.length; i++)
+                    FilterChip(
+                      selected: i == (_pickIndex % _mentionInlineCandidates.length),
+                      label: Text(
+                        '@${_mentionInlineCandidates[i].handle}',
+                        style: _mentionChipStyle,
+                      ),
+                      onSelected: (_) => _insertMention(_mentionInlineCandidates[i]),
+                    ),
+                ],
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  'Use Tab to choose, Enter to insert, or click a match',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: scheme.onSurfaceVariant.withValues(alpha: 0.78),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _onSave,
+          child: _busy
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('Add'),
+        ),
+      ],
+    );
+  }
+}
+
 class _ExpectationDetailsPanel extends StatefulWidget {
   const _ExpectationDetailsPanel({
     super.key,
@@ -10367,6 +11658,8 @@ class _ExpectationDetailsPanel extends StatefulWidget {
     this.talkingPointPersistedMentions = const [],
     this.coReceiverPersonIds = const {},
     this.receiverPeople = const [],
+    required this.mentionAutocompletePeople,
+    required this.onCreatePlaceholderPerson,
     required this.canEdit,
     this.onInviteReceivers,
     this.onChangelogReadSynced,
@@ -10378,6 +11671,8 @@ class _ExpectationDetailsPanel extends StatefulWidget {
   final List<String> talkingPointPersistedMentions;
   final Set<String> coReceiverPersonIds;
   final List<Person> receiverPeople;
+  final List<Person> mentionAutocompletePeople;
+  final Future<Person> Function(String handle) onCreatePlaceholderPerson;
   final bool canEdit;
   final Future<void> Function(List<Person> receivers)? onInviteReceivers;
   final VoidCallback? onChangelogReadSynced;
@@ -10421,6 +11716,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
   int? _savedProgress;
   DateTime? _updateRequestedAt;
   bool _requestingUpdate = false;
+  final List<Person> _overlayAddedReceivers = [];
 
   /// Changelog bubbles compare [DateTime.isAfter] against this UTC instant:
   /// - On first load we seed from `expectation_changelog_reads.last_read_at` (your stored read
@@ -10798,6 +12094,257 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     });
   }
 
+  List<Person> _mergedBaseReceiverPeople() {
+    final byId = <String, Person>{};
+    for (final p in widget.receiverPeople) {
+      byId[p.id] = p;
+    }
+    for (final p in _overlayAddedReceivers) {
+      byId[p.id] = p;
+    }
+    return byId.values.toList();
+  }
+
+  List<String> _mergedPersistedMentionHandles() {
+    final seen = <String>{};
+    final out = <String>[];
+    void add(String raw) {
+      final h = raw.trim();
+      if (h.isEmpty) return;
+      if (seen.add(h.toLowerCase())) out.add(h);
+    }
+
+    for (final h in widget.talkingPointPersistedMentions) {
+      add(h);
+    }
+    for (final p in _overlayAddedReceivers) {
+      add(p.handle);
+    }
+    return out;
+  }
+
+  Set<String> _mergedCoReceiverPersonIds() {
+    return {
+      ...widget.coReceiverPersonIds,
+      ..._overlayAddedReceivers.map((p) => p.id),
+    };
+  }
+
+  Person? _personByHandleInPool(String handle, List<Person> pool) {
+    final q = handle.trim().toLowerCase();
+    if (q.isEmpty) return null;
+    for (final p in pool) {
+      if (p.handle.trim().toLowerCase() == q) return p;
+    }
+    return null;
+  }
+
+  Future<List<Person>> _loadCompanyPeopleForMentions() async {
+    final client = Supabase.instance.client;
+    if (_companyId == null) return List<Person>.from(widget.mentionAutocompletePeople);
+    try {
+      final peopleRows = await client
+          .from('people')
+          .select(
+            'id,created_at,display_name,handle,auth_user_id,email,title',
+          )
+          .eq('company_id', _companyId!);
+      final people = <Person>[];
+      for (final raw in peopleRows as List) {
+        if (raw is! Map) continue;
+        final row = Map<String, dynamic>.from(raw);
+        people.add(
+          Person(
+            id: row['id'] as String,
+            createdAt: DateTime.tryParse(
+                  (row['created_at'] as String?) ?? '',
+                ) ??
+                DateTime.now().toUtc(),
+            displayName: ((row['display_name'] as String?) ?? '').trim(),
+            handle: ((row['handle'] as String?) ?? '').trim(),
+            authUserId: (row['auth_user_id'] as String?)?.trim(),
+            email: ((row['email'] as String?) ?? '').trim().isEmpty
+                ? null
+                : ((row['email'] as String?) ?? '').trim(),
+            title: ((row['title'] as String?) ?? '').trim().isEmpty
+                ? null
+                : ((row['title'] as String?) ?? '').trim(),
+          ),
+        );
+      }
+      return people;
+    } on PostgrestException {
+      return List<Person>.from(widget.mentionAutocompletePeople);
+    }
+  }
+
+  Future<bool> _applyAddedReceivers(String additionalText) async {
+    final client = Supabase.instance.client;
+    final newHandles = extractMentionHandlesFromText(additionalText);
+    if (newHandles.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Type at least one @handle to add.')),
+        );
+      }
+      return false;
+    }
+    await _ensureActorContext();
+    if (_companyId == null || _myPersonId == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not resolve your profile.')),
+        );
+      }
+      return false;
+    }
+
+    final isTopic = widget.expectation.type == ExpectationType.topic;
+    final existingLower = isTopic
+        ? talkingPointMentionHandleList(
+            summary: widget.expectation.summary,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
+          ).map((h) => h.toLowerCase()).toSet()
+        : expectationReceiverHandleList(
+            summary: widget.expectation.summary,
+            primaryPersonHandle: widget.person?.handle,
+            persistedMentionHandles: widget.talkingPointPersistedMentions,
+          ).map((h) => h.toLowerCase()).toSet();
+
+    for (final h in newHandles) {
+      if (existingLower.contains(h.toLowerCase())) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('@$h is already a receiver on this item.')),
+          );
+        }
+        return false;
+      }
+    }
+
+    List<Person> peoplePool = await _loadCompanyPeopleForMentions();
+    try {
+      if (isTopic) {
+        final line = mergeTalkingPointMentionSourceLine(
+          summary: widget.expectation.summary,
+          persistedMentionHandles: widget.talkingPointPersistedMentions,
+          additionalMentionText: additionalText,
+        );
+        await syncTalkingPointMentions(
+          client: client,
+          companyId: _companyId!,
+          expectationId: widget.expectation.id,
+          summary: line,
+          authorPersonId: _myPersonId!,
+          people: peoplePool,
+          resolveMe: (_) async {
+            for (final p in peoplePool) {
+              if (p.id == _myPersonId) return p;
+            }
+            return null;
+          },
+          createPlaceholder: widget.onCreatePlaceholderPerson,
+          replaceExisting: true,
+        );
+      } else {
+        final line = mergeExpectationReceiverMentionSourceLine(
+          summary: widget.expectation.summary,
+          primaryPersonHandle: widget.person?.handle,
+          persistedMentionHandles: widget.talkingPointPersistedMentions,
+          additionalMentionText: additionalText,
+        );
+        await syncExpectationCoReceiverMentions(
+          client: client,
+          companyId: _companyId!,
+          expectationId: widget.expectation.id,
+          mentionSourceText: line,
+          authorPersonId: _myPersonId!,
+          people: peoplePool,
+          resolveMe: (_) async {
+            for (final p in peoplePool) {
+              if (p.id == _myPersonId) return p;
+            }
+            return null;
+          },
+          createPlaceholder: widget.onCreatePlaceholderPerson,
+          replaceExisting: true,
+        );
+      }
+    } on PostgrestException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not add receivers: ${e.message}')),
+        );
+      }
+      return false;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not add receivers: $e')),
+        );
+      }
+      return false;
+    }
+
+    try {
+      await insertExpectationAppMessage(
+        client: client,
+        companyId: _companyId!,
+        expectationId: widget.expectation.id,
+        senderPersonId: _myPersonId!,
+        messageText: encodeChangelogPayloadReceiversAdded(
+          isTopic: isTopic,
+          handles: newHandles,
+        ),
+        type: kExpectationMessageTypeChangelogReceiversAdded,
+      );
+      await touchExpectationChatActivityForAuthUser(
+        client: client,
+        expectationId: widget.expectation.id,
+        expectationWriterUserId: widget.expectation.writerUserId,
+      );
+    } catch (_) {}
+
+    peoplePool = await _loadCompanyPeopleForMentions();
+    final added = <Person>[];
+    final seenIds = <String>{
+      ...widget.receiverPeople.map((p) => p.id),
+      if (widget.person != null) widget.person!.id,
+    };
+    for (final h in newHandles) {
+      final p = _personByHandleInPool(h, peoplePool);
+      if (p != null && seenIds.add(p.id)) {
+        added.add(p);
+      }
+    }
+
+    widget.onExpectationDataMutated?.call();
+    if (mounted) {
+      unawaited(_loadConversation());
+      setState(() {
+        for (final p in added) {
+          if (!_overlayAddedReceivers.any((x) => x.id == p.id)) {
+            _overlayAddedReceivers.add(p);
+          }
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Receivers added.')),
+      );
+    }
+    return true;
+  }
+
+  void _showAddReceiversDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => _AddReceiversDialog(
+        people: widget.mentionAutocompletePeople,
+        onSubmit: _applyAddedReceivers,
+      ),
+    );
+  }
+
   Future<void> _archiveColleagueTalkingPoint() async {
     if (_saving || !widget.canEdit) return;
     setState(() => _status = ExpectationStatus.finished);
@@ -10940,11 +12487,57 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
     }
   }
 
+  /// Receivers for [syncExpectationCoReceiverMentions] when summary has no leading @.
+  String _expectationMentionSourceLine(String summary) {
+    final parts = <String>[];
+    final seen = <String>{};
+    void addHandle(String? raw) {
+      var t = (raw ?? '').trim();
+      if (t.startsWith('@')) t = t.substring(1);
+      if (t.isEmpty) return;
+      final key = t.toLowerCase();
+      if (!seen.add(key)) return;
+      parts.add('@$t');
+    }
+
+    addHandle(widget.person?.handle);
+    for (final p in widget.receiverPeople) {
+      addHandle(p.handle);
+    }
+    for (final h in widget.talkingPointPersistedMentions) {
+      addHandle(h);
+    }
+    if (parts.isEmpty) return summary;
+    return '${parts.join(' ')} $summary';
+  }
+
   Future<void> _save({bool publish = false}) async {
     if (_saving) return;
+    if (publish &&
+        widget.expectation.type != ExpectationType.expectation) {
+      return;
+    }
     setState(() => _saving = true);
     final client = Supabase.instance.client;
     await _ensureActorContext();
+    if (publish) {
+      final uid = client.auth.currentUser?.id;
+      if (uid == null || widget.expectation.writerUserId != uid) {
+        if (!mounted) return;
+        setState(() => _saving = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Only the author can publish this item.'),
+          ),
+        );
+        return;
+      }
+      if (_savedVisibility != ExpectationVisibility.shadow) {
+        if (!mounted) return;
+        setState(() => _saving = false);
+        return;
+      }
+    }
     final isReceiverActor = _myPersonId != null &&
         (_myPersonId == widget.expectation.personId ||
             widget.coReceiverPersonIds.contains(_myPersonId));
@@ -10978,8 +12571,12 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       'progress': _progress,
       'expectation_visibility': nextVisibility.index,
     };
-    if (publish && widget.expectation.publishedAt == null) {
-      updates['published_at'] = DateTime.now().toUtc().toIso8601String();
+    if (publish) {
+      final now = DateTime.now().toUtc();
+      updates['responsible_updated_at'] = now.toIso8601String();
+      if (widget.expectation.publishedAt == null) {
+        updates['published_at'] = now.toIso8601String();
+      }
     }
     if (clearUpdateRequest) {
       updates['update_requested_at'] = null;
@@ -10993,85 +12590,91 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         await _loadConversation();
         actorReady = _myPersonId != null && _companyId != null;
       }
-      if (actorReady &&
-          _companyId != null &&
-          _myPersonId != null &&
-          changeLogEvents.isNotEmpty) {
-        try {
-          final peopleRows = await client
-              .from('people')
-              .select(
-                'id,created_at,display_name,handle,auth_user_id,email,title',
-              )
-              .eq('company_id', _companyId!);
-          final people = <Person>[];
-          for (final raw in peopleRows as List) {
-            if (raw is! Map) continue;
-            final row = Map<String, dynamic>.from(raw);
-            people.add(
-              Person(
-                id: row['id'] as String,
-                createdAt: DateTime.tryParse(
-                      (row['created_at'] as String?) ?? '',
-                    ) ??
-                    DateTime.now().toUtc(),
-                displayName: ((row['display_name'] as String?) ?? '').trim(),
-                handle: ((row['handle'] as String?) ?? '').trim(),
-                authUserId: (row['auth_user_id'] as String?)?.trim(),
-                email: ((row['email'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['email'] as String?) ?? '').trim(),
-                title: ((row['title'] as String?) ?? '').trim().isEmpty
-                    ? null
-                    : ((row['title'] as String?) ?? '').trim(),
-              ),
-            );
-          }
-          if (widget.expectation.type == ExpectationType.expectation) {
-            final primaryHandle = (widget.person?.handle ?? '').trim();
-            final mentionLine = primaryHandle.isNotEmpty
-                ? '@$primaryHandle $summary'
-                : summary;
-            await syncExpectationCoReceiverMentions(
-              client: client,
-              companyId: _companyId!,
-              expectationId: widget.expectation.id,
-              mentionSourceText: mentionLine,
-              authorPersonId: _myPersonId!,
-              people: people,
-              resolveMe: (_) async {
-                for (final p in people) {
-                  if (p.id == _myPersonId) return p;
-                }
-                return null;
-              },
-              createPlaceholder: (_) async {
-                throw StateError('Unexpected unknown @mention on save');
-              },
-            );
-          } else if (nextVisibility == ExpectationVisibility.echo) {
-            await syncTalkingPointMentions(
-              client: client,
-              companyId: _companyId!,
-              expectationId: widget.expectation.id,
-              summary: summary,
-              authorPersonId: _myPersonId!,
-              people: people,
-              resolveMe: (_) async {
-                for (final p in people) {
-                  if (p.id == _myPersonId) return p;
-                }
-                return null;
-              },
-              createPlaceholder: (_) async {
-                throw StateError('Unexpected unknown @mention on save');
-              },
-              replaceExisting: true,
-            );
-          }
-        } on PostgrestException {
-          // Mentions table / policy not deployed.
-        } catch (_) {}
+      final publishingDraftExpectation = publish &&
+          widget.expectation.type == ExpectationType.expectation &&
+          _savedVisibility == ExpectationVisibility.shadow;
+      if (actorReady && _companyId != null && _myPersonId != null) {
+        final syncExpectationMentions =
+            widget.expectation.type == ExpectationType.expectation &&
+            (publishingDraftExpectation || summaryChanged);
+        final syncTalkingPointMentionsOnSave =
+            widget.expectation.type == ExpectationType.topic &&
+            !publish &&
+            changeLogEvents.isNotEmpty;
+        if (syncExpectationMentions || syncTalkingPointMentionsOnSave) {
+          try {
+            final peopleRows = await client
+                .from('people')
+                .select(
+                  'id,created_at,display_name,handle,auth_user_id,email,title',
+                )
+                .eq('company_id', _companyId!);
+            final people = <Person>[];
+            for (final raw in peopleRows as List) {
+              if (raw is! Map) continue;
+              final row = Map<String, dynamic>.from(raw);
+              people.add(
+                Person(
+                  id: row['id'] as String,
+                  createdAt: DateTime.tryParse(
+                        (row['created_at'] as String?) ?? '',
+                      ) ??
+                      DateTime.now().toUtc(),
+                  displayName: ((row['display_name'] as String?) ?? '').trim(),
+                  handle: ((row['handle'] as String?) ?? '').trim(),
+                  authUserId: (row['auth_user_id'] as String?)?.trim(),
+                  email: ((row['email'] as String?) ?? '').trim().isEmpty
+                      ? null
+                      : ((row['email'] as String?) ?? '').trim(),
+                  title: ((row['title'] as String?) ?? '').trim().isEmpty
+                      ? null
+                      : ((row['title'] as String?) ?? '').trim(),
+                ),
+              );
+            }
+            if (syncExpectationMentions) {
+              await syncExpectationCoReceiverMentions(
+                client: client,
+                companyId: _companyId!,
+                expectationId: widget.expectation.id,
+                mentionSourceText: _expectationMentionSourceLine(summary),
+                authorPersonId: _myPersonId!,
+                people: people,
+                resolveMe: (_) async {
+                  for (final p in people) {
+                    if (p.id == _myPersonId) return p;
+                  }
+                  return null;
+                },
+                createPlaceholder: (_) async {
+                  throw StateError('Unexpected unknown @mention on save');
+                },
+                replaceExisting: true,
+              );
+            } else if (syncTalkingPointMentionsOnSave) {
+              await syncTalkingPointMentions(
+                client: client,
+                companyId: _companyId!,
+                expectationId: widget.expectation.id,
+                summary: _descriptionController.text.trim(),
+                authorPersonId: _myPersonId!,
+                people: people,
+                resolveMe: (_) async {
+                  for (final p in people) {
+                    if (p.id == _myPersonId) return p;
+                  }
+                  return null;
+                },
+                createPlaceholder: (_) async {
+                  throw StateError('Unexpected unknown @mention on save');
+                },
+                replaceExisting: true,
+              );
+            }
+          } on PostgrestException {
+            // Mentions table / policy not deployed.
+          } catch (_) {}
+        }
       }
       if (actorReady && changeLogEvents.isNotEmpty) {
         for (final ev in changeLogEvents) {
@@ -11105,17 +12708,23 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            publish && widget.expectation.type == ExpectationType.topic
-                ? 'Talking point published.'
+            publish
+                ? 'Published — now visible to your receiver.'
                 : 'Expectation saved.',
           ),
         ),
       );
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       setState(() => _saving = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to save expectation changes.')),
+        SnackBar(
+          content: Text(
+            publish
+                ? 'Failed to publish: $e'
+                : 'Failed to save expectation changes.',
+          ),
+        ),
       );
     }
   }
@@ -11596,15 +13205,18 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
         widget.expectation.writerUserId != null &&
         widget.expectation.writerUserId == currentUserId;
     final isDiscussionPoint = _isDiscussionPoint(widget.expectation);
+    final mergedReceiverPeople = _mergedBaseReceiverPeople();
+    final mergedPersistedMentions = _mergedPersistedMentionHandles();
+    final mergedCoReceiverIds = _mergedCoReceiverPersonIds();
     final receiverPeopleById = <String, Person>{
-      for (final p in widget.receiverPeople) p.id: p,
+      for (final p in mergedReceiverPeople) p.id: p,
       if (widget.person != null) widget.person!.id: widget.person!,
     };
     final receiverLabel = isDiscussionPoint
         ? talkingPointMentionWhoLabel(
             widget.expectation.summary,
-            persistedMentionHandles: widget.talkingPointPersistedMentions,
-            persistedMentionPersonIds: widget.coReceiverPersonIds,
+            persistedMentionHandles: mergedPersistedMentions,
+            persistedMentionPersonIds: mergedCoReceiverIds,
             peopleById: receiverPeopleById,
           )
         : expectationReceiverWhoLabel(
@@ -11612,22 +13224,41 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
             personDisplayName: widget.person?.displayName,
             personHandle: widget.person?.handle,
             personId: widget.expectation.personId,
-            persistedMentionHandles: widget.talkingPointPersistedMentions,
+            persistedMentionHandles: mergedPersistedMentions,
+            persistedMentionPersonIds: mergedCoReceiverIds,
+            peopleById: receiverPeopleById,
           );
     final hasReceiver = receiverLabel != kLedgerAllMentionLabel;
-    final inviteRecipients = widget.receiverPeople.isNotEmpty
-        ? widget.receiverPeople
+    final inviteRecipients = mergedReceiverPeople.isNotEmpty
+        ? mergedReceiverPeople
         : [
             if (widget.person != null) widget.person!,
           ];
     final receiversMissingEmail = inviteRecipients
         .where((p) => (p.email ?? '').trim().isEmpty)
         .toList();
+    final isAuthor = widget.expectation.writerUserId != null &&
+        widget.expectation.writerUserId == currentUserId;
+    final showPublishDraftExpectation = !isDiscussionPoint &&
+        isAuthor &&
+        canEdit &&
+        _visibility == ExpectationVisibility.shadow &&
+        _status != ExpectationStatus.finished &&
+        _status != ExpectationStatus.abandoned;
+    final showAddReceivers = isAuthor &&
+        canEdit &&
+        _status != ExpectationStatus.finished &&
+        _status != ExpectationStatus.abandoned;
+    final showToDetailRow =
+        hasReceiver || isDiscussionPoint || (!isDiscussionPoint && showAddReceivers);
     final showInviteForReceivers =
         canEdit && receiversMissingEmail.isNotEmpty;
     final inviteButtonLabel = receiversMissingEmail.length > 1
         ? 'Invite all'
         : 'Invite';
+    final toDisplayText = isDiscussionPoint
+        ? receiverLabel
+        : ledgerAtMentionLine(receiverLabel);
     final working = Expectation(
       id: widget.expectation.id,
       createdAt: widget.expectation.createdAt,
@@ -11688,25 +13319,15 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                         Flexible(
                           child: Text(
                             isDiscussionPoint
-                                ? (_visibility == ExpectationVisibility.shadow
-                                      ? 'Talking point - PERSONAL'
-                                      : 'Talking point')
+                                ? 'Talking point'
                                 : (_visibility == ExpectationVisibility.shadow
-                                      ? 'Expectation Details - PERSONAL'
+                                      ? 'Expectation Details - Draft'
                                       : 'Expectation Details'),
                             style: theme.textTheme.titleLarge?.copyWith(
                               fontWeight: FontWeight.w700,
                             ),
                           ),
                         ),
-                        if (_visibility == ExpectationVisibility.shadow) ...[
-                          const SizedBox(width: 8),
-                          Icon(
-                            Icons.visibility_off_outlined,
-                            size: 18,
-                            color: scheme.onSurfaceVariant,
-                          ),
-                        ],
                       ],
                     ),
                   ),
@@ -11732,7 +13353,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             ? _senderLabel
                             : '@$_senderLabel',
                       ),
-                      if (hasReceiver)
+                      if (showToDetailRow)
                         _DetailRow(
                           label: 'To',
                           valueWidget: Row(
@@ -11740,9 +13361,7 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                             children: [
                               Flexible(
                                 child: Text(
-                                  isDiscussionPoint
-                                      ? receiverLabel
-                                      : ledgerAtMentionLine(receiverLabel),
+                                  toDisplayText,
                                   style: theme.textTheme.bodyMedium?.copyWith(
                                     color: scheme.onSurface,
                                     fontWeight: FontWeight.w600,
@@ -11771,18 +13390,25 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                                       : Text(inviteButtonLabel),
                                 ),
                               ],
+                              if (showAddReceivers) ...[
+                                const SizedBox(width: 4),
+                                TextButton(
+                                  onPressed: (_saving || _deleting)
+                                      ? null
+                                      : _showAddReceiversDialog,
+                                  style: TextButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    minimumSize: const Size(0, 0),
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  child: const Text('Add'),
+                                ),
+                              ],
                             ],
-                          ),
-                        )
-                      else if (isDiscussionPoint)
-                        _DetailRow(
-                          label: 'To',
-                          value: talkingPointMentionWhoLabel(
-                            widget.expectation.summary,
-                            persistedMentionHandles:
-                                widget.talkingPointPersistedMentions,
-                            persistedMentionPersonIds: widget.coReceiverPersonIds,
-                            peopleById: receiverPeopleById,
                           ),
                         ),
                       if (widget.expectation.seenAt != null)
@@ -12204,26 +13830,34 @@ class _ExpectationDetailsPanelState extends State<_ExpectationDetailsPanel> {
                           : _save,
                       child: const Text('Save'),
                     ),
-                    const SizedBox(width: 8),
-                    if (canEdit && !_editingDescription) ...[
-                      if (_isColleagueTalkingPoint) ...[
-                        if (_visibility == ExpectationVisibility.shadow &&
-                            _status != ExpectationStatus.finished &&
-                            _status != ExpectationStatus.abandoned)
-                          FilledButton(
-                            onPressed: (_saving || _deleting)
-                                ? null
-                                : _archiveColleagueTalkingPoint,
-                            child: const Text('Archive'),
-                          ),
-                      ] else if (_visibility == ExpectationVisibility.shadow)
-                        FilledButton(
-                          onPressed: (_saving || _deleting)
-                              ? null
-                              : () => _save(publish: true),
-                          child: const Text('Publish'),
-                        ),
+                    if (showPublishDraftExpectation) ...[
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: (_saving || _deleting || _editingDescription)
+                            ? null
+                            : () => _save(publish: true),
+                        child: _saving
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Text('Publish'),
+                      ),
                     ],
+                    const SizedBox(width: 8),
+                    if (canEdit &&
+                        !_editingDescription &&
+                        _isColleagueTalkingPoint &&
+                        _visibility == ExpectationVisibility.shadow &&
+                        _status != ExpectationStatus.finished &&
+                        _status != ExpectationStatus.abandoned)
+                      FilledButton(
+                        onPressed: (_saving || _deleting)
+                            ? null
+                            : _archiveColleagueTalkingPoint,
+                        child: const Text('Archive'),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 15),

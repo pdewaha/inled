@@ -4,6 +4,7 @@ import 'package:exled/models/expectation_type.dart';
 import 'package:exled/services/expectation_chat_changelog.dart';
 
 /// One row to insert after a successful expectation save (structured or plain).
+/// Structured types include 10–16 ([kExpectationMessageTypeChangelogReceiversAdded]).
 class ChangelogSaveEvent {
   const ChangelogSaveEvent({
     required this.type,
@@ -60,6 +61,22 @@ String encodeChangelogPayloadPublished({required bool isTopic}) =>
 
 String encodeChangelogPayloadUpdateRequested({required bool isTopic}) =>
     _json({'kind': 'update_requested', 'isTopic': isTopic});
+
+/// Receivers appended from the expectation / talking-point detail sheet (handles without `@`).
+String encodeChangelogPayloadReceiversAdded({
+  required bool isTopic,
+  required List<String> handles,
+}) {
+  final cleaned = <String>[];
+  final seen = <String>{};
+  for (final raw in handles) {
+    var h = raw.trim();
+    if (h.startsWith('@')) h = h.substring(1);
+    if (h.isEmpty) continue;
+    if (seen.add(h.toLowerCase())) cleaned.add(h);
+  }
+  return _json({'kind': 'receivers_added', 'isTopic': isTopic, 'handles': cleaned});
+}
 
 /// Progress-only change (explicit [pct]; avoids empty `fields` payloads in edge cases).
 String encodeChangelogPayloadProgress({
@@ -176,6 +193,22 @@ String expectationChangelogActivityFeedLine({
       return 'Published this ${_noun(isTopic)}.';
     case 'update_requested':
       return 'Requested an update -consider updating progress, deadline or status.';
+    case 'receivers_added':
+      final raw = parsed['handles'];
+      final hs = <String>[];
+      if (raw is List) {
+        for (final e in raw) {
+          if (e is String && e.trim().isNotEmpty) hs.add(e.trim());
+        }
+      }
+      if (hs.isEmpty) return 'Added receiver(s).';
+      final parts = hs
+          .map((h) {
+            final t = h.trim();
+            return t.startsWith('@') ? t : '@$t';
+          })
+          .join(', ');
+      return 'Added $parts.';
     case 'progress':
       final p = changelogProgressPctFromJson(parsed['pct']);
       if (p == null) return 'Changed progress.';

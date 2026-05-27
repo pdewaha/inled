@@ -55,13 +55,12 @@ bool expectationIsPartyForPerson({
   Set<String>? coReceiverPersonIds,
 }) {
   if (e.writerUserId == authUserId) return true;
-  final target = e.personId.trim();
-  if (target.isNotEmpty && target == myPersonId) return true;
-  // Shadow talking points: co-@mentions are not party until publish (echo).
-  if (e.type == ExpectationType.topic &&
-      e.visibility == ExpectationVisibility.shadow) {
+  // Shadow (private/draft): addressees and @mentions are not party until publish (echo).
+  if (e.visibility == ExpectationVisibility.shadow) {
     return false;
   }
+  final target = e.personId.trim();
+  if (target.isNotEmpty && target == myPersonId) return true;
   if (coReceiverPersonIds != null && coReceiverPersonIds.contains(myPersonId)) {
     return true;
   }
@@ -119,9 +118,98 @@ String activityFeedEllipsis(String input, int maxChars) {
 String _kindLabel(ExpectationType type) =>
     type == ExpectationType.topic ? 'Talking point' : 'Expectation';
 
-/// Hides noise in activity / unread: never surface your own changelog rows, and never
-/// show the initial "… created a new …" line back to the expectation author (even if
-/// [sender_person_id] were wrong in legacy rows).
+/// True when a changelog row is the initial "Created a new …" line (plain or legacy text).
+bool activityFeedMessageIsInitialCreate({
+  required int messageType,
+  required String messageText,
+  required ExpectationType expectationType,
+}) {
+  if (!expectationMessageTypeIsChangelog(messageType)) return false;
+  final line = expectationChangelogActivityFeedLine(
+    messageType: messageType,
+    messageText: messageText,
+    expectationType: expectationType,
+  );
+  final lower = line.toLowerCase();
+  return lower.contains('created a new expectation') ||
+      lower.contains('created a new talking point');
+}
+
+/// True when changelog is "Published this expectation" (mention row covers receivers).
+bool activityFeedMessageIsExpectationPublished({
+  required int messageType,
+  required String messageText,
+  required ExpectationType expectationType,
+}) {
+  if (expectationType == ExpectationType.topic) return false;
+  if (!expectationMessageTypeIsChangelog(messageType)) return false;
+  if (messageType == kExpectationMessageTypeChangelogPublished) return true;
+  final line = expectationChangelogActivityFeedLine(
+    messageType: messageType,
+    messageText: messageText,
+    expectationType: expectationType,
+  );
+  return line.toLowerCase().contains('published this expectation');
+}
+
+bool _feedLineIsReceiverRedundantChangelog(String displayLine) {
+  final lower = displayLine.toLowerCase();
+  return lower.contains('created a new expectation') ||
+      lower.contains('created a new talking point') ||
+      lower.contains('published this expectation');
+}
+
+bool _readerIsExpectationReceiver({
+  required Expectation expectation,
+  required String readerPersonId,
+  required Set<String> mentionExpectationIds,
+}) {
+  if (expectation.type == ExpectationType.topic) return false;
+  if (expectation.personId.trim() == readerPersonId) return true;
+  return mentionExpectationIds.contains(expectation.id);
+}
+
+/// Loads expectation ids where [readerPersonId] has an expectation_mentions row.
+Future<Set<String>> expectationIdsWhereReaderIsMentioned({
+  required SupabaseClient client,
+  required String companyId,
+  required String readerPersonId,
+}) async {
+  try {
+    final rows = await client
+        .from('expectation_mentions')
+        .select('expectation_id')
+        .eq('company_id', companyId)
+        .eq('mentioned_person_id', readerPersonId);
+    final out = <String>{};
+    for (final raw in rows as List) {
+      if (raw is! Map) continue;
+      final id = (raw['expectation_id'] as String?)?.trim() ?? '';
+      if (id.isNotEmpty) out.add(id);
+    }
+    return out;
+  } on PostgrestException {
+    return {};
+  }
+}
+
+/// Bell list: receivers keep mention rows; drop matching create/publish changelog duplicates.
+List<ExpectationActivityFeedItem> mergeActivityFeedChangelogAndMentions({
+  required List<ExpectationActivityFeedItem> changelog,
+  required List<ExpectationActivityFeedItem> mentions,
+}) {
+  final mentionExpectationIds = {for (final m in mentions) m.expectationId};
+  final filteredChangelog = changelog.where((item) {
+    if (!mentionExpectationIds.contains(item.expectationId)) return true;
+    return !_feedLineIsReceiverRedundantChangelog(item.messageText);
+  }).toList();
+  final merged = [...filteredChangelog, ...mentions]
+    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  return merged;
+}
+
+/// Hides noise in activity / unread: never surface your own changelog rows, and hide
+/// create/publish handoff lines from receivers (mention row is the notification).
 bool shouldSuppressChangelogForActivityViewer({
   required Expectation? expectation,
   required String authUserId,
@@ -129,24 +217,41 @@ bool shouldSuppressChangelogForActivityViewer({
   required String? senderPersonId,
   required String messageText,
   required int messageType,
+  Set<String> mentionExpectationIds = const {},
 }) {
   if (expectation == null) return true;
   if (senderPersonId != null && senderPersonId == readerPersonId) {
     return true;
   }
-  if (expectation.writerUserId == authUserId) {
-    if (messageType != kExpectationMessageTypeChangelogPlain) return false;
-    final lower = messageText.toLowerCase();
-    // Legacy copy had a leading name; new copy is impersonal ("Created a new …").
-    if (lower.contains('created a new expectation') ||
-        lower.contains('created a new talking point')) {
+  final isAuthor =
+      expectation.writerUserId != null &&
+      expectation.writerUserId == authUserId;
+  if (!isAuthor &&
+      _readerIsExpectationReceiver(
+        expectation: expectation,
+        readerPersonId: readerPersonId,
+        mentionExpectationIds: mentionExpectationIds,
+      )) {
+    if (activityFeedMessageIsInitialCreate(
+      messageType: messageType,
+      messageText: messageText,
+      expectationType: expectation.type,
+    )) {
+      return true;
+    }
+    if (activityFeedMessageIsExpectationPublished(
+      messageType: messageType,
+      messageText: messageText,
+      expectationType: expectation.type,
+    )) {
       return true;
     }
   }
   return false;
 }
 
-/// Sets [last_read_at] to the latest changelog timestamp on this expectation (or now if none).
+/// Sets [last_read_at] to the latest activity timestamp for this expectation (changelog
+/// and @mention rows for [readerPersonId]), or now when there is none.
 /// Returns false if the upsert failed (e.g. RLS / missing table).
 Future<bool> syncExpectationChangelogReadWatermark({
   required SupabaseClient client,
@@ -154,19 +259,45 @@ Future<bool> syncExpectationChangelogReadWatermark({
   required String expectationId,
   required String readerPersonId,
 }) async {
-  final rows = await client
+  var watermark = DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+
+  void bumpWatermark(DateTime? candidate) {
+    if (candidate == null) return;
+    final u = candidate.toUtc();
+    if (u.isAfter(watermark)) watermark = u;
+  }
+
+  final changelogRows = await client
       .from('expectation_messages')
       .select('created_at')
       .eq('expectation_id', expectationId)
       .not('type', 'in', expectationMessageTypeChatRowsForPostgrestNotIn())
       .order('created_at', ascending: false)
       .limit(1);
-  DateTime watermark;
-  if ((rows as List).isEmpty) {
+  if ((changelogRows as List).isNotEmpty) {
+    final raw = (changelogRows.first as Map)['created_at'] as String?;
+    bumpWatermark(DateTime.tryParse(raw ?? ''));
+  }
+
+  try {
+    final mentionRows = await client
+        .from('expectation_mentions')
+        .select('created_at')
+        .eq('company_id', companyId)
+        .eq('expectation_id', expectationId)
+        .eq('mentioned_person_id', readerPersonId)
+        .order('created_at', ascending: false)
+        .limit(1);
+    if ((mentionRows as List).isNotEmpty) {
+      final raw = (mentionRows.first as Map)['created_at'] as String?;
+      bumpWatermark(DateTime.tryParse(raw ?? ''));
+    }
+  } on PostgrestException {
+    // Mentions table / policy not deployed yet.
+  }
+
+  if (!watermark.isAfter(DateTime.fromMillisecondsSinceEpoch(0, isUtc: true))) {
     watermark = DateTime.now().toUtc();
-  } else {
-    final raw = (rows.first as Map)['created_at'] as String?;
-    watermark = DateTime.tryParse(raw ?? '')?.toUtc() ?? DateTime.now().toUtc();
   }
   try {
     await client.from('expectation_changelog_reads').upsert(
@@ -186,7 +317,7 @@ Future<bool> syncExpectationChangelogReadWatermark({
   }
 }
 
-/// Result of scanning changelog messages vs read watermarks for party expectations.
+/// Result of scanning activity (changelog + @mention rows) vs read watermarks.
 class ChangelogUnreadPartySnapshot {
   const ChangelogUnreadPartySnapshot({
     required this.unreadMessageCount,
@@ -196,26 +327,37 @@ class ChangelogUnreadPartySnapshot {
   /// Rows counted for the activity bell badge (can be > distinct expectations).
   final int unreadMessageCount;
 
-  /// Expectations that have at least one unread changelog row for this reader.
+  /// Expectations with unread activity for this reader.
   final Set<String> expectationIdsWithAnyUnread;
 }
 
-/// Changelog rows from others after your last read watermark count as unread.
+Map<String, dynamic>? _embeddedRowFromJoin(dynamic value) {
+  if (value is Map<String, dynamic>) return value;
+  if (value is Map) return Map<String, dynamic>.from(value);
+  if (value is List && value.isNotEmpty) {
+    final first = value.first;
+    if (first is Map<String, dynamic>) return first;
+    if (first is Map) return Map<String, dynamic>.from(first);
+  }
+  return null;
+}
+
+/// Changelog + mention rows after [expectation_changelog_reads] watermarks count as unread.
 Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
   required SupabaseClient client,
   required String companyId,
   required String authUserId,
   required String readerPersonId,
   required List<Expectation> partyExpectations,
+  Set<String> bellClearedExpectationIds = const {},
 }) async {
-  if (partyExpectations.isEmpty) {
-    return ChangelogUnreadPartySnapshot(
-      unreadMessageCount: 0,
-      expectationIdsWithAnyUnread: {},
-    );
-  }
   final expSet = partyExpectations.map((e) => e.id).toSet();
   final expById = {for (final e in partyExpectations) e.id: e};
+  final mentionExpectationIds = await expectationIdsWhereReaderIsMentioned(
+    client: client,
+    companyId: companyId,
+    readerPersonId: readerPersonId,
+  );
   Map<String, DateTime> readMap = {};
   try {
     final readRows = await client
@@ -227,7 +369,7 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
       final m = r as Map<String, dynamic>;
       final id = m['expectation_id'] as String?;
       final raw = m['last_read_at'] as String?;
-      if (id == null || raw == null || !expSet.contains(id)) continue;
+      if (id == null || raw == null) continue;
       readMap[id] =
           DateTime.tryParse(raw)?.toUtc() ?? DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
     }
@@ -235,7 +377,7 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
     readMap = {};
   }
 
-  List<dynamic> msgRows;
+  List<dynamic> msgRows = [];
   try {
     msgRows = await client
         .from('expectation_messages')
@@ -245,13 +387,9 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
         .order('created_at', ascending: false)
         .limit(500) as List<dynamic>;
   } on PostgrestException {
-    return ChangelogUnreadPartySnapshot(
-      unreadMessageCount: 0,
-      expectationIdsWithAnyUnread: {},
-    );
+    msgRows = [];
   }
 
-  var n = 0;
   final expUnread = <String>{};
   final epoch = DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
   for (final row in msgRows) {
@@ -271,6 +409,7 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
           senderPersonId: sender,
           messageText: text,
           messageType: msgType,
+          mentionExpectationIds: mentionExpectationIds,
         )) {
       continue;
     }
@@ -279,12 +418,48 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
     final created = DateTime.tryParse(raw)?.toUtc() ?? epoch;
     final lastRead = readMap[expId] ?? epoch;
     if (created.isAfter(lastRead)) {
-      n++;
       expUnread.add(expId);
     }
   }
+
+  try {
+    final mentionRows = await client
+        .from('expectation_mentions')
+        .select(
+          'created_at,expectation_id,'
+          'expectations!inner(expectation_visibility,expectation_type,writer_user_id)',
+        )
+        .eq('company_id', companyId)
+        .eq('mentioned_person_id', readerPersonId)
+        .order('created_at', ascending: false)
+        .limit(200) as List<dynamic>;
+    for (final row in mentionRows) {
+      if (row is! Map<String, dynamic>) continue;
+      final expId = row['expectation_id'] as String?;
+      if (expId == null || bellClearedExpectationIds.contains(expId)) continue;
+      final embedded = _embeddedRowFromJoin(row['expectations']);
+      if (embedded == null) continue;
+      final visIdx = embedded['expectation_visibility'];
+      final visibility = visIdx is int
+          ? visIdx
+          : (visIdx is num ? visIdx.toInt() : int.tryParse('$visIdx'));
+      if (visibility == ExpectationVisibility.shadow.index) continue;
+      if (visibility != ExpectationVisibility.echo.index) continue;
+      final raw = row['created_at'] as String?;
+      if (raw == null) continue;
+      final created = DateTime.tryParse(raw)?.toUtc() ?? epoch;
+      final lastRead = readMap[expId] ?? epoch;
+      if (created.isAfter(lastRead)) {
+        expUnread.add(expId);
+      }
+    }
+  } on PostgrestException {
+    // Table / policy not deployed yet.
+  }
+
+  // Bell badge: distinct expectations with unread activity (not per changelog row).
   return ChangelogUnreadPartySnapshot(
-    unreadMessageCount: n,
+    unreadMessageCount: expUnread.length,
     expectationIdsWithAnyUnread: expUnread,
   );
 }
@@ -317,6 +492,11 @@ Future<List<ExpectationActivityFeedItem>> loadChangelogActivityFeed({
 }) async {
   if (partyExpectations.isEmpty) return [];
   final byId = {for (final e in partyExpectations) e.id: e};
+  final mentionExpectationIds = await expectationIdsWhereReaderIsMentioned(
+    client: client,
+    companyId: companyId,
+    readerPersonId: readerPersonId,
+  );
   List<dynamic> rows;
   try {
     rows = await client
@@ -358,6 +538,7 @@ Future<List<ExpectationActivityFeedItem>> loadChangelogActivityFeed({
           senderPersonId: senderId.isEmpty ? null : senderId,
           messageText: text,
           messageType: msgType,
+          mentionExpectationIds: mentionExpectationIds,
         )) {
       continue;
     }

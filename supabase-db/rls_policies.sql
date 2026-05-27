@@ -58,6 +58,54 @@ GRANT EXECUTE ON FUNCTION public.inled_user_company_ids() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.inled_user_person_ids() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.inled_jwt_email_domain() TO authenticated;
 
+CREATE OR REPLACE FUNCTION public.inled_jwt_email_normalized()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT lower(trim(coalesce(nullif(trim(auth.jwt() ->> 'email'), ''), '')));
+$$;
+
+REVOKE ALL ON FUNCTION public.inled_jwt_email_normalized() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.inled_jwt_email_normalized() TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.inled_expectation_reader_may_select(
+  p_expectation_id uuid,
+  p_company_id uuid,
+  p_writer_user_id uuid,
+  p_expectation_visibility integer,
+  p_target_person_id uuid
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT
+    p_company_id IN (SELECT public.inled_user_company_ids())
+    AND (
+      p_writer_user_id = auth.uid()
+      OR (
+        p_expectation_visibility = 1
+        AND (
+          p_target_person_id IN (SELECT public.inled_user_person_ids())
+          OR EXISTS (
+            SELECT 1
+            FROM expectation_mentions em
+            WHERE em.expectation_id = p_expectation_id
+              AND em.mentioned_person_id IN (SELECT public.inled_user_person_ids())
+          )
+        )
+      )
+    );
+$$;
+
+REVOKE ALL ON FUNCTION public.inled_expectation_reader_may_select(uuid, uuid, uuid, integer, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.inled_expectation_reader_may_select(uuid, uuid, uuid, integer, uuid) TO authenticated;
+
 -- ---------------------------------------------------------------------------
 -- Enable RLS
 -- ---------------------------------------------------------------------------
@@ -116,6 +164,20 @@ CREATE POLICY inled_people_select ON people
   USING (
     company_id IN (SELECT public.inled_user_company_ids())
     OR auth_user_id = auth.uid()
+    OR (
+      auth_user_id IS NULL
+      AND nullif(trim(lower(coalesce(email, ''))), '') =
+          nullif(public.inled_jwt_email_normalized(), '')
+      AND public.inled_jwt_email_normalized() <> ''
+      AND EXISTS (
+        SELECT 1
+        FROM companies c
+        WHERE c.id = company_id
+          AND c.domain IS NOT NULL
+          AND lower(c.domain) = public.inled_jwt_email_domain()
+          AND public.inled_jwt_email_domain() <> ''
+      )
+    )
   );
 
 DROP POLICY IF EXISTS inled_people_insert ON people;
@@ -148,8 +210,155 @@ DROP POLICY IF EXISTS inled_people_update ON people;
 CREATE POLICY inled_people_update ON people
   FOR UPDATE
   TO authenticated
-  USING (company_id IN (SELECT public.inled_user_company_ids()))
-  WITH CHECK (company_id IN (SELECT public.inled_user_company_ids()));
+  USING (
+    company_id IN (SELECT public.inled_user_company_ids())
+    OR (
+      auth_user_id IS NULL
+      AND nullif(trim(lower(coalesce(email, ''))), '') =
+          nullif(public.inled_jwt_email_normalized(), '')
+      AND public.inled_jwt_email_normalized() <> ''
+      AND EXISTS (
+        SELECT 1
+        FROM companies c
+        WHERE c.id = company_id
+          AND c.domain IS NOT NULL
+          AND lower(c.domain) = public.inled_jwt_email_domain()
+          AND public.inled_jwt_email_domain() <> ''
+      )
+    )
+  )
+  WITH CHECK (
+    company_id IN (SELECT public.inled_user_company_ids())
+    OR (
+      auth_user_id = auth.uid()
+      AND EXISTS (
+        SELECT 1
+        FROM companies c
+        WHERE c.id = company_id
+          AND c.domain IS NOT NULL
+          AND lower(c.domain) = public.inled_jwt_email_domain()
+          AND public.inled_jwt_email_domain() <> ''
+      )
+    )
+  );
+
+-- Domain join / invite claim (bypasses RLS; see migrations 023 / 024).
+CREATE OR REPLACE FUNCTION public.inled_claim_person_for_domain_join(
+  p_company_id uuid,
+  p_title text DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+SET row_security = off
+AS $$
+DECLARE
+  v_uid uuid;
+  v_email text;
+  v_domain text;
+  v_company_domain text;
+  v_local text;
+  v_display text;
+  v_handle text;
+  pid uuid;
+BEGIN
+  v_uid := auth.uid();
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not authenticated' USING ERRCODE = '28000';
+  END IF;
+
+  v_email := lower(trim(coalesce(nullif(trim(auth.jwt() ->> 'email'), ''), '')));
+  IF v_email = '' OR position('@' IN v_email) = 0 THEN
+    RAISE EXCEPTION 'jwt has no email' USING ERRCODE = '28000';
+  END IF;
+
+  v_domain := lower(split_part(v_email, '@', 2));
+
+  SELECT lower(trim(c.domain))
+  INTO v_company_domain
+  FROM companies c
+  WHERE c.id = p_company_id;
+
+  IF v_company_domain IS NULL OR v_company_domain = '' THEN
+    RAISE EXCEPTION 'company has no domain' USING ERRCODE = '28000';
+  END IF;
+
+  IF v_company_domain <> v_domain THEN
+    RAISE EXCEPTION 'email domain does not match company domain' USING ERRCODE = '28000';
+  END IF;
+
+  UPDATE people
+  SET
+    auth_user_id = v_uid,
+    updated_at = now(),
+    title = COALESCE(NULLIF(trim(p_title), ''), title)
+  WHERE company_id = p_company_id
+    AND lower(trim(coalesce(email, ''))) = v_email
+    AND (auth_user_id IS NULL OR auth_user_id = v_uid)
+  RETURNING id INTO pid;
+
+  IF pid IS NOT NULL THEN
+    RETURN pid;
+  END IF;
+
+  v_local := split_part(v_email, '@', 1);
+  IF length(v_local) = 0 THEN
+    v_display := v_email;
+  ELSE
+    v_display := upper(substr(v_local, 1, 1)) || substr(v_local, 2);
+  END IF;
+
+  v_handle := lower(regexp_replace(v_local, '[^a-zA-Z0-9._-]', '', 'g'));
+  IF v_handle IS NULL OR v_handle = '' THEN
+    v_handle := 'user';
+  END IF;
+
+  INSERT INTO people (
+    company_id,
+    email,
+    display_name,
+    handle,
+    title,
+    auth_user_id,
+    role,
+    status
+  )
+  VALUES (
+    p_company_id,
+    v_email,
+    v_display,
+    v_handle,
+    nullif(trim(p_title), ''),
+    v_uid,
+    0,
+    1
+  )
+  RETURNING id INTO pid;
+
+  RETURN pid;
+
+EXCEPTION
+  WHEN unique_violation THEN
+    UPDATE people
+    SET
+      auth_user_id = v_uid,
+      updated_at = now(),
+      title = COALESCE(NULLIF(trim(p_title), ''), title)
+    WHERE company_id = p_company_id
+      AND lower(trim(coalesce(email, ''))) = v_email
+      AND (auth_user_id IS NULL OR auth_user_id = v_uid)
+    RETURNING id INTO pid;
+
+    IF pid IS NOT NULL THEN
+      RETURN pid;
+    END IF;
+    RAISE;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.inled_claim_person_for_domain_join(uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.inled_claim_person_for_domain_join(uuid, text) TO authenticated;
 
 -- ---------------------------------------------------------------------------
 -- invites
@@ -191,7 +400,15 @@ DROP POLICY IF EXISTS inled_expectations_select ON expectations;
 CREATE POLICY inled_expectations_select ON expectations
   FOR SELECT
   TO authenticated
-  USING (company_id IN (SELECT public.inled_user_company_ids()));
+  USING (
+    public.inled_expectation_reader_may_select(
+      id,
+      company_id,
+      writer_user_id,
+      expectation_visibility,
+      target_person_id
+    )
+  );
 
 DROP POLICY IF EXISTS inled_expectations_insert ON expectations;
 CREATE POLICY inled_expectations_insert ON expectations
@@ -260,7 +477,13 @@ CREATE POLICY inled_expectation_tag_links_select ON expectation_tag_links
       SELECT 1
       FROM expectations e
       WHERE e.id = expectation_id
-        AND e.company_id IN (SELECT public.inled_user_company_ids())
+        AND public.inled_expectation_reader_may_select(
+          e.id,
+          e.company_id,
+          e.writer_user_id,
+          e.expectation_visibility,
+          e.target_person_id
+        )
     )
   );
 
@@ -304,7 +527,20 @@ DROP POLICY IF EXISTS inled_expectation_events_select ON expectation_events;
 CREATE POLICY inled_expectation_events_select ON expectation_events
   FOR SELECT
   TO authenticated
-  USING (company_id IN (SELECT public.inled_user_company_ids()));
+  USING (
+    EXISTS (
+      SELECT 1
+      FROM expectations e
+      WHERE e.id = expectation_id
+        AND public.inled_expectation_reader_may_select(
+          e.id,
+          e.company_id,
+          e.writer_user_id,
+          e.expectation_visibility,
+          e.target_person_id
+        )
+    )
+  );
 
 DROP POLICY IF EXISTS inled_expectation_events_insert ON expectation_events;
 CREATE POLICY inled_expectation_events_insert ON expectation_events
@@ -342,7 +578,20 @@ DROP POLICY IF EXISTS inled_expectation_messages_select ON expectation_messages;
 CREATE POLICY inled_expectation_messages_select ON expectation_messages
   FOR SELECT
   TO authenticated
-  USING (company_id IN (SELECT public.inled_user_company_ids()));
+  USING (
+    EXISTS (
+      SELECT 1
+      FROM expectations e
+      WHERE e.id = expectation_id
+        AND public.inled_expectation_reader_may_select(
+          e.id,
+          e.company_id,
+          e.writer_user_id,
+          e.expectation_visibility,
+          e.target_person_id
+        )
+    )
+  );
 
 DROP POLICY IF EXISTS inled_expectation_messages_insert ON expectation_messages;
 CREATE POLICY inled_expectation_messages_insert ON expectation_messages
@@ -499,7 +748,21 @@ DROP POLICY IF EXISTS inled_expectation_mentions_select ON expectation_mentions;
 CREATE POLICY inled_expectation_mentions_select ON expectation_mentions
   FOR SELECT
   TO authenticated
-  USING (company_id IN (SELECT public.inled_user_company_ids()));
+  USING (
+    EXISTS (
+      SELECT 1
+      FROM expectations e
+      WHERE e.id = expectation_id
+        AND e.company_id = company_id
+        AND public.inled_expectation_reader_may_select(
+          e.id,
+          e.company_id,
+          e.writer_user_id,
+          e.expectation_visibility,
+          e.target_person_id
+        )
+    )
+  );
 
 DROP POLICY IF EXISTS inled_expectation_mentions_insert ON expectation_mentions;
 CREATE POLICY inled_expectation_mentions_insert ON expectation_mentions
