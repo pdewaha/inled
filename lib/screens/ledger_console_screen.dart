@@ -1231,7 +1231,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           .from('people')
           .select('id,company_id,display_name,handle,email,title')
           .eq('auth_user_id', user.id)
-          .limit(1);
+          .limit(1)
+          .timeout(const Duration(seconds: 12));
       if ((meRows as List).isEmpty) {
         if (!mounted) return;
         setState(() {
@@ -1443,7 +1444,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
           .from('people')
           .select('id,company_id')
           .eq('auth_user_id', user.id)
-          .limit(1);
+          .limit(1)
+          .timeout(const Duration(seconds: 12));
       if ((meRows as List).isEmpty) {
         if (!mounted) return;
         setState(() {
@@ -1460,7 +1462,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             'id,created_at,writer_user_id,target_person_id,summary,deadline_label,deadline_at,finished_at,responsible_updated_at,published_at,seen_at,last_chatted_sender_at,last_chatted_receiver_at,update_requested_at,progress,expectation_status,expectation_health,expectation_visibility,expectation_type',
           )
           .eq('company_id', companyId)
-          .order('created_at', ascending: false);
+          .order('created_at', ascending: false)
+          .timeout(const Duration(seconds: 12));
 
       final mapped = <Expectation>[];
       for (final raw in rows as List) {
