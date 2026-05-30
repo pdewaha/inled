@@ -60,7 +60,7 @@ class LedgerConsoleScreen extends StatefulWidget {
 class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   static const _composerDefaultMode = _ComposerEntryMode.topic;
   final _captureController = TextEditingController();
-  final _captureFocus = FocusNode();
+  late final FocusNode _captureFocus;
   /// Save-action row (Home kind row / Add topic / Add expectation): Tab order field ? A ? B.
   final _composerSavePairFocusA = FocusNode(debugLabel: 'composerSaveA');
   final _composerSavePairFocusB = FocusNode(debugLabel: 'composerSaveB');
@@ -147,6 +147,10 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   List<String> _tagInlineCandidates = [];
   /// Keyboard cycle index when [_mentionInlineCandidates] or [_tagInlineCandidates] has >1 item.
   int _composerPickIndex = 0;
+  /// Tab can reach us via both [HardwareKeyboard] (addHandler) and the focus-tree
+  /// [FocusNode.onKeyEvent], which deliver the *same* [KeyEvent] instance. Track the
+  /// last one we acted on so a single press advances the pick index exactly once.
+  KeyEvent? _composerTabHandledEvent;
   String? _activeTagQuery;
   int? _activeTagStart;
   int? _activeTagEnd;
@@ -1175,6 +1179,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
   @override
   void initState() {
     super.initState();
+    _captureFocus = FocusNode(onKeyEvent: _onCaptureFocusKeyEvent);
     _homeComposerSaveRowListenable = Listenable.merge([
       _captureController,
       _homeComposerUiRevision,
@@ -1710,8 +1715,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     if (!_focusInComposerSaveCycleGroup()) {
       return KeyEventResult.ignored;
     }
-    if (_composerHasMultiTokenPick() && _captureFocus.hasFocus) {
-      _onComposerTabPressed();
+    if (_composerHasActiveTokenPick() && _captureFocus.hasFocus) {
+      _handleComposerTabEvent(event);
       return KeyEventResult.handled;
     }
     _cycleComposerSaveFocus(forward: !_shiftDown());
@@ -1720,6 +1725,13 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
 
   bool _onHardwareKey(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
+
+    if (event.logicalKey == LogicalKeyboardKey.tab &&
+        _composerHasActiveTokenPick() &&
+        (_captureFocus.hasFocus || _typingInEditableText())) {
+      _handleComposerTabEvent(event);
+      return true;
+    }
 
     if (event.logicalKey == LogicalKeyboardKey.keyQ &&
         !_shiftDown() &&
@@ -1805,6 +1817,19 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     return false;
   }
 
+  /// Tab while @/# autocomplete is open — the [TextField] eats Tab before parent handlers.
+  KeyEventResult _onCaptureFocusKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.tab) {
+      return KeyEventResult.ignored;
+    }
+    if (!_composerHasActiveTokenPick()) {
+      return KeyEventResult.ignored;
+    }
+    _handleComposerTabEvent(event);
+    return KeyEventResult.handled;
+  }
+
   void _confirmInlineComposerPick() {
     if (_mentionInlineCandidates.length > 1) {
       final p = _mentionInlineCandidates[
@@ -1827,6 +1852,15 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
     }
   }
 
+  /// Single entry point for a Tab press while a token pick is active. De-duplicates
+  /// the same physical press arriving through both the hardware-keyboard handler and
+  /// the focus-tree key handler (otherwise the pick index would advance twice).
+  void _handleComposerTabEvent(KeyEvent event) {
+    if (identical(event, _composerTabHandledEvent)) return;
+    _composerTabHandledEvent = event;
+    _onComposerTabPressed();
+  }
+
   void _onComposerTabPressed() {
     if (!_captureFocus.hasFocus) return;
     final reverse = _shiftDown();
@@ -1838,6 +1872,8 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             ? (_composerPickIndex - 1 + n) % n
             : (_composerPickIndex + 1) % n;
       });
+      // Quick Capture dialog rebuilds via [_homeComposerSaveRowListenable], not setState.
+      _homeComposerUiRevision.value++;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _captureFocus.requestFocus();
       });
@@ -1850,6 +1886,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
             ? (_composerPickIndex - 1 + n) % n
             : (_composerPickIndex + 1) % n;
       });
+      _homeComposerUiRevision.value++;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _captureFocus.requestFocus();
       });
@@ -2159,6 +2196,7 @@ class _LedgerConsoleScreenState extends State<LedgerConsoleScreen> {
         suggestionsPanel: _composerTokenSuggestionsPanel(theme, scheme),
         inlinePickActive: _composerHasActiveTokenPick(),
         onInlinePickConfirm: _confirmInlineComposerPick,
+        onInlinePickTab: _onComposerTabPressed,
         refocusRequestToken:
             _pillar == LedgerPillar.home ? _homeCaptureRefocusToken : null,
       ),

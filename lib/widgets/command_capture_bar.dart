@@ -12,6 +12,7 @@ class CommandCaptureBar extends StatefulWidget {
     this.suggestionsPanel,
     this.inlinePickActive = false,
     this.onInlinePickConfirm,
+    this.onInlinePickTab,
     /// When non-null and increases (Home reset), request focus after this bar is mounted.
     this.refocusRequestToken,
   });
@@ -27,6 +28,8 @@ class CommandCaptureBar extends StatefulWidget {
   /// When true, Enter is handled here so it cannot insert a newline and dismiss @/# completion.
   final bool inlinePickActive;
   final VoidCallback? onInlinePickConfirm;
+  /// Tab / Shift+Tab while [inlinePickActive]: cycle multi-match chips or insert unique pick.
+  final VoidCallback? onInlinePickTab;
 
   @override
   State<CommandCaptureBar> createState() => _CommandCaptureBarState();
@@ -78,14 +81,20 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
 
   void _onFocusChange() => setState(() {});
 
-  Widget _buildTextField(ColorScheme scheme, {required bool isLight}) {
-    // Always wrap with [CallbackShortcuts] so the tree shape does not flip when
-    // [inlinePickActive] toggles (that swap used to drop TextField focus on the
-    // first @/# character that opened multi-match mode).
+  Widget _buildTextField(BuildContext context, ColorScheme scheme, {required bool isLight}) {
+    // Same pattern as Add receivers dialog: CallbackShortcuts on the TextField for
+    // Enter and Tab while @/# autocomplete is open (Actions/NextFocusIntent never
+    // sees Tab from an EditableText).
     final bindings = <ShortcutActivator, VoidCallback>{};
     if (widget.inlinePickActive && widget.onInlinePickConfirm != null) {
       bindings[const SingleActivator(LogicalKeyboardKey.enter)] =
           widget.onInlinePickConfirm!;
+    }
+    if (widget.inlinePickActive && widget.onInlinePickTab != null) {
+      bindings[const SingleActivator(LogicalKeyboardKey.tab)] =
+          widget.onInlinePickTab!;
+      bindings[const SingleActivator(LogicalKeyboardKey.tab, shift: true)] =
+          widget.onInlinePickTab!;
     }
     return CallbackShortcuts(
       bindings: bindings,
@@ -168,7 +177,7 @@ class _CommandCaptureBarState extends State<CommandCaptureBar> {
                   child: Icon(Icons.chevron_right, color: indicatorColor, size: 22),
                 ),
                 Expanded(
-                  child: _buildTextField(scheme, isLight: isLight),
+                  child: _buildTextField(context, scheme, isLight: isLight),
                 ),
               ],
             ),
