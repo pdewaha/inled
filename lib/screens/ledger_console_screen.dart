@@ -7655,6 +7655,7 @@ class _ChangelogActivityFeedListState extends State<_ChangelogActivityFeedList> 
         readerPersonId: widget.readerPersonId,
         partyExpectations: widget.partyExpectations,
         authorLabel: widget.authorLabelForExpectation,
+        excludeWriterUserId: widget.authUserId,
         limit: 40,
       );
       final merged = mergeActivityFeedChangelogAndMentions(

@@ -439,6 +439,9 @@ Future<ChangelogUnreadPartySnapshot> computeChangelogUnreadPartySnapshot({
       if (expId == null || bellClearedExpectationIds.contains(expId)) continue;
       final embedded = _embeddedRowFromJoin(row['expectations']);
       if (embedded == null) continue;
+      // Your own talking point / expectation should never light up your bell.
+      final writerUserId = (embedded['writer_user_id'] as String?)?.trim();
+      if (writerUserId != null && writerUserId == authUserId) continue;
       final visIdx = embedded['expectation_visibility'];
       final visibility = visIdx is int
           ? visIdx

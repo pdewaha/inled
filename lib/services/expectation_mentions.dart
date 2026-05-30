@@ -382,6 +382,9 @@ Future<void> syncTalkingPointMentions({
     createMe: resolveMe,
     createPlaceholder: createPlaceholder,
     replaceExisting: replaceExisting,
+    // A talking point can be self-addressed (@me / your own @handle) so you can
+    // set yourself objectives — keep the author as a receiver when mentioned.
+    includeAuthorSelfMention: true,
   );
 }
 
@@ -468,6 +471,7 @@ Future<void> _syncMentionsFromText({
   required Future<Person?> Function(String handle) createMe,
   required Future<Person> Function(String handle) createPlaceholder,
   required bool replaceExisting,
+  bool includeAuthorSelfMention = false,
 }) async {
   final handles = extractMentionHandlesFromText(summary);
   if (handles.isEmpty) return;
@@ -496,7 +500,7 @@ Future<void> _syncMentionsFromText({
       person ??= await createPlaceholder(raw);
     }
     if (person == null) continue;
-    if (person.id == authorPersonId) continue;
+    if (person.id == authorPersonId && !includeAuthorSelfMention) continue;
     mentionedIds.add(person.id);
   }
 
@@ -648,6 +652,7 @@ Future<List<ExpectationActivityFeedItem>> loadTalkingPointMentionActivityFeed({
   required String readerPersonId,
   required List<Expectation> partyExpectations,
   required String Function(Expectation expectation) authorLabel,
+  String? excludeWriterUserId,
   int limit = 40,
 }) async {
   try {
@@ -670,6 +675,13 @@ Future<List<ExpectationActivityFeedItem>> loadTalkingPointMentionActivityFeed({
       if (expId.isEmpty) continue;
       final exp = _embeddedExpectationRow(raw['expectations']);
       if (exp == null) continue;
+      // Never notify yourself about a talking point / expectation you authored.
+      final writerUserId = _mentionDbString(exp['writer_user_id']).trim();
+      if (excludeWriterUserId != null &&
+          excludeWriterUserId.isNotEmpty &&
+          writerUserId == excludeWriterUserId) {
+        continue;
+      }
       final type = _mentionDbInt(exp['expectation_type']);
       final visibility = _mentionDbInt(exp['expectation_visibility']);
       if (visibility == ExpectationVisibility.shadow.index) continue;
